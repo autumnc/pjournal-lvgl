@@ -1,0 +1,27 @@
+#pragma once
+
+enum AppKey {
+    KEY_NONE = 0,
+    KEY_UP = 0x80,
+    KEY_DOWN = 0x81,
+    KEY_LEFT = 0x82,
+    KEY_RIGHT = 0x83,
+    KEY_IME_TOGGLE = 0x84,
+    KEY_CTRL_ENTER = 0x85,
+    KEY_SHIFT_UP = 0x86,
+    KEY_SHIFT_DOWN = 0x87,
+    KEY_SHIFT_LEFT = 0x88,
+    KEY_SHIFT_RIGHT = 0x89,
+    KEY_CTRL_I = 0x8A,
+    KEY_FULLWIDTH_TOGGLE = 0x8B,
+    KEY_TRAD_TOGGLE = 0x8C,
+    KEY_LSHIFT_TAP = 0x8D,
+    KEY_HOME = 0x8E,
+    KEY_END = 0x8F,
+    KEY_FILE_BASE = 0x90,
+    KEY_PAGE_UP = 0xA0,
+    KEY_PAGE_DOWN = 0xA1,
+    KEY_SEARCH = 0xA2,
+    KEY_HELP = 0xA3,
+    KEY_REDO = 0xA4,
+};

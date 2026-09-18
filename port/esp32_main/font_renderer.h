@@ -1,0 +1,99 @@
+#pragma once
+
+#include <cstdint>
+#include <cstddef>
+
+#include "symbol_glyphs.h"
+
+// Font renderer: reads from embedded terminus22.fnt / wenquanyi16.fnt blobs
+struct TextStyle {
+    bool bold = false;      // synthetic bold: glyph drawn twice, 1px offset
+    bool underline = false; // line below the whole segment
+    bool italic = false;    // vertical-only italic marker decoration
+    bool strike = false;    // line through vertical center
+    bool invert = false;    // reverse video: dark box + light glyphs
+    bool emph = false;      // emphasis dot (着重号) under each character
+    bool bookTitle = false; // vertical-only book title wave decoration
+};
+
+class FontRenderer {
+public:
+    bool begin();
+
+    // Switch between available font sizes
+    bool setSize(int fontSize);
+
+    // Draw UTF-8 text at (x, y). y is baseline.
+    // Returns width consumed.
+    int drawText(int x, int y, const char *text, bool invert = false);
+
+    // Draw UTF-8 text with style flags (bold/underline/strike/invert/emph).
+    // Width is identical to drawText/textWidth — marker-free passthrough.
+    int drawTextStyled(int x, int y, const char *text, const TextStyle &ts);
+
+    // Get text width in pixels (UTF-8)
+    int textWidth(const char *text);
+
+    // Get glyph advance width
+    int charWidth(uint32_t codepoint);
+
+    // Font metrics
+    int lineHeight() const { return line_height_; }
+    int ascent() const { return ascent_; }
+    int descent() const { return descent_; }
+    int fontSize() const { return font_size_; }
+
+    // Cell-based layout helpers (monospace assumption)
+    int cjkAdvance() const { return line_height_; }     // fullwidth advance (pixels)
+    int halfAdvance() const { return line_height_ / 2; } // halfwidth advance (pixels)
+
+    // Check if font is loaded
+    bool loaded() const { return loaded_; }
+
+    // Decode a single UTF-8 character from *str, advance str pointer
+    static uint32_t utf8Decode(const char *&str);
+
+private:
+    struct GlyphMeta {
+        uint16_t width;
+        uint16_t height;
+        int8_t x_off;
+        int8_t y_off;
+        uint8_t advance;
+        uint32_t bitmap_offset;
+    };
+
+    // Find glyph metadata for a codepoint
+    const GlyphMeta *findGlyph(uint32_t cp);
+
+    // Draw a single glyph at (x, y)
+    void drawGlyph(int x, int y, const GlyphMeta *meta, bool invert);
+
+    // Draw a symbol glyph from the TTF supplement table
+    void drawSymbolGlyph(int x, int y, const SymbolGlyph *sym, bool invert);
+
+    // Parse font header from a blob pointer
+    bool parseBlob(const uint8_t *blob, size_t sz);
+
+    const uint8_t *blob_ = nullptr;
+    const uint8_t *blob_small_ = nullptr;  // 小字号(18pt FontLibrary18)
+    const uint8_t *blob_22_ = nullptr;
+    bool loaded_ = false;
+    int font_size_ = 22;
+    int line_height_ = 22;
+    int ascent_ = 17;
+    int descent_ = 5;
+    int glyph_count_ = 0;
+
+    // Table pointers
+    const uint32_t *ascii_table_ = nullptr;
+    struct CjkBlock { uint32_t start_cp, end_cp, first_meta; };
+    const CjkBlock *cjk_blocks_ = nullptr;
+    int cjk_block_count_ = 0;
+    const CjkBlock *other_blocks_ = nullptr;
+    int other_block_count_ = 0;
+    const uint8_t *meta_array_ = nullptr;
+    const uint8_t *bitmap_data_ = nullptr;
+};
+
+extern FontRenderer g_font;

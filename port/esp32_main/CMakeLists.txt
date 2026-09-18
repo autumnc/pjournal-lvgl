@@ -1,0 +1,66 @@
+idf_component_register(SRCS
+    "main.cpp"
+    "pjournal_app.cpp"
+    "ui_helpers.cpp"
+    "safe_file.cpp"
+    "screen_editor.cpp"
+    "screen_settings.cpp"
+    "quick_edit.cpp"
+    "typing_click.cpp"
+    "screen_bt_manage.cpp"
+    "screen_file_manager.cpp"
+    "file_manager_server.cpp"
+    "font_renderer.cpp"
+    "bt_keyboard.cpp"
+    "journal_storage.cpp"
+    "settings_manager.cpp"
+    "wifi_manager.cpp"
+    "webdav_client.cpp"
+    "flomo_client.cpp"
+    "deepseek_client.cpp"
+    "pcf85063.cpp"
+    "json_parser.cpp"
+    "json_utils.cpp"
+    "ime/IME.cpp"
+    "screen_gtd.cpp"
+    "screen_outline.cpp"
+    "screen_inspiration.cpp"
+    "screen_voice.cpp"
+    "screen_polish.cpp"
+    "screen_polish_prompt.cpp"
+    "voice_input.cpp"
+    "markdown_render.cpp"
+    "vertical_layout.cpp"
+    INCLUDE_DIRS "."
+    EMBED_FILES
+        "ime/ime_table_pinyin.bin"
+        "ime/liangfen.bin"
+        "ime/english_words.txt"
+        "terminus22.fnt"
+        "fontlibrary18.fnt"
+    PRIV_REQUIRES
+        spi_flash
+        nvs_flash
+        esp_wifi
+        esp_netif
+        esp-tls
+        esp_http_client
+        esp_http_server
+        esp_event
+        bt
+        esp_hid
+        lwip
+        mbedtls
+        fatfs
+        sdmmc
+        driver
+        u8g2
+        u8g2_st7305
+        esp_adc
+        esp_websocket_client
+        esp_codec_dev
+        esp_audio_codec
+        efuse
+)
+
+target_compile_definitions(${COMPONENT_LIB} PRIVATE PJOURNAL_VERSION="4.6.3")
