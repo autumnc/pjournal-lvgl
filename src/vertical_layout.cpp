@@ -20,12 +20,19 @@ static void vt_code_flags(const std::vector<std::string> &lines, std::vector<cha
 
 // 正文里 [from,to)(相对正文起点)的可见字符逐个成格。
 static void vt_append_body(const std::string &line, int body_off, int from, int to,
-                           VerticalCellKind kind, std::vector<VerticalCell> &cs) {
+                           const MdRender &r, VerticalCellKind kind,
+                           std::vector<VerticalCell> &cs) {
     if(to > (int)line.size() - body_off) to = (int)line.size() - body_off;
     if(from >= to) return;
     for(int p = body_off + from; p < body_off + to;) {
         size_t n = md_utf8_step(line, p);
-        cs.push_back({p, (int)n, line.substr(p, n - p), kind, false});
+        MdStyle st = md_style_at(r, md_display_offset(r, p));
+        // 转义的斜杠、链接的方括号与 URL 占位但不显字,排成等宽空白
+        int rel = p - r.body_off;
+        bool padded = false;
+        for(const auto &ps : r.padded)
+            if(rel >= ps.first && rel < ps.second) { padded = true; break; }
+        cs.push_back({p, (int)n, padded ? std::string(" ") : line.substr(p, n - p), kind, false, st});
         p = (int)n;
     }
 }
@@ -34,7 +41,7 @@ static void vt_append_raw(const std::string &s, int base, VerticalCellKind kind,
                           std::vector<VerticalCell> &cs) {
     for(int p = 0; p < (int)s.size();) {
         size_t n = md_utf8_step(s, p);
-        cs.push_back({base + p, base + (int)n, s.substr(p, n - p), kind, false});
+        cs.push_back({base + p, base + (int)n, s.substr(p, n - p), kind, false, MdStyle {}});
         p = (int)n;
     }
 }
@@ -110,25 +117,27 @@ VerticalData build_vertical_data(const std::vector<std::string> &lines, int rows
                 vt_append_raw(line, 0, VerticalCellKind::Rule, cs);
             } else {
                 // 列表/引用的前导空格占空白格,保住缩进;块标记本身也归这一段
-                for(int p = 0; p < lead; ++p) cs.push_back({p, p + 1, " ", kind, false});
+                for(int p = 0; p < lead; ++p) cs.push_back({p, p + 1, " ", kind, false, MdStyle {}});
                 // 替换型块标记:尾部空格丢掉,所有格共享同一段原始字节
                 int pend = r.prefix_bytes;
                 while(pend > 0 && r.text[pend - 1] == ' ') pend--;
+                MdStyle pst = md_style_at(r, 0);
                 for(int p = 0; p < pend;) {
                     size_t n = md_utf8_step(r.text, p);
-                    cs.push_back({lead, r.body_off, r.text.substr(p, n - p), kind, false});
+                    cs.push_back({lead, r.body_off, r.text.substr(p, n - p), kind, false, pst});
                     p = (int)n;
                 }
                 // 正文:成对行内标记整段隐藏
                 int prev = 0;
                 for(const auto &hs : r.hidden) {
-                    vt_append_body(line, r.body_off, prev, hs.first, kind, cs);
+                    vt_append_body(line, r.body_off, prev, hs.first, r, kind, cs);
                     prev = hs.second;
                 }
-                vt_append_body(line, r.body_off, prev, (int)line.size() - r.body_off, kind, cs);
+                vt_append_body(line, r.body_off, prev, (int)line.size() - r.body_off, r, kind, cs);
                 if(folded_here && r.heading) {
+                    MdStyle hst = md_style_at(r, 0);
                     for(const char *g : {" ", "[", "+", "]"})
-                        cs.push_back({lead, r.body_off, g, kind, true});
+                        cs.push_back({lead, r.body_off, g, kind, true, hst});
                 }
             }
         }

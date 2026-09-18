@@ -2,6 +2,7 @@
 
 #include <lvgl.h>
 
+#include <atomic>
 #include <cstdint>
 #include <fcntl.h>
 #include <linux/input.h>
@@ -46,6 +47,20 @@ struct InputState {
     bool left_shift_used = false;
 };
 
+// 控制台这条路上,tty 只送出按 K_XLATE 键表翻译后的字节,修饰键的信息到这里就丢了:
+// Shift+Space 和裸空格一样是 0x20,Ctrl+Shift+F 和 Ctrl+F 一样是 0x06。所以另开线程直接
+// 读输入设备,把修饰键状态记下来,补发那几个 tty 表达不出来的组合键,同时让 tty 线程把
+// 重复的那一个字节丢掉。两个线程共享这几个标志,必须用原子量。
+static std::atomic<bool> g_shift_held{false};
+static std::atomic<bool> g_ctrl_held{false};
+static std::atomic<bool> g_modifier_tap_live{false};
+
+static bool console_byte_swallowed(uint8_t ch) {
+    if(!g_modifier_tap_live.load() || !g_shift_held.load()) return false;
+    if(ch == ' ') return true;
+    return g_ctrl_held.load() && (ch == 0x06 || ch == 0x1A || ch == 0x1F);
+}
+
 static int shifted_digit(int code) {
     switch(code) {
     case KEY_1: return '!';
@@ -62,6 +77,18 @@ static int shifted_digit(int code) {
     }
 }
 
+// 字母键在 input 码里是分三段排的(Q..P 是 16..25,A..L 是 30..38,Z..M 是 44..50),
+// 按 KEY_A 等差推出来的字符是错的,必须查表。
+static int letter_of(int code) {
+    static const char qrow[] = "qwertyuiop";
+    static const char arow[] = "asdfghjkl";
+    static const char zrow[] = "zxcvbnm";
+    if(code >= KEY_Q && code <= KEY_P) return qrow[code - KEY_Q];
+    if(code >= KEY_A && code <= KEY_L) return arow[code - KEY_A];
+    if(code >= KEY_Z && code <= KEY_M) return zrow[code - KEY_Z];
+    return 0;
+}
+
 static int map_key(int code, const InputState &st) {
     if(st.ctrl) {
         if(code == KEY_SPACE) return APP_KEY_IME_TOGGLE;
@@ -76,7 +103,8 @@ static int map_key(int code, const InputState &st) {
             int n = code == KEY_0 ? 0 : code - KEY_1 + 1;
             return APP_KEY_FILE_BASE + n;
         }
-        if(code >= KEY_A && code <= KEY_Z) return code - KEY_A + 1;
+        int c = letter_of(code);
+        if(c) return c - 'a' + 1;
     }
     switch(code) {
     case KEY_UP: return st.shift ? APP_KEY_SHIFT_UP : APP_KEY_UP;
@@ -92,7 +120,7 @@ static int map_key(int code, const InputState &st) {
     case KEY_DELETE: return 127;
     case KEY_ENTER: return '\n';
     case KEY_TAB: return '\t';
-    case KEY_SPACE: return ' ';
+    case KEY_SPACE: return st.shift ? APP_KEY_FULLWIDTH_TOGGLE : ' ';
     case KEY_MINUS: return st.shift ? '_' : '-';
     case KEY_EQUAL: return st.shift ? '+' : '=';
     case KEY_LEFTBRACE: return st.shift ? '{' : '[';
@@ -106,10 +134,8 @@ static int map_key(int code, const InputState &st) {
     case KEY_SLASH: return st.shift ? '?' : '/';
     default: break;
     }
-    if(code >= KEY_A && code <= KEY_Z) {
-        int ch = 'a' + code - KEY_A;
-        return st.shift ? ch - 32 : ch;
-    }
+    int ch = letter_of(code);
+    if(ch) return st.shift ? ch - 32 : ch;
     if(code >= KEY_1 && code <= KEY_0) {
         int shifted = shifted_digit(code);
         if(st.shift && shifted) return shifted;
@@ -187,7 +213,7 @@ static void console_input_thread() {
             continue;
         }
         if(ch != 0x1b) {
-            dispatch_key(ch);
+            if(!console_byte_swallowed(ch)) dispatch_key(ch);
             continue;
         }
 
@@ -252,31 +278,53 @@ bool linux_input_start(const std::string &device) {
     return true;
 }
 
-static void modifier_tap_thread(std::string device) {
+// 控制台模式下普通按键由 tty 负责(它连键表翻译一起送来了),这里只补 tty 表达不出来
+// 的那几个组合键,以及单独的左 Shift 轻点。非键盘设备不含这些键位,读了也不会动作。
+static void console_modifier_thread(std::string device) {
     int fd = open(device.c_str(), O_RDONLY | O_CLOEXEC);
     if(fd < 0) return;
+    g_modifier_tap_live = true;
     bool left_down = false;
     bool used = false;
     input_event ev {};
     while(read(fd, &ev, sizeof(ev)) == sizeof(ev)) {
         if(ev.type != EV_KEY) continue;
         bool down = ev.value != 0;
-        if(ev.code == KEY_LEFTSHIFT) {
-            if(down) {
-                left_down = true;
-                used = false;
-            } else {
-                if(left_down && !used) dispatch_key(APP_KEY_LSHIFT_TAP);
-                left_down = false;
+        if(ev.code == KEY_LEFTSHIFT || ev.code == KEY_RIGHTSHIFT) {
+            if(ev.code == KEY_LEFTSHIFT) {
+                if(down) {
+                    left_down = true;
+                    used = false;
+                } else {
+                    if(left_down && !used) dispatch_key(APP_KEY_LSHIFT_TAP);
+                    left_down = false;
+                }
             }
+            g_shift_held = down;
             continue;
         }
-        if(left_down && down) used = true;
+        if(ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL) { g_ctrl_held = down; continue; }
+        if(!down) continue;
+        if(left_down) used = true;
+        if(g_ctrl_held && g_shift_held) {
+            if(ev.code == KEY_F) dispatch_key(APP_KEY_TRAD_TOGGLE);
+            else if(ev.code == KEY_Z) dispatch_key(APP_KEY_REDO);
+            else if(ev.code == KEY_SLASH || ev.code == KEY_QUESTION) dispatch_key(APP_KEY_HELP);
+            continue;
+        }
+        // Ctrl+Space 走 tty 的 0x00(输入法开关),别在这里抢
+        if(g_shift_held && !g_ctrl_held && ev.code == KEY_SPACE)
+            dispatch_key(APP_KEY_FULLWIDTH_TOGGLE);
     }
     close(fd);
 }
 
-bool linux_input_start_modifier_taps(const std::string &device) {
-    std::thread(modifier_tap_thread, device).detach();
+// 键盘未必挂在 event0(枚举顺序会变),所以整个 /dev/input/event* 都开一遍,开不了就算了。
+bool linux_input_start_console_modifiers() {
+    for(int i = 0; i < 16; ++i) {
+        std::string path = "/dev/input/event" + std::to_string(i);
+        if(access(path.c_str(), R_OK) == 0)
+            std::thread(console_modifier_thread, path).detach();
+    }
     return true;
 }

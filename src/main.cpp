@@ -76,7 +76,7 @@ int main() {
         linux_input_start(input);
     } else {
         bool console = linux_input_start_console();
-        if(console) linux_input_start_modifier_taps("/dev/input/event0");
+        if(console) linux_input_start_console_modifiers();
         else linux_input_start("/dev/input/event0");
     }
     linux_input_start("/dev/input/event1");

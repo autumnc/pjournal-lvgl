@@ -54,6 +54,10 @@ int LinuxIme::page_size() const {
     return IME::getInstance().pageSize();
 }
 
+void LinuxIme::set_page_size(int n) {
+    IME::getInstance().setPageSize(n);
+}
+
 int LinuxIme::highlight_index() const {
     return IME::getInstance().highlightIdx();
 }

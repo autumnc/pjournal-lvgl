@@ -71,7 +71,7 @@ public:
     IME(const IME &) = delete;
     IME &operator=(const IME &) = delete;
 
-    void setPageSize(int n) { _pageSize = n; }
+    void setPageSize(int n) { if (n == _pageSize) return; _pageSize = n; buildPage(); }
     // 返回当前页实际候选数量(界面用 (i % pageSize)+1 编号, 页内从 1 起)
     int pageSize() const { int n = (int)_page.size(); return n >= 1 ? n : 1; }
     int totalCandidates() const { return (int)_all.size(); }
@@ -80,8 +80,8 @@ public:
 
     using WidthFn = int (*)(const char *text);
     void setWidthFn(WidthFn fn) { _widthFn = fn; }
-    // 候选行可用像素宽度(与各界面渲染 curW+partW+8>SCREEN_W 的 8px 余量一致)
-    void setDisplayWidth(int w) { _displayWidth = w; }
+    // 候选行可用像素宽度(0=退化为固定 _pageSize 分页);宽度变了要重排分页
+    void setDisplayWidth(int w) { if (w == _displayWidth) return; _displayWidth = w; buildPage(); }
 
 private:
     IME() {}

@@ -11,7 +11,10 @@ public:
     std::string journal_dir() const;
     std::string theme() const;
     std::string font_file() const;
+    std::string font_bold_file() const;
+    std::string font_italic_file() const;
     int font_size() const;
+    int ime_font_size() const;
     bool markdown_render() const;
     bool version_history() const;
     bool first_line_indent() const;

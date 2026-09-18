@@ -20,6 +20,7 @@ public:
     int total_pages() const;
     int total_candidates() const;
     int page_size() const;
+    void set_page_size(int n);
     int highlight_index() const;
     bool fullwidth() const;
     bool trad() const;

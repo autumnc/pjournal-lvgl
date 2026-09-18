@@ -4,6 +4,7 @@
 
 #include <map>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -12,6 +13,8 @@ struct FontInfo {
     std::string name;
 };
 
+enum class FontStyle { Normal, Bold, Italic };
+
 class FontManager {
 public:
     void scan(const std::string &dir = "/root/.fonts");
@@ -19,7 +22,7 @@ public:
     std::string default_font_path() const;
     bool supports_cjk(const std::string &path) const;
     bool supports_symbols(const std::string &path) const;
-    lv_font_t *load(const std::string &path, int size);
+    lv_font_t *load(const std::string &path, int size, FontStyle style = FontStyle::Normal);
     lv_font_t *current() const { return current_; }
     int current_size() const { return current_size_; }
     std::string current_path() const { return current_path_; }
@@ -27,10 +30,10 @@ public:
     ~FontManager();
 
 private:
-    lv_font_t *create(const std::string &path, int size);
+    lv_font_t *create(const std::string &path, int size, FontStyle style);
     std::string pick_fallback(const std::string &primary);
     std::vector<FontInfo> fonts_;
-    std::map<std::pair<std::string, int>, lv_font_t *> loaded_;
+    std::map<std::tuple<std::string, int, int>, lv_font_t *> loaded_;
     lv_font_t *current_ = nullptr;
     int current_size_ = 0;
     std::string current_path_;

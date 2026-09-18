@@ -2,61 +2,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <set>
-
-static bool starts_with(const std::string &s, const char *p) {
-    return s.rfind(p, 0) == 0;
-}
-
-std::string strip_inline_markdown(const std::string &text) {
-    std::string out;
-    out.reserve(text.size());
-    for(size_t i = 0; i < text.size(); ++i) {
-        if((text[i] == '*' || text[i] == '_' || text[i] == '`' || text[i] == '=' || text[i] == '~') &&
-           i + 1 < text.size() && text[i + 1] == text[i]) {
-            ++i;
-            continue;
-        }
-        if(text[i] == '[' || text[i] == ']') continue;
-        out += text[i];
-    }
-    return out;
-}
-
-std::vector<MdLine> parse_markdown_lines(const std::string &text) {
-    std::vector<MdLine> lines;
-    size_t pos = 0;
-    while(pos <= text.size()) {
-        size_t nl = text.find('\n', pos);
-        std::string line = nl == std::string::npos ? text.substr(pos) : text.substr(pos, nl - pos);
-        MdLine md;
-        std::string trimmed = line;
-        size_t first = trimmed.find_first_not_of(" \t\r");
-        if(first == std::string::npos) {
-            md.kind = MdKind::Blank;
-            md.text = "";
-        } else {
-            trimmed = trimmed.substr(first);
-            if(starts_with(trimmed, "# ")) { md.kind = MdKind::Heading1; md.text = trimmed.substr(2); }
-            else if(starts_with(trimmed, "## ")) { md.kind = MdKind::Heading2; md.text = trimmed.substr(3); }
-            else if(starts_with(trimmed, "### ")) { md.kind = MdKind::Heading3; md.text = trimmed.substr(4); }
-            else if(starts_with(trimmed, "> ")) { md.kind = MdKind::Quote; md.text = trimmed.substr(2); }
-            else if(starts_with(trimmed, "- ") || starts_with(trimmed, "* ")) { md.kind = MdKind::List; md.text = trimmed.substr(2); }
-            else if(starts_with(trimmed, "```")) { md.kind = MdKind::Code; md.text = trimmed; }
-            else if(trimmed == "---" || trimmed == "***") { md.kind = MdKind::Rule; md.text = ""; }
-            else { md.kind = MdKind::Paragraph; md.text = trimmed; }
-            md.text = strip_inline_markdown(md.text);
-        }
-        lines.push_back(md);
-        if(nl == std::string::npos) break;
-        pos = nl + 1;
-    }
-    return lines;
-}
-
-// ---------------------------------------------------------------------------
-// 行级解析(横排叠加层与竖排共用)
-// ---------------------------------------------------------------------------
 
 size_t md_utf8_step(const std::string &s, size_t i) {
     if(i >= s.size()) return s.size();
@@ -109,13 +56,23 @@ bool md_marker_edge(const std::string &b, size_t at, size_t len, bool underscore
     return true;
 }
 
-// 找出正文里成对的行内标记(** __ == ~~ ` * _)并记下它们的字节范围。
-// 光标落在某一对里面时整对都原样显示,方便直接改标记本身。
-void md_inline_hidden(const std::string &body, int caret_rel,
-                      std::vector<std::pair<int,int>> &out) {
-    static const struct { const char *s; size_t len; bool undersc; } marks[] = {
-        {"**", 2, false}, {"__", 2, true}, {"==", 2, false}, {"~~", 2, false},
-        {"`", 1, false}, {"*", 1, false}, {"_", 1, true},
+// 找出正文里成对的行内标记(** __ == ~~ ` * _)、链接与转义,记下各自的字节范围。
+// 光标落在某一对里面时整对都原样显示,方便直接改标记本身;其余情况下把这一对
+// 记成一段带样式的区间,交给渲染层换成粗体/斜体/删除线/着重号/反白字体。
+// 链接的方括号与 URL、转义的斜杠都记进 padded —— 显示成同宽空白,宽度不变。
+void md_inline_runs(const std::string &body, int caret_rel,
+                    std::vector<std::pair<int,int>> &hidden_out,
+                    std::vector<std::pair<int,int>> &padded_out,
+                    std::vector<MdRun> &runs_out) {
+    static const struct { const char *s; size_t len; bool undersc; MdStyle st; } marks[] = {
+        {"***", 3, false, {true,  true,  false, false, false, false}},
+        {"**",  2, false, {true,  false, false, false, false, false}},
+        {"__",  2, true,  {true,  false, false, false, false, false}},
+        {"==",  2, false, {false, false, false, false, false, true }},
+        {"~~",  2, false, {false, false, true,  false, false, false}},
+        {"`",   1, false, {false, false, false, false, true,  false}},
+        {"*",   1, false, {false, true,  false, false, false, false}},
+        {"_",   1, true,  {false, true,  false, false, false, false}},
     };
     const int nmark = (int)(sizeof(marks) / sizeof(marks[0]));
     std::set<int> used;  // 已经配过对的标记位置,不能再当开标记用
@@ -125,6 +82,36 @@ void md_inline_hidden(const std::string &body, int caret_rel,
             i = md_utf8_step(body, i);
             continue;
         }
+
+        // 转义:`\x`(x 是单字节 ASCII)→ 反斜杠换成空格、x 原样显示,不再当标记
+        if(body[i] == '\\' && i + 1 < body.size() && (unsigned char)body[i + 1] < 0x80) {
+            padded_out.push_back({(int)i, (int)i + 1});
+            i += 2;
+            continue;
+        }
+
+        // 链接 `[文字](url)`:方括号与整个 URL 换成同宽空白,文字反白+下划线
+        if(body[i] == '[') {
+            size_t p = body.find("](", i + 1);
+            if(p != std::string::npos) {
+                size_t cp = body.find(')', p + 2);
+                if(cp != std::string::npos) {
+                    int a1 = (int)i, end = (int)cp + 1;
+                    if(!(caret_rel >= a1 && caret_rel < end)) {
+                        padded_out.push_back({a1, a1 + 1});
+                        padded_out.push_back({(int)p, end});
+                        if(p > i + 1)
+                            runs_out.push_back({(int)(i + 1), (int)p,
+                                                {false, false, false, true, true, false}});
+                    }
+                    i = (size_t)end;
+                    continue;
+                }
+            }
+            i = md_utf8_step(body, i);
+            continue;
+        }
+
         bool claimed = false;
         for(int m = 0; m < nmark; ++m) {
             size_t ml = marks[m].len;
@@ -148,19 +135,34 @@ void md_inline_hidden(const std::string &body, int caret_rel,
                 break;
             }
             int a1 = (int)i, b2 = (int)(close + ml);
-            used.insert(a1);
-            used.insert((int)close);
+            // 标记的每个字节都得占位。只记首字节的话,闭标记的第二个 '*' 会在后续
+            // 遍历里被当成新的单 '*' 开标记,把紧随其后的 **粗体** 误配成斜体。
+            for(size_t k = 0; k < ml; ++k) {
+                used.insert((int)i + (int)k);
+                used.insert((int)close + (int)k);
+            }
             if(!(caret_rel >= a1 && caret_rel < b2)) {
-                out.push_back({a1, (int)(i + ml)});
-                out.push_back({(int)close, b2});
+                hidden_out.push_back({a1, (int)(i + ml)});
+                hidden_out.push_back({(int)close, b2});
+                if((marks[m].st.bold || marks[m].st.italic || marks[m].st.strike ||
+                    marks[m].st.underline || marks[m].st.invert || marks[m].st.emph) &&
+                   close > i + ml)
+                    runs_out.push_back({(int)(i + ml), (int)close, marks[m].st});
             }
             i += ml;
             break;
         }
         if(!claimed) i = md_utf8_step(body, i);
     }
-    std::sort(out.begin(), out.end());
+    std::sort(hidden_out.begin(), hidden_out.end());
+    std::sort(padded_out.begin(), padded_out.end());
 }
+
+// 标题前缀:分级 Nerd Font 图标(与 ESP32 版同一组码位),比一根竖线更能看出层级
+static const char *kHeadingGlyph[6] = {
+    "\xf3\xb0\x8e\xa4", "\xf3\xb0\x8e\xa7", "\xf3\xb0\x8e\xaa",
+    "\xf3\xb0\x8e\xad", "\xf3\xb0\x8e\xb1", "\xf3\xb0\x8e\xb3",
+};
 
 MdRender md_build_line(const std::string &raw, bool in_code, int caret_rel) {
     MdRender l;
@@ -178,7 +180,7 @@ MdRender md_build_line(const std::string &raw, bool in_code, int caret_rel) {
             while(b < t.size() && t[b] == ' ') b++;
             l.heading = true;
             l.level = h;
-            prefix = "\xe2\x96\x8d ";  // 粗竖线,比 # 直观
+            prefix = std::string(kHeadingGlyph[h - 1]) + " ";
             l.body_off = (int)(lead + b);
         } else if(t.rfind("```", 0) == 0 || t.rfind("~~~", 0) == 0 || md_is_rule(t)) {
             l.rule = true;
@@ -205,10 +207,19 @@ MdRender md_build_line(const std::string &raw, bool in_code, int caret_rel) {
         } else {
             size_t k = 0;
             while(k < t.size() && t[k] >= '0' && t[k] <= '9') k++;
-            if(k > 0 && k < t.size()) {
-                bool cn_sep = t.compare(k, 3, "\xe3\x80\x81") == 0;
-                if(t[k] == '.' || t[k] == ')' || cn_sep) {
-                    size_t m = k + (cn_sep ? 3 : 1);
+            bool cn_sep = false;
+            if(k > 0 && k < t.size()) cn_sep = t.compare(k, 3, "\xe3\x80\x81") == 0;
+            if(k > 0 && k < t.size() && (t[k] == '.' || t[k] == ')' || cn_sep)) {
+                size_t m = k + (cn_sep ? 3 : 1);
+                while(m < t.size() && t[m] == ' ') m++;
+                prefix = t.substr(0, m);
+                l.body_off = (int)(lead + m);
+            } else {
+                // 中文数字序号:一、二、十、十一、…(原文渲染,前缀即序号+顿号)
+                int nl = 0;
+                int v = md_cn_num_value(t, 0, nl);
+                if(v >= 0 && nl > 0 && t.compare(nl, 3, "\xe3\x80\x81") == 0) {
+                    size_t m = (size_t)nl + 3;
                     while(m < t.size() && t[m] == ' ') m++;
                     prefix = t.substr(0, m);
                     l.body_off = (int)(lead + m);
@@ -218,18 +229,57 @@ MdRender md_build_line(const std::string &raw, bool in_code, int caret_rel) {
     }
 
     const std::string body = raw.substr((size_t)l.body_off);
-    md_inline_hidden(body, caret_rel, l.hidden);
+    std::vector<MdRun> raw_runs;
+    md_inline_runs(body, caret_rel, l.hidden, l.padded, raw_runs);
+
+    // 重叠的样式区间(如 ***粗斜***)按位取并集,再逐字节压成不重叠的显示片段。
+    std::vector<char> hid(body.size(), 0), pad(body.size(), 0);
+    for(const auto &hs : l.hidden) {
+        for(int k = hs.first; k < hs.second && k < (int)body.size(); ++k)
+            if(k >= 0) hid[(size_t)k] = 1;
+    }
+    for(const auto &ps : l.padded) {
+        for(int k = ps.first; k < ps.second && k < (int)body.size(); ++k)
+            if(k >= 0) pad[(size_t)k] = 1;
+    }
+    std::vector<MdStyle> sty(body.size());
+    for(const MdRun &r : raw_runs) {
+        for(int k = r.lo; k < r.hi && k < (int)body.size(); ++k) {
+            if(k < 0) continue;
+            sty[(size_t)k].bold |= r.st.bold;
+            sty[(size_t)k].italic |= r.st.italic;
+            sty[(size_t)k].strike |= r.st.strike;
+            sty[(size_t)k].underline |= r.st.underline;
+            sty[(size_t)k].invert |= r.st.invert;
+            sty[(size_t)k].emph |= r.st.emph;
+        }
+    }
 
     l.prefix_bytes = (int)prefix.size();
     l.text = prefix;
-    size_t prev = 0;
-    for(const auto &hs : l.hidden) {
-        int s = hs.first < (int)prev ? (int)prev : hs.first;
-        if(hs.second <= s) continue;
-        if(s > (int)prev) l.text.append(body, prev, (size_t)s - prev);
-        prev = (size_t)hs.second;
+    l.runs.clear();
+    for(size_t k = 0; k < body.size(); ++k) {
+        if(hid[k]) continue;
+        char ch = pad[k] ? ' ' : body[k];
+        MdStyle s = sty[k];
+        if(!s.bold && !s.italic && !s.strike && !s.underline && !s.invert && !s.emph) {
+            l.text += ch;
+            continue;
+        }
+        int at = (int)l.text.size();
+        if(!l.runs.empty() && l.runs.back().hi == at &&
+           l.runs.back().st.bold == s.bold && l.runs.back().st.italic == s.italic &&
+           l.runs.back().st.strike == s.strike && l.runs.back().st.underline == s.underline &&
+           l.runs.back().st.invert == s.invert && l.runs.back().st.emph == s.emph)
+            l.runs.back().hi = at + 1;
+        else
+            l.runs.push_back({at, at + 1, s});
+        l.text += ch;
     }
-    if(prev < body.size()) l.text.append(body, prev, body.size() - prev);
+
+    // 标题整行(含前缀图标)用粗体,和 ESP32 的 base.bold 一致。
+    if(l.heading)
+        l.runs.assign(1, {0, (int)l.text.size(), {true, false, false}});
     return l;
 }
 
@@ -243,6 +293,14 @@ int md_display_offset(const MdRender &l, int raw_rel) {
         d -= (rel < hs.second ? rel : hs.second) - hs.first;
     }
     return d;
+}
+
+MdStyle md_style_at(const MdRender &l, int disp) {
+    for(const auto &r : l.runs) {
+        if(disp < r.lo) break;
+        if(disp < r.hi) return r.st;
+    }
+    return MdStyle {};
 }
 
 void md_split_caret(const std::string &text, uint32_t caret_byte, MdDoc &out) {
@@ -272,4 +330,121 @@ void md_split_caret(const std::string &text, uint32_t caret_byte, MdDoc &out) {
             break;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 列表标记与中文数字序号(回车续行用)
+// ---------------------------------------------------------------------------
+
+static bool md_cn_is_num(const std::string &s, int at) {
+    static const char *kCn[13] = {"零", "一", "二", "三", "四", "五", "六",
+                                  "七", "八", "九", "十", "百", "千"};
+    if(at + 3 > (int)s.size()) return false;
+    for(int k = 0; k < 13; ++k)
+        if(s.compare(at, 3, kCn[k]) == 0) return true;
+    return false;
+}
+
+int md_cn_num_value(const std::string &line, int from, int &num_len) {
+    static const char *kDg[10] = {"零", "一", "二", "三", "四", "五", "六", "七", "八", "九"};
+    int len = (int)line.size();
+    int value = 0, section = 0;
+    int i = from;
+    while(i + 3 <= len) {
+        const std::string c = line.substr(i, 3);
+        int dv = -1, mult = 0;
+        for(int k = 0; k < 10; ++k)
+            if(c == kDg[k]) { dv = k; break; }
+        if(dv < 0) {
+            if(c == "十") mult = 10;
+            else if(c == "百") mult = 100;
+            else if(c == "千") mult = 1000;
+            else break;
+        }
+        if(mult) { value += (section == 0 ? 1 : section) * mult; section = 0; }
+        else section = dv;
+        i += 3;
+    }
+    num_len = i - from;
+    if(num_len == 0) return -1;
+    return value + section;
+}
+
+std::string md_cn_numeral(int n) {
+    static const char *kCN[10] = {"零", "一", "二", "三", "四", "五", "六", "七", "八", "九"};
+    static const char *kUnit[4] = {"", "十", "百", "千"};
+    if(n < 0 || n > 9999) return std::to_string(n);
+    if(n < 10) return kCN[n];
+    std::string out;
+    int digits[4] = {0, 0, 0, 0};
+    int len = 0;
+    for(int t = n; t > 0; t /= 10) digits[len++] = t % 10;
+    bool zeroPending = false;
+    for(int i = len - 1; i >= 0; --i) {
+        if(digits[i] == 0) {
+            if(i > 0) zeroPending = true;
+        } else {
+            if(zeroPending) { out += kCN[0]; zeroPending = false; }
+            out += kCN[digits[i]];
+            out += kUnit[i];
+        }
+    }
+    if(n >= 10 && n < 20) out.erase(0, 3);  // "一十"→"十"
+    return out;
+}
+
+MdListMarker md_list_marker(const std::string &line) {
+    MdListMarker m;
+    int len = (int)line.size();
+    int i = 0;
+    while(i < len && (line[i] == ' ' || line[i] == '\t')) i++;
+    m.start = m.indent = i;
+    int rest = len - i;
+
+    if(rest >= 5 && (line.compare(i, 5, "- [ ]") == 0 || line.compare(i, 5, "- [x]") == 0 ||
+                     line.compare(i, 5, "- [X]") == 0)) {
+        m.ok = m.task = true;
+        m.len = (i + 5 < len && line[i + 5] == ' ') ? 6 : 5;
+        return m;
+    }
+    if(rest >= 2 && (line[i] == '-' || line[i] == '*' || line[i] == '+') && line[i + 1] == ' ') {
+        m.ok = true;
+        m.len = 2;
+        return m;
+    }
+    int d = i;
+    while(d < len && line[d] >= '0' && line[d] <= '9') d++;
+    int nd = d - i;
+    if(nd >= 1 && d + 2 < len && (unsigned char)line[d] == 0xE3 &&
+       (unsigned char)line[d + 1] == 0x80 && (unsigned char)line[d + 2] == 0x81) {  // 、
+        m.num_len = nd;
+        m.num = std::atoi(line.substr(i, nd).c_str());
+        m.len = nd + 3;
+        if(d + 3 < len && line[d + 3] == ' ') m.len++;
+        m.ordered = m.ok = true;
+        return m;
+    }
+    if(nd >= 1 && d < len && (line[d] == '.' || line[d] == ')')) {
+        if(d + 1 >= len) m.len = nd + 1;              // "1." 行尾
+        else if(line[d + 1] == ' ') m.len = nd + 2;   // "1. "
+        else return m;                                 // "1.5" 不是列表
+        m.num_len = nd;
+        m.num = std::atoi(line.substr(i, nd).c_str());
+        m.ordered = m.ok = true;
+        return m;
+    }
+    // 中文序号 + 顿号:一、二、十、十一、…
+    int c = i, nchars = 0;
+    while(c + 3 <= len && md_cn_is_num(line, c)) { c += 3; nchars++; }
+    if(nchars >= 1 && c + 2 < len && (unsigned char)line[c] == 0xE3 &&
+       (unsigned char)line[c + 1] == 0x80 && (unsigned char)line[c + 2] == 0x81) {
+        int nl = 0;
+        m.num = md_cn_num_value(line, i, nl);
+        m.num_len = nl;
+        m.cn = true;
+        m.len = (c - i) + 3;
+        if(c + 3 < len && line[c + 3] == ' ') m.len++;
+        m.ordered = m.ok = true;
+    }
+    return m;
 }

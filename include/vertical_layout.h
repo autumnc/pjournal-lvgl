@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include "markdown.h"
+
 // 竖排以「格」为最小单位:一行先分解为格子(Markdown 关闭时每 UTF-8 字符一格,
 // 开启时块标记替换为等价符号、成对行内标记整段隐藏),列 = 连续 rowsPerCol 个格。
 // 光标/导航按格索引映射,字节只存在于格的 [start,end) 区间内。
@@ -15,6 +17,7 @@ struct VerticalCell {
     std::string glyph;  // 本格绘制的文本(通常一个字符)
     VerticalCellKind kind = VerticalCellKind::Normal;
     bool foldMark = false;  // 折叠标志格
+    MdStyle style;          // 行内粗体/斜体/删除线
 };
 
 struct VerticalCol {

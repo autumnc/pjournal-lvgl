@@ -44,8 +44,16 @@ void Settings::set(const std::string &key, const std::string &value) {
 std::string Settings::journal_dir() const { return get("journal_dir", home_dir() + "/pjournal"); }
 std::string Settings::theme() const { return get("theme", "dark"); }
 std::string Settings::font_file() const { return get("font_file", ""); }
+std::string Settings::font_bold_file() const { return get("font_bold_file", ""); }
+std::string Settings::font_italic_file() const { return get("font_italic_file", ""); }
 int Settings::font_size() const {
     int n = atoi(get("font_size", "24").c_str());
+    if(n < 12) n = 12;
+    if(n > 72) n = 72;
+    return n;
+}
+int Settings::ime_font_size() const {
+    int n = atoi(get("ime_font_size", "27").c_str());
     if(n < 12) n = 12;
     if(n > 72) n = 72;
     return n;

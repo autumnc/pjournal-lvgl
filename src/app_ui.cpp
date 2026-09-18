@@ -83,6 +83,7 @@ static Theme g_theme;
 static lv_style_t g_style;
 static lv_obj_t *g_root = nullptr;
 static lv_obj_t *g_status = nullptr;
+static lv_obj_t *g_status_right = nullptr;  // 状态栏右侧靠右对齐的那半
 static Screen g_screen = Screen::Main;
 static Screen g_prev_screen = Screen::Main;
 static int g_main_sel = 0;
@@ -222,6 +223,20 @@ static std::set<int> g_md_folded;         // 被折叠的标题所在逻辑行
 static int g_md_max_w = 0;                // 编辑器正文宽度(排版用)
 static int g_md_view_h = 0;
 static std::vector<lv_area_t> g_md_sel_rects;  // 选区高亮块(每帧由 refresh 重算)
+static std::vector<lv_area_t> g_md_box_rects;  // 反白底色块(`code` / 链接)
+static std::vector<lv_area_t> g_md_dot_rects;  // 着重号小方点(==高亮==)
+
+// 只读渲染(阅读视图 / 历史预览):与编辑器叠加层共用行级排版,但没有光标/选区/折叠。
+// 定义在编辑器模块里,这里先声明给上面的 render_viewer / render_history 用。
+static lv_obj_t *g_ro_view = nullptr;
+static lv_obj_t *g_ro_content = nullptr;
+static std::vector<lv_obj_t *> g_ro_labels;
+static std::vector<lv_obj_t *> g_ro_rules;
+static std::vector<int> g_viewer_line_y;  // 阅读视图每个源行的 y(按行滚动)
+static int g_viewer_scroll = 0;           // 阅读视图首行行号
+static void md_readonly_create(int x, int y, int w, int h);
+static void md_render_readonly(const std::string &text, int content_w, int line_space,
+                               std::vector<int> *line_y_out);
 
 // 竖排编辑器(文字方向 = 竖排)叠加层。和 Markdown 叠加层一样,lv_textarea
 // 依旧是唯一数据源,这一层只负责按「格」重排并自绘光标/选区/参考线。
@@ -229,12 +244,19 @@ static lv_obj_t *g_vt_view = nullptr;
 static lv_obj_t *g_vt_caret = nullptr;
 static std::vector<lv_obj_t *> g_vt_cols;   // 每列一个标签(字符以 \n 竖排)
 static std::vector<lv_obj_t *> g_vt_marks;  // 选区高亮块(池化复用)
+static std::vector<lv_obj_t *> g_vt_cells;  // 带样式的列改用逐格标签
 static int g_ed_sel_anchor = -1;            // 编辑器选区锚点(字节),-1 = 无选区;横排/竖排共用
 static int g_vt_scroll = 0;                 // 首列列号
 static VerticalLayoutMetrics g_vt_m;        // 当前排版度量
 static VerticalData g_vt_data;              // 上一帧的格数据(导航复用)
 static MdDoc g_vt_doc;                      // 上一帧的行拆分(导航复用)
 static int g_vt_h = 0;
+static std::vector<lv_area_t> g_vt_box_rects;  // 反白格底色块
+static std::vector<lv_area_t> g_vt_deco_rects;  // 竖排下划线/删除线/着重号
+static size_t g_editor_clean_hash = 0;      // 上次保存/载入时正文的哈希
+static bool g_editor_exit_asking = false;   // 退出询问框是否显示
+static int g_editor_exit_target = 0;        // 0=主面板 1=大纲 2=快捷编辑(设置)
+static lv_obj_t *g_editor_exit_dlg = nullptr;
 static Screen g_history_return = Screen::Browser;
 static bool g_history_preview = false;
 static bool g_history_confirm_restore = false;
@@ -328,9 +350,17 @@ static bool g_should_quit = false;
 static lv_font_t *g_ui_font = nullptr;
 static lv_font_t *g_icon_font = nullptr;
 static lv_font_t *g_editor_font = nullptr;
+static lv_font_t *g_editor_bold_font = nullptr;    // 真粗体字体;未配置为 nullptr(改用描两遍)
+static lv_font_t *g_editor_italic_font = nullptr;  // 真斜体字体;未配置为 nullptr
+static lv_font_t *g_editor_faux_italic = nullptr;  // 正文路径 + FreeType 斜切,伪斜体免费
+static lv_font_t *g_ime_font = nullptr;  // 候选条字号独立于正文,由设置里的输入法字号决定
 static const lv_font_t *g_current_font = nullptr;
 
+// 正文行距。着重号画在字脚下面,行挨太紧会蹭到下一行,必须留出余量。
+static constexpr int k_md_line_space = 6;
+
 static void render();
+static void goto_screen(Screen s);
 static void save_editor_text();
 static void editor_follow_cursor();
 static void editor_md_refresh();
@@ -364,9 +394,15 @@ static const char *k_bat_level[10] = {
 };
 
 static std::string battery_percent_label() {
+    // 逐键刷新状态栏时会反复调用,电池读得慢又变得少,这里缓存 30 秒
+    static std::string cache;
+    static uint32_t next_ms = 0;
+    uint32_t now = lv_tick_get();
+    if(!cache.empty() && (int32_t)(now - next_ms) < 0) return cache;
+
     const char *base = "/sys/class/power_supply";
     DIR *d = opendir(base);
-    if(!d) return std::string(k_bat_level[0]) + "\xef\x9c\x80--%";
+    if(!d) return cache = std::string(k_bat_level[0]) + "\xef\x9c\x80--%";
     std::string cap, status;
     dirent *de = nullptr;
     while((de = readdir(d)) != nullptr) {
@@ -387,8 +423,10 @@ static std::string battery_percent_label() {
     if(level < 0) level = 0;
     if(level > 9) level = 9;
     const char *sign = status == "Charging" ? "\xef\x9c\x81" : "\xef\x9c\x80";
-    return (pct < 0 ? std::string(k_bat_level[0]) : std::string(k_bat_level[level])) + sign +
-           (pct < 0 ? "--" : std::to_string(pct)) + "%";
+    cache = (pct < 0 ? std::string(k_bat_level[0]) : std::string(k_bat_level[level])) + sign +
+            (pct < 0 ? "--" : std::to_string(pct)) + "%";
+    next_ms = now + 30000;
+    return cache;
 }
 
 static std::string main_status_text() {
@@ -713,6 +751,58 @@ static bool flomo_send_text(const std::string &text, std::string &msg) {
     }
     msg = response.empty() ? "Flomo无响应" : "Flomo发送失败";
     return false;
+}
+
+// 邮箱+密码登录换取 access_token,与 ESP32 的 login_by_email 同一套签名与请求体。
+static bool flomo_generate_token(std::string &msg) {
+    std::string email = g_settings.get("flomo_email", "");
+    std::string pass = g_settings.get("flomo_pass", "");
+    if(email.empty() || pass.empty()) {
+        msg = "请先设置Flomo邮箱和密码";
+        return false;
+    }
+    if(system("command -v curl >/dev/null 2>&1") != 0) {
+        msg = "未找到 curl";
+        return false;
+    }
+    time_t now = time(nullptr);
+    std::string ts = std::to_string((long long)now);
+    std::string params = "api_key=flomo_web&app_version=4.1&email=" + email + "&password=" + pass +
+                         "&platform=web&timestamp=" + ts + "&webp=1";
+    std::string sign;
+    if(!flomo_sign(params, sign, msg)) return false;
+    std::string body = "{\"email\":\"" + json_escape(email) + "\",\"password\":\"" + json_escape(pass) +
+                       "\",\"wechat_union_id\":\"\",\"wechat_oa_open_id\":\"\",\"timestamp\":\"" + ts +
+                       "\",\"api_key\":\"flomo_web\",\"app_version\":\"4.1\",\"platform\":\"web\","
+                       "\"webp\":\"1\",\"sign\":\"" + sign + "\"}";
+    std::string path = "/tmp/pjournal-flomo-login-" + ts + ".json";
+    if(!safe_write_file(path, body)) {
+        msg = "无法写入Flomo请求";
+        return false;
+    }
+    std::string cmd = "curl -sS -m 30 -X POST -H 'Content-Type: application/json' --data-binary @" +
+                      app_shell_quote(path) + " https://flomoapp.com/api/v1/user/login_by_email";
+    std::string response = app_run_capture(cmd);
+    remove(path.c_str());
+    // {"code":0,"data":{"access_token":"..."}}
+    std::string token;
+    size_t dp = response.find("\"data\"");
+    size_t tp = dp == std::string::npos ? std::string::npos : response.find("\"access_token\"", dp);
+    if(tp == std::string::npos) tp = response.find("\"access_token\"");
+    if(tp != std::string::npos) {
+        size_t vs = response.find('"', tp + 14);
+        if(vs != std::string::npos) {
+            size_t ve = response.find('"', vs + 1);
+            if(ve != std::string::npos) token = response.substr(vs + 1, ve - vs - 1);
+        }
+    }
+    if(token.empty()) {
+        msg = response.empty() ? "Flomo无响应" : "生成失败：邮箱或密码不正确";
+        return false;
+    }
+    g_settings.set("flomo_token", token);
+    msg = "已生成Flomo Token";
+    return true;
 }
 
 static void gtd_save() {
@@ -1306,6 +1396,8 @@ static lv_obj_t *label(lv_obj_t *parent, const std::string &text, int x, int y, 
     lv_obj_set_pos(obj, x, y);
     lv_obj_set_size(obj, w, h);
     lv_obj_set_style_text_color(obj, g_theme.fg, 0);
+    // 内容比框略高时 LVGL 默认会在右/下画滚动条,这里一律不要
+    lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
     return obj;
 }
 
@@ -1319,15 +1411,43 @@ static lv_obj_t *box(lv_obj_t *parent, int x, int y, int w, int h, bool selected
     lv_obj_set_style_bg_color(obj, selected ? g_theme.fg : g_theme.bg, 0);
     lv_obj_set_style_text_color(obj, selected ? g_theme.bg : g_theme.fg, 0);
     lv_obj_set_style_pad_all(obj, 4, 0);
+    // 子控件比内容区略大是常态,不要让 LVGL 画出右/下滚动条
+    lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
     return obj;
+}
+
+// 图标字体(Nerd Font)的 PUA 字形在字宽里基本靠左,照字宽居中会让墨迹整体偏右;
+// 有些字形(如键盘)的墨迹还比字宽宽,按内容自适应尺寸会被 LVGL 裁掉一截。
+// 所以标签铺满整个图标框、文字居中,再按字形墨迹盒(ofs_x/box_w)补一次偏移。
+static void center_ink(lv_obj_t *lbl, const char *txt) {
+    int dx = 0;
+    const lv_font_t *f = lv_obj_get_style_text_font(lbl, LV_PART_MAIN);
+    if(f && txt && *txt) {
+        uint32_t idx = 0;
+        uint32_t cp = lv_text_encoded_next(txt, &idx);
+        lv_font_glyph_dsc_t dsc {};
+        if(lv_font_get_glyph_dsc(f, &dsc, cp, 0) && dsc.box_w)
+            dx = (int)dsc.adv_w / 2 - dsc.ofs_x - dsc.box_w / 2;
+    }
+    lv_obj_align(lbl, LV_ALIGN_CENTER, dx, 0);
 }
 
 static void set_status(const std::string &left, const std::string &right = "") {
     if(!g_status) return;
-    std::string s = left;
-    if(!right.empty()) s += "    " + right;
-    lv_label_set_text(g_status, s.c_str());
+    lv_label_set_text(g_status, left.c_str());
+    // 右侧是输入法/电池这类常驻内容,单独传 right 时才覆盖,免得临时提示把它抹掉
+    if(g_status_right && !right.empty()) lv_label_set_text(g_status_right, right.c_str());
 }
+
+// 状态栏高度跟着 UI 字体走,换字号也不会把字的下半截切掉
+static int status_bar_h() {
+    int lh = lv_font_get_line_height(g_ui_font ? g_ui_font : LV_FONT_DEFAULT);
+    if(lh < 16) lh = 16;
+    return lh + 8;
+}
+static int status_bar_y() { return 596 - status_bar_h(); }
+// 正文能占到的最下边(状态栏上方再留一点空白)
+static int chrome_bottom() { return status_bar_y() - 4; }
 
 // The UI chrome keeps one fixed face so menus, status bar and calendar stay
 // visually stable; the 字体 setting only swaps the editor's text font.
@@ -1336,12 +1456,32 @@ static const char *k_ui_font_path = "/root/.fonts/Go-LavaPropo-NF-R.ttf";
 void app_ui_reload_font() {
     std::string ui_path = k_ui_font_path;
     if(!g_fonts.supports_cjk(ui_path)) ui_path = g_fonts.default_font_path();
-    g_ui_font = g_fonts.load(ui_path, 24);
+    g_ui_font = g_fonts.load(ui_path, 27);
     g_icon_font = g_fonts.load(ui_path, 60);
+    g_ime_font = g_fonts.load(ui_path, g_settings.ime_font_size());
+    // 候选分页是按字形宽度算好的,字号一换就得作废重排
+    g_linux_ime.set_display_width(0);
 
     std::string editor_path = g_settings.font_file();
     if(editor_path.empty() || !g_fonts.supports_cjk(editor_path)) editor_path = g_fonts.default_font_path();
-    g_editor_font = g_fonts.load(editor_path, g_settings.font_size());
+    int esize = g_settings.font_size();
+    g_editor_font = g_fonts.load(editor_path, esize);
+    // 粗体/斜体各自可指一个真字体;留空就用伪粗体/伪斜体。
+    std::string bold_path = g_settings.font_bold_file();
+    std::string italic_path = g_settings.font_italic_file();
+    g_editor_bold_font = bold_path.empty() ? nullptr : g_fonts.load(bold_path, esize);
+    g_editor_italic_font = italic_path.empty() ? nullptr : g_fonts.load(italic_path, esize);
+    g_editor_faux_italic = g_fonts.load(editor_path, esize, FontStyle::Italic);
+    // 粗体/斜体多半是拉丁字体,不含中日韩,缺字得往下回退,否则混排里的中文变成豆腐块。
+    // 斜体回退到伪斜体(正文路径 + 斜切)而不是正文字体,这样中文照样是斜的;
+    // 伪粗体没有对应的字体对象(靠描两遍实现),粗体只能退回正文字体,中文不加粗。
+    // 两者的下一跳都是 FontManager 挂的符号回退,整条链不断。
+    if(g_editor_font) {
+        if(g_editor_bold_font && g_editor_bold_font != g_editor_font)
+            g_editor_bold_font->fallback = g_editor_font;
+        if(g_editor_italic_font && g_editor_italic_font != g_editor_faux_italic && g_editor_faux_italic)
+            g_editor_italic_font->fallback = g_editor_faux_italic;
+    }
 
     lv_font_t *font = g_ui_font ? g_ui_font : g_editor_font;
     g_current_font = font;
@@ -1362,6 +1502,8 @@ void app_ui_reload_theme() {
 
 static void clear_root() {
     lv_obj_clean(g_root);
+    g_status = nullptr;
+    g_status_right = nullptr;
     g_editor = nullptr;
     g_setting_text = nullptr;
     g_gtd.input = nullptr;
@@ -1387,20 +1529,42 @@ static void clear_root() {
     g_md_caret = nullptr;
     g_md_labels.clear();
     g_md_rules.clear();
+    g_md_sel_rects.clear();
+    g_md_box_rects.clear();
+    g_md_dot_rects.clear();
+    g_ro_view = nullptr;
+    g_ro_content = nullptr;
+    g_ro_labels.clear();
+    g_ro_rules.clear();
+    g_viewer_line_y.clear();
     g_vt_view = nullptr;
     g_vt_caret = nullptr;
+    g_editor_exit_dlg = nullptr;
     g_vt_cols.clear();
     g_vt_marks.clear();
+    g_vt_cells.clear();
+    g_vt_box_rects.clear();
+    g_vt_deco_rects.clear();
     g_ed_sel_anchor = -1;
     base_style(g_root);
 }
 
-static void draw_status_bar(const std::string &left = "", bool align_right = false) {
-    g_status = label(g_root, left, 8, 570, 1000, 26);
+// right 非空时在状态栏右侧另起一个靠右对齐的标签(如输入法状态 + 电池)
+static void draw_status_bar(const std::string &left = "", bool align_right = false,
+                            const std::string &right = "") {
+    int y = status_bar_y();
+    int h = status_bar_h();
+    g_status = label(g_root, left, 8, y, 1000, h);
     lv_obj_set_style_text_align(g_status, align_right ? LV_TEXT_ALIGN_RIGHT : LV_TEXT_ALIGN_LEFT, 0);
     lv_obj_set_style_border_width(g_status, 1, LV_PART_MAIN);
     lv_obj_set_style_border_side(g_status, LV_BORDER_SIDE_TOP, LV_PART_MAIN);
     lv_obj_set_style_pad_top(g_status, 4, 0);
+    g_status_right = nullptr;
+    if(!right.empty()) {
+        g_status_right = label(g_root, right, 8, y, 1000, h);
+        lv_obj_set_style_text_align(g_status_right, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_set_style_pad_top(g_status_right, 4, 0);
+    }
 }
 
 static lv_obj_t *active_textarea() {
@@ -1423,10 +1587,30 @@ static const lv_font_t *active_text_font(lv_obj_t *ta) {
     return LV_FONT_DEFAULT;
 }
 
+static const lv_font_t *ime_font() {
+    if(g_ime_font) return g_ime_font;
+    if(g_ui_font) return g_ui_font;
+    return LV_FONT_DEFAULT;
+}
+
+// 候选条按像素宽度分页要好 IME 自己知道每个候选用当前字体占多宽
+static int ime_measure_width(const char *text) {
+    if(!text) return 0;
+    return (int)lv_text_get_width(text, (uint32_t)strlen(text), ime_font(), 0);
+}
+
+// 候选条高度跟着输入法字号走,字号调大也不会切掉下半截
+static int ime_bar_h() {
+    int lh = lv_font_get_line_height(ime_font());
+    if(lh < 12) lh = 12;
+    return lh + 8;
+}
+
 static void create_ime_bar() {
     if(g_ime_bar) return;
-    g_ime_bar = label(g_root, "", 8, 534, 656, 30);
+    g_ime_bar = label(g_root, "", 8, chrome_bottom() - ime_bar_h(), 656, ime_bar_h());
     lv_label_set_long_mode(g_ime_bar, LV_LABEL_LONG_CLIP);
+    if(g_ime_font) lv_obj_set_style_text_font(g_ime_bar, g_ime_font, 0);
     lv_obj_set_style_bg_color(g_ime_bar, g_theme.bg, 0);
     lv_obj_set_style_bg_opa(g_ime_bar, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(g_ime_bar, g_theme.fg, 0);
@@ -1440,37 +1624,146 @@ static std::string editor_status_text() {
     else if(!g_ol.editPath.empty()) mode = "大纲文件 " + g_ol.project;
     else if(g_edit_file.empty()) mode = g_prompt.empty() ? "自由写作" : "提示写作";
     else mode = "编辑 " + g_edit_file;
-    std::string ime;
-    if(!g_linux_ime.active()) ime = "EN";
-    else if(g_linux_ime.english()) ime = "[英]";
-    else {
-        ime = "[中]";
-        ime += g_linux_ime.fullwidth() ? "●" : "◐";
-        ime += g_linux_ime.trad() ? "繁" : "简";
-    }
-    return mode + "  " + ime;
+    return mode;
+}
+
+static std::string editor_ime_text() {
+    if(!g_linux_ime.active()) return "EN";
+    if(g_linux_ime.english()) return "[英]";
+    return std::string("[中]") + (g_linux_ime.fullwidth() ? "●" : "◐") + (g_linux_ime.trad() ? "繁" : "简");
+}
+
+// 状态栏右侧:输入法状态 + 电池,格式与主面板一致
+static std::string editor_right_text() {
+    return editor_ime_text() + "  " + battery_percent_label();
 }
 
 static void refresh_ime_status() {
-    if(g_screen == Screen::Editor) set_status(editor_status_text());
+    if(g_screen != Screen::Editor || !g_status_right) return;
+    lv_label_set_text(g_status_right, editor_right_text().c_str());
+}
+
+// 横排:把候选条真正可用的像素宽度交给 IME,由它按字形宽度分页——一页塞不下的
+// 候选整项挪到下一页,编号从 1 重新计。这里只把当前页原样画出来,不再自己截断,
+// 否则会出现"页里藏着 7/8/9 却看不见、翻页又从别处开始"的错位。
+static void ime_bar_layout_horizontal(int x, int y, int bar_w) {
+    const lv_font_t *f = ime_font();
+    std::string head = " " + g_linux_ime.composition() + "  ";
+    int head_w = f ? (int)lv_text_get_width(head.c_str(), (uint32_t)head.size(), f, 0) : 0;
+    // 页码在 buildPage 之后才定,这里按两位数页码预留,免得页数从 9 变 10 时撑破行宽
+    int tail_w = f ? (int)lv_text_get_width(" 88/88", 6, f, 0) : 0;
+    // v 模式的命中候选带方括号,宽度也留出来,免得它被挤到下一页去高亮
+    int br_w = (f && g_linux_ime.highlight_index() >= 0)
+                   ? (int)lv_text_get_width("[]", 2, f, 0) : 0;
+    int budget = bar_w - 8 - head_w - tail_w - br_w;  // 8 = create_ime_bar 的左右内边距
+    if(budget < 80) budget = 80;
+    if(budget > bar_w - 8) budget = bar_w - 8;
+    g_linux_ime.set_display_width(budget);
+
+    std::string tail = " " + std::to_string(g_linux_ime.current_page()) + "/" +
+                       std::to_string(g_linux_ime.total_pages());
+    // 前缀和 buildPage 量宽的 " 编号." + 候选 完全一致,分页与渲染才不会错位
+    std::string s = head;
+    const auto &c = g_linux_ime.candidates();
+    int hi = g_linux_ime.highlight_index();
+    for(size_t i = 0; i < c.size(); ++i) {
+        std::string part = std::to_string((int)i + 1) + "." + c[i];
+        s += ((int)i == hi) ? " [" + part + "]" : " " + part;
+    }
+    s += tail;
+
+    lv_obj_set_style_text_line_space(g_ime_bar, 0, 0);
+    lv_label_set_text(g_ime_bar, s.c_str());
+    lv_obj_set_pos(g_ime_bar, x, y);
+    lv_obj_set_size(g_ime_bar, bar_w, ime_bar_h());
+}
+
+// 竖排:正文是一列列竖着的字,候选条贴着光标那一格竖着排,一行一个候选。
+// 光标下面放不下整块候选区时改成从下往上长,顺序也跟着倒过来,让 1 号候选始终贴着光标。
+static void ime_bar_layout_vertical() {
+    const lv_font_t *f = ime_font();
+    int lh = f ? lv_font_get_line_height(f) : 24;
+    int row_h = lh + 2;
+
+    lv_obj_update_layout(g_vt_view);
+    lv_area_t va {};
+    lv_obj_get_coords(g_vt_view, &va);
+    bool caret_on = g_vt_caret && !lv_obj_has_flag(g_vt_caret, LV_OBJ_FLAG_HIDDEN);
+    lv_area_t cc {};
+    if(caret_on) lv_obj_get_coords(g_vt_caret, &cc);
+
+    int below_top = (caret_on ? cc.y2 : va.y1) + 6;                    // 向下时的起始边
+    int above_bottom = (caret_on ? cc.y1 : va.y1) - 6;                 // 向上时的收尾边
+    int space_down = chrome_bottom() - below_top;
+    int space_up = above_bottom - 8;
+    // 编码行加两个候选算"够用",不够就翻转;两边都挤时挑空的那边
+    int need = row_h * 3 + 8;
+    bool upward = space_down < need && space_up > space_down;
+
+    // 先扣掉编码那行,再扣底边;页内至少 1 个候选、最多 9 个
+    int cap = ((upward ? space_up : space_down) - 8) / row_h - 1;
+    if(cap < 1) cap = 1;
+    if(cap > 9) cap = 9;
+    g_linux_ime.set_display_width(0);  // 竖排按行数分页,不走像素宽度那条路
+    g_linux_ime.set_page_size(cap);
+
+    const auto &c = g_linux_ime.candidates();
+    int hi = g_linux_ime.highlight_index();
+    std::string head = " " + g_linux_ime.composition() + "  " +
+                       std::to_string(g_linux_ime.current_page()) + "/" +
+                       std::to_string(g_linux_ime.total_pages());
+    int wmax = f ? (int)lv_text_get_width(head.c_str(), (uint32_t)head.size(), f, 0) : 0;
+    std::vector<std::string> lines;
+    for(size_t i = 0; i < c.size(); ++i) {
+        std::string part = std::to_string((int)i + 1) + "." + c[i];
+        if((int)i == hi) part = "[" + part + "]";
+        lines.push_back(part);
+        int pw = f ? (int)lv_text_get_width(part.c_str(), (uint32_t)part.size(), f, 0) : 0;
+        if(pw > wmax) wmax = pw;
+    }
+    // 向下:编码行在上,候选 1 紧贴光标。向上:编码行翻到最上,候选从 1 号往上递增。
+    std::string s = head;
+    if(upward) {
+        for(size_t i = lines.size(); i-- > 0;) s += "\n" + lines[i];
+    } else {
+        for(size_t i = 0; i < lines.size(); ++i) s += "\n" + lines[i];
+    }
+
+    int w = wmax + 14;
+    if(w < 120) w = 120;
+    if(w > 320) w = 320;
+    int h = ((int)c.size() + 1) * row_h + 8;
+    int x = caret_on ? cc.x1 - w - 6 : va.x1 + 6;  // 优先排在光标左边
+    if(x < 8) x = (caret_on ? cc.x2 + 6 : va.x1 + 6);
+    if(x + w > 1016) x = 1016 - w;
+    if(x < 8) x = 8;
+    int y = upward ? above_bottom - h : below_top;
+    if(y + h > chrome_bottom()) y = chrome_bottom() - h;
+    if(y < 8) y = 8;
+
+    lv_obj_set_style_text_line_space(g_ime_bar, row_h - lh, 0);
+    lv_label_set_text(g_ime_bar, s.c_str());
+    lv_obj_set_pos(g_ime_bar, x, y);
+    lv_obj_set_size(g_ime_bar, w, h);
 }
 
 static void update_ime_bar() {
     create_ime_bar();
     if(!g_ime_bar) return;
-    if(!g_linux_ime.active()) {
+    // 输入法状态交给状态栏右侧显示,这里只在组字时弹候选条
+    if(!g_linux_ime.active() || !g_linux_ime.composing()) {
         lv_obj_add_flag(g_ime_bar, LV_OBJ_FLAG_HIDDEN);
         refresh_ime_status();
         return;
     }
-    if(!g_linux_ime.composing()) {
-        lv_obj_clear_flag(g_ime_bar, LV_OBJ_FLAG_HIDDEN);
-        std::string ime = g_linux_ime.english() ? "[英]" : (std::string("[中]") + (g_linux_ime.fullwidth() ? "●" : "◐") + (g_linux_ime.trad() ? "繁" : "简"));
-        lv_label_set_text(g_ime_bar, (ime + "  Ctrl+Space").c_str());
+    lv_obj_clear_flag(g_ime_bar, LV_OBJ_FLAG_HIDDEN);
+
+    if(editor_vertical() && g_vt_view && g_vt_caret) {
+        ime_bar_layout_vertical();
+        lv_obj_move_foreground(g_ime_bar);
         refresh_ime_status();
         return;
     }
-    lv_obj_clear_flag(g_ime_bar, LV_OBJ_FLAG_HIDDEN);
 
     int x = 12;
     int y = 500;
@@ -1494,7 +1787,8 @@ static void update_ime_bar() {
     }
     if(x < 8) x = 8;
     if(x > 360) x = 360;
-    if(y > 526) y -= 58;
+    int bh = ime_bar_h();
+    if(y + bh > chrome_bottom()) y -= 58;  // 光标太靠下就挪到上一行
     if(y < 8) y = 8;
     int bar_w = std::min(656, 1016 - x);
     if(bar_w < 320) {
@@ -1502,55 +1796,9 @@ static void update_ime_bar() {
         bar_w = std::min(656, 1016 - x);
     }
 
-    g_linux_ime.set_display_width(bar_w - 16);
-    std::string tail = " " + std::to_string(g_linux_ime.current_page()) + "/" + std::to_string(g_linux_ime.total_pages());
-    std::string s = " " + g_linux_ime.composition() + "  ";
-    const auto &c = g_linux_ime.candidates();
-    int hi = g_linux_ime.highlight_index();
-    if(!c.empty()) {
-        const lv_font_t *measure_font = active_text_font(ta);
-        int used_w = (int)lv_text_get_width(s.c_str(), (uint32_t)s.size(), measure_font, 0);
-        int tail_w = (int)lv_text_get_width(tail.c_str(), (uint32_t)tail.size(), measure_font, 0);
-        for(size_t i = 0; i < c.size(); ++i) {
-            std::string part;
-            if((int)i == hi) part += "[";
-            part += std::to_string((int)(i % g_linux_ime.page_size()) + 1);
-            part += ".";
-            part += c[i];
-            if((int)i == hi) part += "]";
-            part += " ";
-            int part_w = (int)lv_text_get_width(part.c_str(), (uint32_t)part.size(), measure_font, 0);
-            if(used_w + part_w + tail_w + 12 > bar_w) break;
-            s += part;
-            used_w += part_w;
-        }
-        s += tail;
-    }
-    lv_label_set_text(g_ime_bar, s.c_str());
-    lv_obj_set_pos(g_ime_bar, x, y);
-    lv_obj_set_size(g_ime_bar, bar_w, 30);
+    ime_bar_layout_horizontal(x, y, bar_w);
     lv_obj_move_foreground(g_ime_bar);
     refresh_ime_status();
-    return;
-
-#if 0
-    if(!g_linux_ime.active()) {
-        lv_label_set_text(g_ime_bar, "IME: off  Ctrl+Space");
-        return;
-    }
-    std::string s = "IME: " + g_linux_ime.composition();
-    const auto &c = g_linux_ime.candidates();
-    if(!c.empty()) {
-        s += "  ";
-        for(size_t i = 0; i < c.size(); ++i) {
-            s += std::to_string(i + 1);
-            s += ".";
-            s += c[i];
-            s += " ";
-        }
-    }
-    lv_label_set_text(g_ime_bar, s.c_str());
-#endif
 }
 
 static void render_main() {
@@ -1607,7 +1855,7 @@ static void render_main() {
                 lv_obj_t *frame = box(g_root, fx, fy, 68, 32, false);
                 lv_obj_set_style_bg_opa(frame, LV_OPA_TRANSP, 0);
                 lv_obj_set_style_pad_all(frame, 0, 0);
-                txt = label(g_root, cell, fx, fy + 4, 68, 24);
+                txt = label(g_root, cell, fx, fy + 2, 68, 30);
                 lv_obj_move_foreground(txt);
             } else {
                 txt = label(g_root, cell, col * col_w, 104 + row * 42, col_w, 32);
@@ -1663,18 +1911,64 @@ static void render_main() {
         lv_obj_t *icon = box(g_root, cx - 42, 416, 84, 76, i == g_main_sel);
         lv_obj_set_style_border_width(icon, 0, 0);
         lv_obj_set_style_pad_all(icon, 0, 0);
-        lv_obj_t *sym = label(icon, a.symbol, 0, 0, 84, 72);
+        // 图标字号大,PUA 字形在字宽里靠左、墨迹还可能比字宽宽,得铺满框再按墨迹居中
+        lv_obj_t *sym = label(icon, a.symbol, 0, 0, 84);
         if(g_icon_font) lv_obj_set_style_text_font(sym, g_icon_font, 0);
         lv_obj_set_style_text_align(sym, LV_TEXT_ALIGN_CENTER, 0);
-        if(i == g_main_sel) {
-            lv_obj_set_style_text_color(sym, g_theme.bg, 0);
-        }
-        lv_obj_t *name = label(g_root, a.title, i * slot, 498, slot, 28);
-        lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_t *key = label(g_root, std::string("[") + a.key + "]", i * slot, 526, slot, 24);
-        lv_obj_set_style_text_align(key, LV_TEXT_ALIGN_CENTER, 0);
+        center_ink(sym, a.symbol);
+        if(i == g_main_sel) lv_obj_set_style_text_color(sym, g_theme.bg, 0);
     }
+    int sel_idx = (total > 0 || g_main_sel < 2) ? g_main_sel : g_main_sel + 1;
+    lv_obj_t *hint = label(g_root, std::string("[") + k_actions[sel_idx].key + "] " + k_actions[sel_idx].title,
+                           0, 502, 1024, 34);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
     draw_status_bar(main_status_text(), true);
+}
+
+// 正文和上次保存/载入时是否一致。直接比哈希,不依赖 LVGL 的文本变更事件。
+static size_t editor_text_hash() {
+    const char *t = g_editor ? lv_textarea_get_text(g_editor) : nullptr;
+    return std::hash<std::string>{}(t ? t : "");
+}
+
+static void editor_mark_clean() {
+    g_editor_clean_hash = editor_text_hash();
+}
+
+static bool editor_dirty() {
+    return g_editor && editor_text_hash() != g_editor_clean_hash;
+}
+
+static void editor_leave() {
+    if(g_editor_exit_target == 1) goto_screen(Screen::Outline);
+    else if(g_editor_exit_target == 2) {
+        g_quick_slot = -1;
+        goto_screen(Screen::Settings);
+    } else goto_screen(Screen::Main);
+}
+
+static void editor_exit_target_from_state() {
+    if(!g_ol.editPath.empty()) g_editor_exit_target = 1;
+    else if(g_quick_slot >= 0) g_editor_exit_target = 2;
+    else g_editor_exit_target = 0;
+}
+
+// 有未保存改动时按返回弹出的询问框
+static void draw_editor_exit_confirm() {
+    lv_obj_t *dlg = box(g_root, 312, 218, 400, 142, false);
+    lv_obj_set_style_bg_color(dlg, g_theme.bg, 0);
+    lv_obj_set_style_border_width(dlg, 2, 0);
+    lv_obj_t *t = label(dlg, "有未保存的修改", 0, 6, 392, 30);
+    lv_obj_set_style_text_align(t, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_t *a = label(dlg, "Enter 保存并返回", 0, 40, 392, 28);
+    lv_obj_set_style_text_align(a, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_t *b = label(dlg, "N 不保存返回", 0, 68, 392, 28);
+    lv_obj_set_style_text_align(b, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_t *c = label(dlg, "Esc 取消", 0, 96, 392, 28);
+    lv_obj_set_style_text_color(c, g_theme.muted, 0);
+    lv_obj_set_style_text_align(c, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_move_foreground(dlg);
+    g_editor_exit_dlg = dlg;
 }
 
 static void render_editor() {
@@ -1693,6 +1987,7 @@ static void render_editor() {
     lv_obj_set_size(g_editor, 1008, editor_h);
     base_style(g_editor);
     if(g_editor_font) lv_obj_set_style_text_font(g_editor, g_editor_font, 0);
+    lv_obj_set_style_text_line_space(g_editor, k_md_line_space, 0);
     lv_obj_set_style_border_width(g_editor, 0, 0);
     lv_obj_set_style_pad_all(g_editor, 0, 0);
     lv_textarea_set_one_line(g_editor, false);
@@ -1733,7 +2028,11 @@ static void render_editor() {
     }
     create_ime_bar();
     update_ime_bar();
-    draw_status_bar(!g_recovery_meta.empty() ? ("已恢复草稿  " + editor_status_text()) : editor_status_text());
+    draw_status_bar(!g_recovery_meta.empty() ? ("已恢复草稿  " + editor_status_text()) : editor_status_text(),
+                    false, editor_right_text());
+    // 重新载入的正文就是"干净"的基准,之后的改动才算未保存
+    editor_mark_clean();
+    if(g_editor_exit_asking) draw_editor_exit_confirm();
     editor_follow_cursor();
 }
 
@@ -1918,30 +2217,12 @@ static void render_browser() {
 static void render_viewer() {
     clear_root();
     label(g_root, g_view_file, 8, 8, 1008, 32);
-    lv_obj_t *cont = lv_obj_create(g_root);
-    lv_obj_set_pos(cont, 8, 48);
-    lv_obj_set_size(cont, 1008, 516);
-    lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
-    base_style(cont);
-    lv_obj_set_style_border_width(cont, 0, 0);
-    auto lines = parse_markdown_lines(g_journal.read_entry(g_view_file));
-    for(const auto &line : lines) {
-        if(line.kind == MdKind::Blank) {
-            lv_obj_t *sp = lv_obj_create(cont);
-            lv_obj_set_size(sp, 1, 8);
-            lv_obj_set_style_border_width(sp, 0, 0);
-            lv_obj_set_style_bg_opa(sp, LV_OPA_TRANSP, 0);
-            continue;
-        }
-        std::string s = line.text;
-        if(line.kind == MdKind::List) s = "• " + s;
-        if(line.kind == MdKind::Quote) s = "| " + s;
-        lv_obj_t *l = lv_label_create(cont);
-        lv_label_set_text(l, s.c_str());
-        lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(l, lv_pct(100));
-        lv_obj_set_style_text_color(l, line.kind == MdKind::Heading1 || line.kind == MdKind::Heading2 ? g_theme.accent : g_theme.fg, 0);
-    }
+    md_readonly_create(8, 48, 1008, 516);
+    md_render_readonly(g_journal.read_entry(g_view_file), 1008, k_md_line_space, &g_viewer_line_y);
+    if(g_viewer_scroll >= (int)g_viewer_line_y.size()) g_viewer_scroll = (int)g_viewer_line_y.size() - 1;
+    if(g_viewer_scroll < 0) g_viewer_scroll = 0;
+    if(!g_viewer_line_y.empty())
+        lv_obj_scroll_to_y(g_ro_view, g_viewer_line_y[g_viewer_scroll], LV_ANIM_OFF);
     draw_status_bar("阅读");
 }
 
@@ -1969,31 +2250,14 @@ static void render_history() {
     if(g_history_preview && !g_history_versions.empty()) {
         const auto &v = g_history_versions[g_history_sel];
         label(g_root, "历史 " + history_filename_label(v.filename), 8, 8, 1008, 32);
-        lv_obj_t *cont = lv_obj_create(g_root);
-        lv_obj_set_pos(cont, 8, 48);
-        lv_obj_set_size(cont, 1008, 516);
-        lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
-        base_style(cont);
-        lv_obj_set_style_border_width(cont, 0, 0);
-        auto lines = parse_markdown_lines(g_journal.read_history_version(g_history_file, v.filename));
-        for(const auto &line : lines) {
-            if(line.kind == MdKind::Blank) {
-                lv_obj_t *sp = lv_obj_create(cont);
-                lv_obj_set_size(sp, 1, 8);
-                lv_obj_set_style_border_width(sp, 0, 0);
-                lv_obj_set_style_bg_opa(sp, LV_OPA_TRANSP, 0);
-                continue;
-            }
-            std::string s = line.text;
-            if(line.kind == MdKind::List) s = "• " + s;
-            if(line.kind == MdKind::Quote) s = "| " + s;
-            lv_obj_t *l = lv_label_create(cont);
-            lv_label_set_text(l, s.c_str());
-            lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
-            lv_obj_set_width(l, lv_pct(100));
-            lv_obj_set_style_text_color(l, line.kind == MdKind::Heading1 || line.kind == MdKind::Heading2 ? g_theme.accent : g_theme.fg, 0);
-        }
-        lv_obj_scroll_to_y(cont, g_history_preview_scroll * std::max(18, g_settings.font_size() + 4), LV_ANIM_OFF);
+        md_readonly_create(8, 48, 1008, 516);
+        md_render_readonly(g_journal.read_history_version(g_history_file, v.filename), 1008,
+                           k_md_line_space, &g_viewer_line_y);
+        int idx = g_history_preview_scroll;
+        if(idx >= (int)g_viewer_line_y.size()) idx = (int)g_viewer_line_y.size() - 1;
+        if(idx < 0) idx = 0;
+        if(!g_viewer_line_y.empty())
+            lv_obj_scroll_to_y(g_ro_view, g_viewer_line_y[idx], LV_ANIM_OFF);
         draw_status_bar("历史预览");
     } else {
         label(g_root, "历史版本  " + g_history_file, 8, 8, 1008, 32);
@@ -2977,7 +3241,7 @@ static std::vector<std::pair<std::string, std::string>> setting_options(const st
     if(k == "md_render" || k == "first_line_indent" || k == "version_history" ||
        k == "auto_save" || k == "recovery_draft" || k == "vertical_ref_line")
         return {{"1", "开"}, {"0", "关"}};
-    if(k == "font_size") {
+    if(k == "font_size" || k == "ime_font_size") {
         std::vector<std::pair<std::string, std::string>> o;
         for(int n : {16, 18, 20, 22, 24, 28, 32, 36, 48}) o.push_back({std::to_string(n), std::to_string(n)});
         return o;
@@ -2988,6 +3252,13 @@ static std::vector<std::pair<std::string, std::string>> setting_options(const st
         if(o.empty()) o.push_back({g_fonts.default_font_path(), g_fonts.default_font_path()});
         return o;
     }
+    if(k == "font_bold_file" || k == "font_italic_file") {
+        // 空值代表不指定真字体,用描两遍/斜切凑出效果
+        std::vector<std::pair<std::string, std::string>> o{
+            {"", k == "font_bold_file" ? "(伪粗体)" : "(伪斜体)"}};
+        for(const auto &f : g_fonts.fonts()) o.push_back({f.path, f.path});
+        return o;
+    }
     return {};
 }
 
@@ -2996,7 +3267,10 @@ static std::string setting_current_value(const std::string &k) {
     if(k == "app_mode") return g_settings.app_mode();
     if(k == "home_view") return g_settings.home_view();
     if(k == "font_size") return std::to_string(g_settings.font_size());
+    if(k == "ime_font_size") return std::to_string(g_settings.ime_font_size());
     if(k == "font_file") return g_settings.font_file().empty() ? g_fonts.default_font_path() : g_settings.font_file();
+    if(k == "font_bold_file") return g_settings.font_bold_file();
+    if(k == "font_italic_file") return g_settings.font_italic_file();
     if(k == "input_mode") return g_settings.input_mode();
     if(k == "editor_orientation") return editor_vertical() ? "vertical" : "horizontal";
     if(k == "editor_mode") return g_settings.editor_mode();
@@ -3012,7 +3286,7 @@ static std::string setting_current_value(const std::string &k) {
 
 static void setting_apply(const std::string &k, const std::string &v) {
     g_settings.set(k, v);
-    if(k == "font_file") app_ui_reload_font();
+    if(k == "font_file" || k == "font_bold_file" || k == "font_italic_file") app_ui_reload_font();
     app_ui_reload_theme();
 }
 
@@ -3051,7 +3325,12 @@ static std::vector<SetItem> settings_items() {
         {"app_mode", "工作模式", g_settings.app_mode() == "quick" ? "快捷编辑" : "个人日记"},
         {"home_view", "主页视图", g_settings.home_view() == "month" ? "月视图" : "周视图"},
         {"font_size", "字号", std::to_string(g_settings.font_size())},
-        {"font_file", "字体", g_settings.font_file().empty() ? g_fonts.default_font_path() : g_settings.font_file()},
+        {"ime_font_size", "输入法字号", std::to_string(g_settings.ime_font_size())},
+        {"font_file", "正文字体", g_settings.font_file().empty() ? g_fonts.default_font_path() : g_settings.font_file()},
+        {"font_bold_file", "粗体字体",
+         g_settings.font_bold_file().empty() ? "(伪粗体)" : g_settings.font_bold_file()},
+        {"font_italic_file", "斜体字体",
+         g_settings.font_italic_file().empty() ? "(伪斜体)" : g_settings.font_italic_file()},
         {"journal_dir", "保存位置", g_settings.journal_dir()},
         {"webdav_url", "WebDAV URL", g_settings.get("webdav_url", "")},
         {"webdav_user", "WebDAV 用户", g_settings.get("webdav_user", "")},
@@ -3067,7 +3346,7 @@ static std::vector<SetItem> settings_items() {
         {"polish_prompt", "润色提示词", g_settings.get("polish_prompt", "").empty() ? "(未设置)" : "(已设置)"},
         {"flomo_email", "Flomo 邮箱", g_settings.get("flomo_email", "")},
         {"flomo_pass", "Flomo 密码", g_settings.get("flomo_pass", "").empty() ? "" : "******"},
-        {"flomo_token", "Flomo Token", g_settings.get("flomo_token", "").empty() ? "" : "******"},
+        {"flomo_token", "Flomo Token", g_settings.get("flomo_token", "").empty() ? "未生成" : "已生成"},
         {"personal_exp", "个人经历", g_settings.get("personal_exp", "").empty() ? "(未设置)" : "(已设置)"},
         {"personal_hob", "个人爱好", g_settings.get("personal_hob", "").empty() ? "(未设置)" : "(已设置)"},
         {"editor_orientation", "文字方向", editor_vertical() ? "竖排" : "横排"},
@@ -3550,6 +3829,7 @@ static void save_editor_text() {
     if(body.empty()) {
         if(!g_ol.editPath.empty()) {
             bool ok = safe_write_file(g_ol.editPath, "");
+            if(ok) editor_mark_clean();
             set_status(ok ? "已保存" : "保存失败");
             return;
         }
@@ -3563,11 +3843,13 @@ static void save_editor_text() {
     }
     if(g_quick_slot >= 0) {
         bool ok = ensure_dir_path(quick_dir()) && safe_write_file(quick_file(g_quick_slot), body);
+        if(ok) editor_mark_clean();
         set_status(ok ? "已保存快捷文件" : "保存快捷文件失败");
         return;
     }
     if(!g_ol.editPath.empty()) {
         bool ok = safe_write_file(g_ol.editPath, body);
+        if(ok) editor_mark_clean();
         set_status(ok ? "已保存" : "保存失败");
         return;
     }
@@ -3577,6 +3859,7 @@ static void save_editor_text() {
         g_journal.clear_recovery_draft();
         g_last_recovery_hash = 0;
         g_recovery_meta.clear();
+        editor_mark_clean();
     }
     set_status(ok ? "已保存" : "保存失败");
 }
@@ -3678,7 +3961,7 @@ static void handle_browser(int key) {
     if(g_browser_sel < 0) g_browser_sel = 0;
     if(g_browser_sel >= (int)g_entries.size()) g_browser_sel = (int)g_entries.size() - 1;
     if(g_entries.empty()) { goto_screen(Screen::Main); return; }
-    if(key == '\n' || key == '\r') { g_view_file = g_entries[g_browser_sel].filename; goto_screen(Screen::Viewer); return; }
+    if(key == '\n' || key == '\r') { g_view_file = g_entries[g_browser_sel].filename; g_viewer_scroll = 0; goto_screen(Screen::Viewer); return; }
     if(key == 'e' || key == 'E') { g_quick_slot = -1; g_edit_file = g_entries[g_browser_sel].filename; g_prompt.clear(); goto_screen(Screen::Editor); return; }
     if(key == 'h' || key == 'H') { open_history(g_entries[g_browser_sel].filename, Screen::Browser); return; }
     if(key == 'd' || key == 'D') { g_journal.delete_entry(g_entries[g_browser_sel].filename); }
@@ -3805,7 +4088,16 @@ static void handle_settings(int key) {
         if(k == "polish_prompt") { open_setting_text("polish_prompt", "润色提示词"); return; }
         if(k == "flomo_email") { open_setting_text("flomo_email", "Flomo 邮箱"); return; }
         if(k == "flomo_pass") { open_setting_text("flomo_pass", "Flomo 密码"); return; }
-        if(k == "flomo_token") { open_setting_text("flomo_token", "Flomo Token"); return; }
+        if(k == "flomo_token") {
+            std::string m;
+            set_status("正在生成Flomo Token...");
+            lv_timer_handler();
+            flomo_generate_token(m);
+            // render() 会重建状态栏,提示必须在它之后再写
+            render();
+            set_status(m);
+            return;
+        }
         if(k == "personal_exp") { open_setting_text("personal_exp", "个人经历"); return; }
         if(k == "personal_hob") { open_setting_text("personal_hob", "个人爱好"); return; }
         if(k == "file_mgr_token") { open_setting_text("file_mgr_token", "文件管理密码"); return; }
@@ -5738,88 +6030,117 @@ static lv_color_t md_heading_color() {
     return g_settings.theme() == "light" ? lv_color_hex(0x1f4e79) : lv_color_hex(0x7fb4ff);
 }
 
-static int md_wrap_count(const std::string &txt, const lv_font_t *font, int letter_space) {
-    if(txt.empty() || g_md_max_w <= 0) return 1;
-    int n = 0;
-    uint32_t start = 0;
-    while(start < txt.size()) {
-        uint32_t len = lv_text_get_next_line(txt.c_str() + start, font, letter_space, g_md_max_w, NULL,
-                                             LV_TEXT_FLAG_NONE);
-        if(len == 0) break;
-        start += len;
-        if(++n > 4000) break;
+// 行内样式 → 实际字体。faux_bold 表示这一片要靠"再描一遍、偏移 1px"补粗:
+// FreeType 位图模式不支持 FT_Outline_Embolden,伪粗体只能自己画两遍;伪斜体则免费
+// (建 face 时的 FT_Set_Transform 斜切,位图模式同样生效)。
+static const lv_font_t *md_style_font(const MdStyle &st, bool &faux_bold) {
+    faux_bold = false;
+    const lv_font_t *base = g_editor_font ? g_editor_font : lv_font_default();
+    const lv_font_t *ital = g_editor_italic_font ? g_editor_italic_font
+                                                 : (g_editor_faux_italic ? g_editor_faux_italic : base);
+    if(st.bold) {
+        if(g_editor_bold_font) return g_editor_bold_font;
+        faux_bold = true;
+        return st.italic ? ital : base;
     }
-    return n > 0 ? n : 1;
+    return st.italic ? ital : base;
 }
 
-// 显示文本里某个字节位置落在第几个视觉行、行内 x 是多少。
-static void md_caret_in_text(const std::string &disp, int byte_off, const lv_font_t *font,
-                             int letter_space, int line_h, int &out_x, int &out_y) {
+static MdStyle runs_style_at(const std::vector<MdRun> &runs, int at) {
+    for(const auto &r : runs) {
+        if(at < r.lo) break;
+        if(at < r.hi) return r.st;
+    }
+    return MdStyle {};
+}
+
+// 一个排版碎片:显示文本里的一段,画在第 row 个视觉行、行内 x 处。
+struct MdPiece {
+    int row = 0, x = 0, w = 0, lo = 0, hi = 0;
+    const lv_font_t *font = nullptr;
+    bool faux_bold = false;
+    MdStyle st;
+};
+
+// 唯一的排版逻辑:标签摆放、光标位置、选区矩形全部从这里读,三者天然一致。
+static void md_layout_line(const std::string &disp, const std::vector<MdRun> &runs,
+                           int letter_space, int max_w, std::vector<MdPiece> &out) {
+    out.clear();
+    if(max_w < 1) max_w = 1;
+    int n = (int)disp.size();
+    int row = 0, x = 0, i = 0;
+    while(i < n) {
+        MdStyle st = runs_style_at(runs, i);
+        bool faux = false;
+        const lv_font_t *f = md_style_font(st, faux);
+        // 本段到下一个样式边界为止
+        int seg_end = n;
+        for(const auto &r : runs) {
+            if(r.lo > i && r.lo < seg_end) seg_end = r.lo;
+            if(r.hi > i && r.hi < seg_end) seg_end = r.hi;
+        }
+        while(i < seg_end) {
+            int avail = max_w - x;
+            if(avail < 1) { ++row; x = 0; avail = max_w; }
+            uint32_t len = lv_text_get_next_line(disp.c_str() + i, f, letter_space, (uint32_t)avail, NULL,
+                                                 LV_TEXT_FLAG_NONE);
+            if(len == 0 || (int)len > seg_end - i) len = (uint32_t)(seg_end - i);
+            if(len == 0) len = (uint32_t)(md_utf8_step(disp, (size_t)i) - (size_t)i);
+            if(len == 0) break;
+            int wpx = (int)lv_text_get_width(disp.c_str() + i, len, f, letter_space);
+            if(wpx > avail && x > 0) { ++row; x = 0; continue; }
+            out.push_back({row, x, wpx, i, i + (int)len, f, faux, st});
+            i += (int)len;
+            x += wpx;
+            if(x >= max_w) { ++row; x = 0; }
+        }
+    }
+}
+
+// 显示字节偏移 → 在排版碎片里的位置。
+static void md_caret_from_pieces(const std::string &disp, const std::vector<MdPiece> &p, int byte_off,
+                                 int letter_space, int line_h, int &out_x, int &out_y) {
     out_x = 0;
     out_y = 0;
-    if(byte_off < 0) byte_off = 0;
-    if(byte_off > (int)disp.size()) byte_off = (int)disp.size();
-    uint32_t n = (uint32_t)disp.size();
-    if(n == 0) return;
-
-    uint32_t start = 0, last = 0;
-    int y = 0, last_y = 0;
-    bool found = false;
-    while(start < n) {
-        uint32_t len = lv_text_get_next_line(disp.c_str() + start, font, letter_space, g_md_max_w, NULL,
-                                             LV_TEXT_FLAG_NONE);
-        if(len == 0) break;
-        if((uint32_t)byte_off < start + len) {
-            out_x = (int)lv_text_get_width(disp.c_str() + start, (uint32_t)byte_off - start, font, letter_space);
-            out_y = y;
-            found = true;
-            break;
+    if(p.empty()) return;
+    if(byte_off <= p.front().lo) {
+        out_x = p.front().x;
+        out_y = p.front().row * line_h;
+        return;
+    }
+    for(const MdPiece &q : p) {
+        if(byte_off < q.lo) continue;
+        if(byte_off <= q.hi) {
+            out_x = q.x + (int)lv_text_get_width(disp.c_str() + q.lo, (uint32_t)(byte_off - q.lo), q.font,
+                                                 letter_space);
+            out_y = q.row * line_h;
+            return;
         }
-        last = start;
-        last_y = y;
-        y += line_h;
-        start += len;
     }
-    if(!found) {
-        out_x = (int)lv_text_get_width(disp.c_str() + last, n - last, font, letter_space);
-        out_y = last_y;
-    }
+    const MdPiece &q = p.back();
+    out_x = q.x + q.w;
+    out_y = q.row * line_h;
 }
 
-// 显示文本里的一段字节区间 → 每个视觉行一个高亮矩形(相对本行左上角)。
-static void md_sel_row_rects(const std::string &disp, int d0, int d1, const lv_font_t *font,
-                             int letter_space, int line_h, std::vector<lv_area_t> &out) {
-    if(d0 < 0) d0 = 0;
-    if(d1 > (int)disp.size()) d1 = (int)disp.size();
+// 显示字节区间 → 每段一个高亮矩形(与文字同一套排版,不会跑偏)。
+static void md_sel_from_pieces(const std::string &disp, const std::vector<MdPiece> &p, int d0, int d1,
+                               int letter_space, int line_h, std::vector<lv_area_t> &out) {
     if(d1 <= d0) return;
-    uint32_t n = (uint32_t)disp.size();
-    uint32_t start = 0;
-    int y = 0;
-    while(start < n) {
-        uint32_t len = lv_text_get_next_line(disp.c_str() + start, font, letter_space, g_md_max_w, NULL,
-                                             LV_TEXT_FLAG_NONE);
-        if(len == 0) break;
-        int row_end = (int)(start + len);
-        int seg_lo = (int)start > d0 ? (int)start : d0;
-        int seg_hi = row_end < d1 ? row_end : d1;
-        if(seg_hi > seg_lo) {
-            int x0 = (int)lv_text_get_width(disp.c_str() + start, (uint32_t)seg_lo - start, font, letter_space);
-            int x1 = (int)lv_text_get_width(disp.c_str() + start, (uint32_t)seg_hi - start, font, letter_space);
-            if(x1 > x0) {
-                lv_area_t a{x0, y, x1 - 1, y + line_h - 1};
-                out.push_back(a);
-            }
-        }
-        if(row_end >= d1) break;
-        y += line_h;
-        start = (uint32_t)row_end;
+    for(const MdPiece &q : p) {
+        int lo = d0 > q.lo ? d0 : q.lo;
+        int hi = d1 < q.hi ? d1 : q.hi;
+        if(hi <= lo) continue;
+        int x0 = q.x + (int)lv_text_get_width(disp.c_str() + q.lo, (uint32_t)(lo - q.lo), q.font, letter_space);
+        int x1 = q.x + (int)lv_text_get_width(disp.c_str() + q.lo, (uint32_t)(hi - q.lo), q.font, letter_space);
+        if(x1 > x0)
+            out.push_back({x0, q.row * line_h, x1 - 1, q.row * line_h + line_h - 1});
     }
 }
 
-// 选区画在内容层自己的绘制回调里(先于子标签),文字正好压在色块上。
-// 绘制回调里的坐标是屏幕绝对坐标,而矩形是按内容层局部坐标算的,要加上层原点。
-static void editor_md_draw_sel(lv_event_t *e) {
-    if(g_md_sel_rects.empty()) return;
+// 反白底色块、着重号小方点、选区都画在内容层自己的绘制回调里(先于子标签),
+// 文字正好压在色块上。绘制回调里的坐标是屏幕绝对坐标,而矩形是按内容层局部
+// 坐标算的,要加上层原点。
+static void editor_md_draw_deco(lv_event_t *e) {
     lv_layer_t *layer = lv_event_get_layer(e);
     if(!layer) return;
     lv_obj_t *o = lv_event_get_current_target_obj(e);
@@ -5828,33 +6149,50 @@ static void editor_md_draw_sel(lv_event_t *e) {
     lv_obj_get_coords(o, &org);
     lv_draw_rect_dsc_t dsc;
     lv_draw_rect_dsc_init(&dsc);
-    dsc.bg_color = g_theme.accent;
-    dsc.bg_opa = LV_OPA_50;
     dsc.radius = 0;
     dsc.border_width = 0;
+    dsc.bg_color = g_theme.fg;
+    dsc.bg_opa = LV_OPA_COVER;
+    for(const std::vector<lv_area_t> *tbl : {&g_md_box_rects, &g_md_dot_rects}) {
+        for(const lv_area_t &a : *tbl) {
+            lv_area_t r{a.x1 + org.x1, a.y1 + org.y1, a.x2 + org.x1, a.y2 + org.y1};
+            lv_draw_rect(layer, &dsc, &r);
+        }
+    }
+    if(g_md_sel_rects.empty()) return;
+    dsc.bg_color = g_theme.accent;
+    dsc.bg_opa = LV_OPA_50;
     for(const lv_area_t &a : g_md_sel_rects) {
         lv_area_t r{a.x1 + org.x1, a.y1 + org.y1, a.x2 + org.x1, a.y2 + org.y1};
         lv_draw_rect(layer, &dsc, &r);
     }
 }
 
-static lv_obj_t *md_label_at(int idx, const lv_font_t *font, int letter_space, int line_space) {
-    if(idx < (int)g_md_labels.size()) return g_md_labels[idx];
-    lv_obj_t *o = lv_label_create(g_md_content);
-    lv_label_set_long_mode(o, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_pad_all(o, 0, 0);
-    lv_obj_set_style_border_width(o, 0, 0);
-    lv_obj_set_style_shadow_width(o, 0, 0);
+static lv_obj_t *md_label_in(std::vector<lv_obj_t *> &pool, lv_obj_t *parent, int idx,
+                             const lv_font_t *font, int letter_space, int line_space) {
+    lv_obj_t *o = idx < (int)pool.size() ? pool[idx] : nullptr;
+    if(!o) {
+        o = lv_label_create(parent);
+        // 排版已经在 md_layout_line 里算好了,标签只负责把这一小段画出来,不能再让它自己折行。
+        lv_label_set_long_mode(o, LV_LABEL_LONG_CLIP);
+        lv_obj_set_style_pad_all(o, 0, 0);
+        lv_obj_set_style_border_width(o, 0, 0);
+        lv_obj_set_style_shadow_width(o, 0, 0);
+        // 布局是自己算的,标签不承担滚动职责,否则裁边时也会冒出滚动条
+        lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+        pool.push_back(o);
+    }
+    // 字体随片段变(粗体/斜体/正体),复用的标签必须重设,否则上一帧的字形会留在原地。
+    // 比如正在输入 **粗体** 时,闭合的 * 敲下去前这一格还是斜体字形,敲完变粗体却只叠了一层。
     lv_obj_set_style_text_font(o, font, 0);
     lv_obj_set_style_text_letter_space(o, letter_space, 0);
     lv_obj_set_style_text_line_space(o, line_space, 0);
-    g_md_labels.push_back(o);
     return o;
 }
 
-static lv_obj_t *md_rule_at(int idx) {
-    if(idx < (int)g_md_rules.size()) return g_md_rules[idx];
-    lv_obj_t *o = lv_obj_create(g_md_content);
+static lv_obj_t *md_rule_in(std::vector<lv_obj_t *> &pool, lv_obj_t *parent, int idx) {
+    if(idx < (int)pool.size()) return pool[idx];
+    lv_obj_t *o = lv_obj_create(parent);
     lv_obj_set_style_radius(o, 0, 0);
     lv_obj_set_style_border_width(o, 0, 0);
     lv_obj_set_style_pad_all(o, 0, 0);
@@ -5862,8 +6200,35 @@ static lv_obj_t *md_rule_at(int idx) {
     lv_obj_set_style_bg_color(o, g_theme.muted, 0);
     lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
     lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
-    g_md_rules.push_back(o);
+    pool.push_back(o);
     return o;
+}
+
+// 一行的反白底块与着重号小方点,推进绘制回调要用的矩形表。
+static void md_push_deco(const std::string &disp, const std::vector<MdPiece> &pieces,
+                         int line_y, int line_h, int letter_h, int letter_space) {
+    for(const MdPiece &q : pieces) {
+        if(q.hi <= q.lo) continue;
+        int ry = line_y + q.row * line_h;
+        if(q.st.invert)
+            g_md_box_rects.push_back({q.x, ry, q.x + q.w + (q.faux_bold ? 1 : 0) - 1, ry + letter_h - 1});
+        if(q.st.emph) {
+            // 和 ESP32 一样落在字脚下面:基线再往下一个 descent,正好压住 em 框下沿
+            int dy = ry + letter_h + 1;
+            for(int k = q.lo; k < q.hi;) {
+                size_t n = md_utf8_step(disp, (size_t)k);
+                if(disp[k] != ' ') {
+                    int w0 = (int)lv_text_get_width(disp.c_str() + q.lo, (uint32_t)(k - q.lo), q.font,
+                                                    letter_space);
+                    int w1 = (int)lv_text_get_width(disp.c_str() + q.lo, (uint32_t)((int)n - q.lo), q.font,
+                                                    letter_space);
+                    int cx = q.x + w0 + (w1 - w0 - 3) / 2;
+                    g_md_dot_rects.push_back({cx, dy, cx + 2, dy + 1});
+                }
+                k = (int)n;
+            }
+        }
+    }
 }
 
 static void editor_md_create(int x, int y, int w, int h, int content_w) {
@@ -5889,7 +6254,11 @@ static void editor_md_create(int x, int y, int w, int h, int content_w) {
     lv_obj_set_style_pad_all(g_md_content, 0, 0);
     lv_obj_set_style_shadow_width(g_md_content, 0, 0);
     lv_obj_set_style_bg_opa(g_md_content, LV_OPA_TRANSP, 0);
-    lv_obj_add_event_cb(g_md_content, editor_md_draw_sel, LV_EVENT_DRAW_MAIN, nullptr);
+    // 这一层只负责盛放排版好的碎片,滚动由 g_md_view 做。若它自己可滚动,碎片超出
+    // 1px(伪粗体副本)就会触发 AUTO 滚动条,在文字底部画出一条横贯整屏的灰线。
+    lv_obj_remove_flag(g_md_content, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(g_md_content, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_add_event_cb(g_md_content, editor_md_draw_deco, LV_EVENT_DRAW_MAIN, nullptr);
 
     g_md_caret = lv_obj_create(g_md_content);
     lv_obj_set_pos(g_md_caret, 0, 0);
@@ -5916,6 +6285,8 @@ static void editor_md_refresh() {
     uint32_t caret_byte = lv_text_encoded_get_byte_id(ctxt ? ctxt : "", lv_textarea_get_cursor_pos(g_editor));
 
     g_md_sel_rects.clear();
+    g_md_box_rects.clear();
+    g_md_dot_rects.clear();
     int sel_lo = -1, sel_hi = -1;
     if(g_ed_sel_anchor >= 0 && g_ed_sel_anchor != (int)caret_byte) {
         sel_lo = g_ed_sel_anchor < (int)caret_byte ? g_ed_sel_anchor : (int)caret_byte;
@@ -5982,7 +6353,7 @@ static void editor_md_refresh() {
         MdRender d = md_build_line(lines[i], in_code[i] != 0, ((int)i == ml.caret_line) ? ml.caret_rel : -1);
 
         if(d.rule) {
-            lv_obj_t *o = md_rule_at(rbi++);
+            lv_obj_t *o = md_rule_in(g_md_rules, g_md_content, rbi++);
             lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
             lv_obj_set_pos(o, 0, y + letter_h / 2 - 1);
             lv_obj_set_size(o, g_md_max_w, 2);
@@ -6000,7 +6371,24 @@ static void editor_md_refresh() {
             indent_bytes = 6;
         }
 
-        // 选区:落在本行的部分映射成显示坐标,再按视觉行切成矩形
+        // 行内样式片段跟着 disp 平移(缩进 6 字节);标题的折叠标志也跟着整行加粗
+        std::vector<MdRun> druns = d.runs;
+        for(MdRun &r : druns) {
+            r.lo += indent_bytes;
+            r.hi += indent_bytes;
+        }
+        if(d.heading && !druns.empty()) druns.back().hi = (int)disp.size();
+
+        std::vector<MdPiece> pieces;
+        md_layout_line(disp, druns, letter_space, g_md_max_w, pieces);
+        int rows = 1;
+        for(const MdPiece &q : pieces)
+            if(q.row + 1 > rows) rows = q.row + 1;
+        int h = rows * line_h;
+
+        lv_color_t color = d.heading ? md_heading_color() : (d.muted ? g_theme.muted : g_theme.fg);
+
+        // 选区:落在本行的部分映射成显示坐标,再按排版碎片切成矩形
         if(sel_lo >= 0) {
             int lb = (int)ml.start[i];
             int le = lb + (int)lines[i].size();
@@ -6010,7 +6398,7 @@ static void editor_md_refresh() {
                 int d0 = md_display_offset(d, a - lb) + indent_bytes;
                 int d1 = md_display_offset(d, b - lb) + indent_bytes;
                 size_t before = g_md_sel_rects.size();
-                md_sel_row_rects(disp, d0, d1, font, letter_space, line_h, g_md_sel_rects);
+                md_sel_from_pieces(disp, pieces, d0, d1, letter_space, line_h, g_md_sel_rects);
                 for(size_t k = before; k < g_md_sel_rects.size(); ++k) {
                     g_md_sel_rects[k].y1 += y;
                     g_md_sel_rects[k].y2 += y;
@@ -6018,17 +6406,31 @@ static void editor_md_refresh() {
             }
         }
 
-        lv_obj_t *o = md_label_at(lbi++, font, letter_space, line_space);
-        lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
-        int nvis = md_wrap_count(disp, font, letter_space);
-        int h = nvis * letter_h + (nvis - 1) * line_space;
-        lv_obj_set_pos(o, 0, y);
-        lv_obj_set_size(o, g_md_max_w, h);
-        lv_label_set_text(o, disp.c_str());
-        lv_obj_set_style_text_color(o, d.heading ? md_heading_color() : (d.muted ? g_theme.muted : g_theme.fg), 0);
+        // 反白底块与着重号小方点:按排版碎片算好,交给内容层的绘制回调
+        md_push_deco(disp, pieces, y, line_h, letter_h, letter_space);
+
+        for(const MdPiece &q : pieces) {
+            int pw = g_md_max_w - q.x;
+            if(pw < 1) pw = 1;
+            std::string seg = disp.substr((size_t)q.lo, (size_t)(q.hi - q.lo));
+            uint32_t decor = LV_TEXT_DECOR_NONE;
+            if(q.st.underline) decor |= LV_TEXT_DECOR_UNDERLINE;
+            if(q.st.strike) decor |= LV_TEXT_DECOR_STRIKETHROUGH;
+            int nlab = q.faux_bold ? 2 : 1;
+            for(int d2 = 0; d2 < nlab; ++d2) {
+                lv_obj_t *o = md_label_in(g_md_labels, g_md_content, lbi++, q.font, letter_space, line_space);
+                lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_set_pos(o, q.x + d2, y + q.row * line_h);
+                lv_obj_set_size(o, pw, letter_h);
+                lv_label_set_text(o, seg.c_str());
+                lv_obj_set_style_text_decor(o, (lv_text_decor_t)decor, 0);
+                lv_obj_set_style_text_color(o, q.st.invert ? g_theme.bg : color, 0);
+            }
+        }
 
         if((int)i == ml.caret_line) {
-            md_caret_in_text(disp, md_display_offset(d, ml.caret_rel) + indent_bytes, font, letter_space, line_h, caret_x, caret_y);
+            md_caret_from_pieces(disp, pieces, md_display_offset(d, ml.caret_rel) + indent_bytes, letter_space,
+                                 line_h, caret_x, caret_y);
             caret_y += y;
         }
         y += h;
@@ -6060,6 +6462,133 @@ static void editor_md_refresh() {
         else if(caret_y + line_h - scroll > g_md_view_h) scroll = caret_y + line_h - g_md_view_h;
         lv_obj_scroll_to_y(g_md_view, scroll, LV_ANIM_OFF);
     }
+}
+
+// ---------------------------------------------------------------------------
+// 只读 Markdown 渲染(阅读视图 / 历史预览)
+//
+// 复用编辑器那套行级排版:同样的隐藏标记、行内样式、代码围栏、分隔线、任务框。
+// 区别只是没有光标、没有选区、没有折叠,滚动由调用方按行号驱动。
+// ---------------------------------------------------------------------------
+
+static void md_code_flags(const std::vector<std::string> &lines, std::vector<char> &in_code) {
+    in_code.assign(lines.size(), 0);
+    bool code = false;
+    for(size_t i = 0; i < lines.size(); ++i) {
+        size_t lead = 0;
+        while(lead < lines[i].size() && lines[i][lead] == ' ') lead++;
+        bool fence = lines[i].compare(lead, 3, "```") == 0 || lines[i].compare(lead, 3, "~~~") == 0;
+        in_code[i] = code ? 1 : 0;
+        if(fence) code = !code;
+    }
+}
+
+static void md_readonly_create(int x, int y, int w, int h) {
+    g_ro_view = lv_obj_create(g_root);
+    lv_obj_set_pos(g_ro_view, x, y);
+    lv_obj_set_size(g_ro_view, w, h);
+    base_style(g_ro_view);
+    lv_obj_set_style_radius(g_ro_view, 0, 0);
+    lv_obj_set_style_border_width(g_ro_view, 0, 0);
+    lv_obj_set_style_pad_all(g_ro_view, 0, 0);
+    lv_obj_set_style_shadow_width(g_ro_view, 0, 0);
+    lv_obj_set_scrollbar_mode(g_ro_view, LV_SCROLLBAR_MODE_OFF);
+
+    g_ro_content = lv_obj_create(g_ro_view);
+    lv_obj_set_pos(g_ro_content, 0, 0);
+    lv_obj_set_size(g_ro_content, w, h);
+    lv_obj_set_style_radius(g_ro_content, 0, 0);
+    lv_obj_set_style_border_width(g_ro_content, 0, 0);
+    lv_obj_set_style_pad_all(g_ro_content, 0, 0);
+    lv_obj_set_style_shadow_width(g_ro_content, 0, 0);
+    lv_obj_set_style_bg_opa(g_ro_content, LV_OPA_TRANSP, 0);
+    // 同编辑器:内容层自己不能滚动,否则伪粗体多出的 1px 会冒出假滚动条横线。
+    lv_obj_remove_flag(g_ro_content, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(g_ro_content, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_add_event_cb(g_ro_content, editor_md_draw_deco, LV_EVENT_DRAW_MAIN, nullptr);
+}
+
+static void md_render_readonly(const std::string &text, int content_w, int line_space,
+                               std::vector<int> *line_y_out) {
+    if(!g_ro_view || !g_ro_content || content_w <= 0) return;
+    const lv_font_t *font = g_editor_font ? g_editor_font : lv_font_default();
+    const int letter_space = 0;
+    const int letter_h = lv_font_get_line_height(font);
+    const int line_h = letter_h + line_space;
+
+    g_md_box_rects.clear();
+    g_md_dot_rects.clear();
+
+    MdDoc doc;
+    md_split_caret(text, 0, doc);
+    std::vector<char> in_code;
+    md_code_flags(doc.lines, in_code);
+    if(line_y_out) line_y_out->assign(doc.lines.size(), 0);
+
+    int lbi = 0, rbi = 0, y = 0;
+    for(size_t i = 0; i < doc.lines.size(); ++i) {
+        if(line_y_out) (*line_y_out)[i] = y;
+        MdRender d = md_build_line(doc.lines[i], in_code[i] != 0, -1);
+
+        if(d.rule) {
+            lv_obj_t *o = md_rule_in(g_ro_rules, g_ro_content, rbi++);
+            lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_pos(o, 0, y + letter_h / 2 - 1);
+            lv_obj_set_size(o, content_w, 2);
+            y += line_h;
+            continue;
+        }
+
+        std::string disp = d.text;
+        int indent_bytes = 0;
+        if(g_settings.first_line_indent() && !d.heading && !d.muted &&
+           d.prefix_bytes == 0 && in_code[i] == 0 && !disp.empty()) {
+            disp = "\xe3\x80\x80\xe3\x80\x80" + disp;
+            indent_bytes = 6;
+        }
+        std::vector<MdRun> druns = d.runs;
+        for(MdRun &r : druns) {
+            r.lo += indent_bytes;
+            r.hi += indent_bytes;
+        }
+        if(d.heading && !druns.empty()) druns.back().hi = (int)disp.size();
+
+        std::vector<MdPiece> pieces;
+        md_layout_line(disp, druns, letter_space, content_w, pieces);
+        int rows = 1;
+        for(const MdPiece &q : pieces)
+            if(q.row + 1 > rows) rows = q.row + 1;
+        int h = rows * line_h;
+        lv_color_t color = d.heading ? md_heading_color() : (d.muted ? g_theme.muted : g_theme.fg);
+
+        md_push_deco(disp, pieces, y, line_h, letter_h, letter_space);
+
+        for(const MdPiece &q : pieces) {
+            int pw = content_w - q.x;
+            if(pw < 1) pw = 1;
+            std::string seg = disp.substr((size_t)q.lo, (size_t)(q.hi - q.lo));
+            uint32_t decor = LV_TEXT_DECOR_NONE;
+            if(q.st.underline) decor |= LV_TEXT_DECOR_UNDERLINE;
+            if(q.st.strike) decor |= LV_TEXT_DECOR_STRIKETHROUGH;
+            int nlab = q.faux_bold ? 2 : 1;
+            for(int d2 = 0; d2 < nlab; ++d2) {
+                lv_obj_t *o = md_label_in(g_ro_labels, g_ro_content, lbi++, q.font, letter_space, line_space);
+                lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_set_pos(o, q.x + d2, y + q.row * line_h);
+                lv_obj_set_size(o, pw, letter_h);
+                lv_label_set_text(o, seg.c_str());
+                lv_obj_set_style_text_decor(o, (lv_text_decor_t)decor, 0);
+                lv_obj_set_style_text_color(o, q.st.invert ? g_theme.bg : color, 0);
+            }
+        }
+        y += h;
+    }
+
+    for(int k = lbi; k < (int)g_ro_labels.size(); ++k) lv_obj_add_flag(g_ro_labels[k], LV_OBJ_FLAG_HIDDEN);
+    for(int k = rbi; k < (int)g_ro_rules.size(); ++k) lv_obj_add_flag(g_ro_rules[k], LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_height(g_ro_content, y > 0 ? y : letter_h);
+    // 滚动范围是按子对象坐标算的,先把这一层排完版,调用方再滚动
+    lv_obj_update_layout(g_ro_view);
 }
 
 // ---------------------------------------------------------------------------
@@ -6096,11 +6625,18 @@ static void editor_vt_draw_guides(lv_event_t *e) {
     if(sk == "dash") style = VerticalGuideStyle::Dash;
     else if(sk == "dot") style = VerticalGuideStyle::Dot;
 
+    // 绘制回调里的坐标是屏幕绝对坐标,而列位置是视口局部坐标,必须加上视口原点,
+    // 否则参考线会整体偏到左上角,压在字上。
+    lv_area_t org;
+    lv_obj_get_coords(g_vt_view, &org);
+
+    // 参考线落在两列之间的空档正中。列宽和间距都随字号变,这里现算而不是写死。
     int lh = lv_font_get_line_height(editor_font());
-    int rightTextX = g_vt_m.x + g_vt_m.w - g_vt_m.colAdvance;
-    int rightGuideX = rightTextX + lh + 3;
-    int top = g_vt_m.y;
-    int bottom = g_vt_m.y + g_vt_m.h;
+    int gap = g_vt_m.colAdvance - lh;
+    if(gap < 2) gap = 2;
+    int rightGuideX = org.x1 + g_vt_m.x + g_vt_m.w - g_vt_m.colAdvance + lh + gap / 2;
+    int top = org.y1 + g_vt_m.y;
+    int bottom = org.y1 + g_vt_m.y + g_vt_m.h;
 
     for(int i = 0; i <= g_vt_m.cols; ++i) {
         int gx = rightGuideX - i * g_vt_m.colAdvance;
@@ -6121,8 +6657,29 @@ static void editor_vt_draw_guides(lv_event_t *e) {
     }
 }
 
-static lv_obj_t *vt_col_at(int idx) {
-    if(idx < (int)g_vt_cols.size()) return g_vt_cols[idx];
+// 竖排的装饰几何与 ESP32 对齐:反白是整格实心块,下划线/删除线是列左侧/中央的
+// 竖线(横排的线画在字下,竖排就得画在列的侧向),着重号是每行一个 3×3 小方块。
+static void editor_vt_draw_deco(lv_event_t *e) {
+    if(g_vt_box_rects.empty() && g_vt_deco_rects.empty()) return;
+    lv_layer_t *layer = lv_event_get_layer(e);
+    if(!layer) return;
+    lv_area_t org;
+    lv_obj_get_coords(g_vt_view, &org);
+    lv_draw_rect_dsc_t dsc;
+    lv_draw_rect_dsc_init(&dsc);
+    dsc.radius = 0;
+    dsc.border_width = 0;
+    dsc.bg_opa = LV_OPA_COVER;
+    dsc.bg_color = g_theme.fg;
+    for(const std::vector<lv_area_t> *tbl : {&g_vt_box_rects, &g_vt_deco_rects}) {
+        for(const lv_area_t &a : *tbl) {
+            lv_area_t r{a.x1 + org.x1, a.y1 + org.y1, a.x2 + org.x1, a.y2 + org.y1};
+            lv_draw_rect(layer, &dsc, &r);
+        }
+    }
+}
+
+static lv_obj_t *vt_col_at(int idx) {    if(idx < (int)g_vt_cols.size()) return g_vt_cols[idx];
     lv_obj_t *o = lv_label_create(g_vt_view);
     lv_label_set_long_mode(o, LV_LABEL_LONG_CLIP);
     lv_obj_set_style_pad_all(o, 0, 0);
@@ -6133,6 +6690,21 @@ static lv_obj_t *vt_col_at(int idx) {
     lv_obj_set_style_text_letter_space(o, 0, 0);
     lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
     g_vt_cols.push_back(o);
+    return o;
+}
+
+// 列里有带样式的格时整列改成逐格标签:紧贴该列,尺寸一格一拍。
+static lv_obj_t *vt_cell_at(int idx) {
+    if(idx < (int)g_vt_cells.size()) return g_vt_cells[idx];
+    lv_obj_t *o = lv_label_create(g_vt_view);
+    lv_label_set_long_mode(o, LV_LABEL_LONG_CLIP);
+    lv_obj_set_style_pad_all(o, 0, 0);
+    lv_obj_set_style_border_width(o, 0, 0);
+    lv_obj_set_style_shadow_width(o, 0, 0);
+    lv_obj_set_style_text_align(o, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_letter_space(o, 0, 0);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+    g_vt_cells.push_back(o);
     return o;
 }
 
@@ -6159,6 +6731,9 @@ static lv_color_t vt_kind_color(VerticalCellKind kind) {
 static void editor_vt_create(int x, int y, int w, int h) {
     g_vt_cols.clear();
     g_vt_marks.clear();
+    g_vt_cells.clear();
+    g_vt_box_rects.clear();
+    g_vt_deco_rects.clear();
     g_ed_sel_anchor = -1;
     g_vt_scroll = 0;
     g_vt_h = h;
@@ -6174,6 +6749,7 @@ static void editor_vt_create(int x, int y, int w, int h) {
     lv_obj_set_style_bg_opa(g_vt_view, LV_OPA_COVER, 0);
     lv_obj_set_scrollbar_mode(g_vt_view, LV_SCROLLBAR_MODE_OFF);
     lv_obj_add_event_cb(g_vt_view, editor_vt_draw_guides, LV_EVENT_DRAW_MAIN, nullptr);
+    lv_obj_add_event_cb(g_vt_view, editor_vt_draw_deco, LV_EVENT_DRAW_MAIN, nullptr);
 
     g_vt_caret = lv_obj_create(g_vt_view);
     lv_obj_set_style_radius(g_vt_caret, 0, 0);
@@ -6183,10 +6759,15 @@ static void editor_vt_create(int x, int y, int w, int h) {
     lv_obj_set_style_bg_color(g_vt_caret, g_theme.accent, 0);
     lv_obj_set_style_bg_opa(g_vt_caret, LV_OPA_COVER, 0);
     lv_obj_remove_flag(g_vt_caret, LV_OBJ_FLAG_SCROLLABLE);
+    // 尺寸/坐标是存进样式的,要跑一次布局才落到 coords 上;刷新时要读视口宽度,
+    // 不先更新的话拿到的是 0,整列会被排到屏幕外。
+    lv_obj_update_layout(g_vt_view);
 }
 
 static void editor_vt_refresh() {
     if(!g_vt_view || !g_editor) return;
+    g_vt_box_rects.clear();
+    g_vt_deco_rects.clear();
     const char *ctxt = lv_textarea_get_text(g_editor);
     std::string text = ctxt ? ctxt : "";
     uint32_t caret_byte = lv_text_encoded_get_byte_id(ctxt ? ctxt : "",
@@ -6233,6 +6814,7 @@ static void editor_vt_refresh() {
 
     int right = g_vt_m.x + g_vt_m.w - g_vt_m.colAdvance;
     int col_h = g_vt_m.rows * g_vt_m.rowAdvance;
+    int cell_i = 0;
 
     for(int ci = 0; ci < g_vt_m.cols; ++ci) {
         int colIdx = g_vt_scroll + ci;
@@ -6242,6 +6824,63 @@ static void editor_vt_refresh() {
         }
         const VerticalCol &col = data.cols[colIdx];
         const std::vector<VerticalCell> &cells = data.cells[col.lineIdx];
+
+        bool styled = false;
+        for(int i = col.start; i < col.end && !styled; ++i)
+            styled = cells[i].style.bold || cells[i].style.italic || cells[i].style.strike ||
+                     cells[i].style.underline || cells[i].style.invert || cells[i].style.emph;
+
+        if(styled) {
+            // 带样式的列整列改成逐格标签:每格一个字符、用自己的字体和颜色,
+            // 伪粗体的格再多画一层偏移 1px 的副本。
+            lv_obj_add_flag(vt_col_at(ci), LV_OBJ_FLAG_HIDDEN);
+            int cx = right - ci * g_vt_m.colAdvance;
+            int row = 0;
+            for(int i = col.start; i < col.end; ++i, ++row) {
+                const VerticalCell &c = cells[i];
+                bool faux = false;
+                const lv_font_t *f = md_style_font(c.style, faux);
+                int cy = g_vt_m.y + row * g_vt_m.rowAdvance;
+                if(c.style.invert)
+                    g_vt_box_rects.push_back({cx, cy, cx + lh - 1, cy + lh - 1});
+                for(int d = 0; d < (faux ? 2 : 1); ++d) {
+                    lv_obj_t *g = vt_cell_at(cell_i++);
+                    lv_obj_remove_flag(g, LV_OBJ_FLAG_HIDDEN);
+                    lv_obj_set_style_text_font(g, f, 0);
+                    lv_obj_set_style_text_decor(g, LV_TEXT_DECOR_NONE, 0);
+                    lv_obj_set_style_text_color(g, c.style.invert ? g_theme.bg : vt_kind_color(c.kind), 0);
+                    lv_obj_set_pos(g, cx + d, cy);
+                    lv_obj_set_size(g, lh, g_vt_m.rowAdvance);
+                    lv_label_set_text(g, c.glyph.c_str());
+                }
+            }
+            // 下划线/删除线:同意样式的连续格并成一条竖线
+            for(int flag = 0; flag < 2; ++flag) {
+                int rs = -1;
+                for(int i = col.start; i <= col.end; ++i) {
+                    bool on = i < col.end && (flag == 0 ? cells[i].style.underline : cells[i].style.strike);
+                    if(on && rs < 0) rs = i;
+                    if(rs >= 0 && !on) {
+                        int row0 = rs - col.start, row1 = i - col.start;
+                        int y0 = g_vt_m.y + row0 * g_vt_m.rowAdvance + 2;
+                        int hh = (row1 - row0 - 1) * g_vt_m.rowAdvance + lh - 4;
+                        if(hh > 0) {
+                            int x0 = flag == 0 ? cx - 2 : cx + lh / 2;
+                            int w0 = flag == 0 ? 1 : 2;
+                            g_vt_deco_rects.push_back({x0, y0, x0 + w0 - 1, y0 + hh - 1});
+                        }
+                        rs = -1;
+                    }
+                }
+            }
+            for(int i = col.start; i < col.end; ++i) {
+                if(!cells[i].style.emph) continue;
+                int cy = g_vt_m.y + (i - col.start) * g_vt_m.rowAdvance + lh / 2 - 1;
+                g_vt_deco_rects.push_back({cx - 6, cy, cx - 4, cy + 2});
+            }
+            continue;
+        }
+
         std::string disp;
         for(int i = col.start; i < col.end; ++i) {
             if(i > col.start) disp += "\n";
@@ -6258,6 +6897,8 @@ static void editor_vt_refresh() {
     }
     for(int ci = g_vt_m.cols; ci < (int)g_vt_cols.size(); ++ci)
         lv_obj_add_flag(g_vt_cols[ci], LV_OBJ_FLAG_HIDDEN);
+    for(int k = cell_i; k < (int)g_vt_cells.size(); ++k)
+        lv_obj_add_flag(g_vt_cells[k], LV_OBJ_FLAG_HIDDEN);
 
     // 选区:锚点到光标之间的格反白
     int nmark = 0;
@@ -6665,7 +7306,52 @@ static void handle_editor(int key) {
     else { editor_sel_sync_label(); editor_follow_cursor(); }
 }
 
+// 行尾回车时,若当前行是列表项,续行带上递增后的同款标记(空列表项只换行)。
+static std::string editor_list_continue() {
+    if(!g_editor) return "\n";
+    std::string full = lv_textarea_get_text(g_editor);
+    int cb = editor_caret_byte();
+    size_t ls = 0;
+    if(cb > 0) {
+        size_t p = full.rfind('\n', (size_t)cb - 1);
+        ls = (p == std::string::npos) ? 0 : p + 1;
+    }
+    size_t le = full.find('\n', (size_t)cb);
+    if(le == std::string::npos) le = full.size();
+    if((size_t)cb != le) return "\n";  // 只在行尾续行
+    std::string cur = full.substr(ls, le - ls);
+    MdListMarker m = md_list_marker(cur);
+    if(!m.ok) return "\n";
+    if(cur.substr((size_t)(m.start + m.len)).find_first_not_of(" \t") == std::string::npos)
+        return "\n";  // 空列表项:只换行,不续标记
+    std::string lead = cur.substr(0, (size_t)m.start);
+    if(m.task) return "\n" + lead + "- [ ] ";
+    if(m.ordered) {
+        std::string after = cur.substr((size_t)m.start + (size_t)m.num_len,
+                                       (size_t)m.len - (size_t)m.num_len);
+        return "\n" + lead + (m.cn ? md_cn_numeral(m.num + 1) : std::to_string(m.num + 1)) + after;
+    }
+    return "\n" + lead + cur.substr((size_t)m.start, 1) + " ";  // 保留 -/*/+
+}
+
 static void handle_editor_keys(int key) {
+    if(g_editor_exit_asking) {
+        if(key == '\n' || key == '\r') {
+            g_editor_exit_asking = false;
+            save_editor_text();
+            editor_leave();
+        } else if(key == 'n' || key == 'N') {
+            g_editor_exit_asking = false;
+            editor_leave();
+        } else if(key == 27 || key == 'q' || key == 0x11) {
+            g_editor_exit_asking = false;
+            if(g_editor_exit_dlg) {
+                lv_obj_delete(g_editor_exit_dlg);
+                g_editor_exit_dlg = nullptr;
+            }
+        }
+        return;
+    }
     if(g_polish_panel) { polish_panel_key(key); return; }
     if(g_search_panel) {
         if(key == KEY_IME_TOGGLE) {
@@ -6735,10 +7421,15 @@ static void handle_editor_keys(int key) {
         return;
     }
     if(key == 0x11 || key == 27) {
-        save_editor_text();
-        if(!g_ol.editPath.empty()) { goto_screen(Screen::Outline); return; }
-        if(g_quick_slot >= 0) { g_quick_slot = -1; goto_screen(Screen::Settings); }
-        else goto_screen(Screen::Main);
+        editor_exit_target_from_state();
+        // 自动保存开着就不用问,内容迟早会落到文件里
+        if(editor_dirty() && !g_settings.auto_save()) {
+            g_editor_exit_asking = true;
+            draw_editor_exit_confirm();
+            return;
+        }
+        if(editor_dirty()) save_editor_text();
+        editor_leave();
         return;
     }
     if(g_quick_slot >= 0 && key == 0x0E) { open_quick_editor((g_quick_slot + 1) % 10); return; }
@@ -6814,9 +7505,13 @@ static void handle_editor_keys(int key) {
         if(g_ed_sel_anchor >= 0) editor_delete_selection();
         else { editor_record_undo(); lv_textarea_delete_char(g_editor); }
     } else if(key == '\n' || key == '\r') {
-        if(g_ed_sel_anchor >= 0) editor_delete_selection();
-        else editor_record_undo();
-        lv_textarea_add_char(g_editor, '\n');
+        if(g_ed_sel_anchor >= 0) {
+            editor_delete_selection();
+            lv_textarea_add_char(g_editor, '\n');
+        } else {
+            editor_record_undo();
+            lv_textarea_add_text(g_editor, editor_list_continue().c_str());
+        }
     } else if(key >= 32 && key < 127) {
         if(g_ed_sel_anchor >= 0) editor_delete_selection();
         else editor_record_undo();
@@ -6858,6 +7553,10 @@ static void handle_key(int key) {
         if(key == 'q' || key == 27) goto_screen(Screen::Browser);
         else if(key == 'e' || key == 'E') { g_quick_slot = -1; g_edit_file = g_view_file; g_prompt.clear(); goto_screen(Screen::Editor); }
         else if(key == 'h' || key == 'H') { open_history(g_view_file, Screen::Viewer); }
+        else if(key == KEY_DOWN || key == 'j') { g_viewer_scroll++; render(); }
+        else if(key == KEY_UP || key == 'k') { g_viewer_scroll--; render(); }
+        else if(key == KEY_PAGE_DOWN) { g_viewer_scroll += 10; render(); }
+        else if(key == KEY_PAGE_UP) { g_viewer_scroll -= 10; render(); }
         else render();
         break;
     case Screen::History: handle_history(key); break;
@@ -6896,6 +7595,7 @@ void app_ui_create() {
     g_root = lv_screen_active();
     lv_obj_remove_style_all(g_root);
     g_linux_ime.begin();
+    g_linux_ime.set_width_fn(ime_measure_width);
     app_ui_reload_font();
     if(g_settings.app_mode() == "quick") {
         open_quick_editor(0);

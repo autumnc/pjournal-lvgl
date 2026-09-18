@@ -103,20 +103,18 @@ std::string FontManager::pick_fallback(const std::string &primary) {
     return best;
 }
 
-lv_font_t *FontManager::create(const std::string &path, int size) {
-    auto key = std::make_pair(path, size);
+lv_font_t *FontManager::create(const std::string &path, int size, FontStyle style) {
+    if(path.empty()) return nullptr;
+    auto key = std::make_tuple(path, size, (int)style);
     auto it = loaded_.find(key);
     if(it != loaded_.end()) return it->second;
-    if(path.empty()) return nullptr;
+    lv_freetype_font_style_t fs = LV_FREETYPE_FONT_STYLE_NORMAL;
+    if(style == FontStyle::Bold) fs = LV_FREETYPE_FONT_STYLE_BOLD;
+    else if(style == FontStyle::Italic) fs = LV_FREETYPE_FONT_STYLE_ITALIC;
     lv_font_t *font = lv_freetype_font_create(path.c_str(), LV_FREETYPE_FONT_RENDER_MODE_BITMAP,
-                                            (uint32_t)size, LV_FREETYPE_FONT_STYLE_NORMAL);
-    if(font) loaded_[key] = font;
-    return font;
-}
-
-lv_font_t *FontManager::load(const std::string &path, int size) {
-    lv_font_t *font = create(path, size);
+                                            (uint32_t)size, fs);
     if(!font) return nullptr;
+    loaded_[key] = font;
     if(!fallback_resolved_) {
         fallback_resolved_ = true;
         fallback_path_ = pick_fallback(path);
@@ -124,11 +122,17 @@ lv_font_t *FontManager::load(const std::string &path, int size) {
     // LVGL walks lv_font_t::fallback once the primary font reports a codepoint
     // as a placeholder, which FreeType does for glyph index 0. Chaining a
     // symbol font keeps text the chosen font lacks (e.g. U+2713) visible
-    // instead of blank.
+    // instead of blank. 挂在 create 里,三种 style 的字体对象才都有回退。
     if(!fallback_path_.empty() && fallback_path_ != path) {
-        lv_font_t *fb = create(fallback_path_, size);
+        lv_font_t *fb = create(fallback_path_, size, FontStyle::Normal);
         if(fb && fb != font) font->fallback = fb;
     }
+    return font;
+}
+
+lv_font_t *FontManager::load(const std::string &path, int size, FontStyle style) {
+    lv_font_t *font = create(path, size, style);
+    if(!font) return nullptr;
     current_ = font;
     current_path_ = path;
     current_size_ = size;
