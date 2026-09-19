@@ -16,8 +16,6 @@
 static int s_tty_fd = -1;
 static bool s_have_termios = false;
 static termios s_old_termios {};
-static int s_old_kd_mode = KD_TEXT;
-static bool s_have_kd_mode = false;
 static int s_old_kb_mode = K_XLATE;
 static bool s_have_kb_mode = false;
 static bool s_graphics = false;
@@ -55,15 +53,21 @@ static std::string active_vt_path() {
 void linux_console_restore() {
     if(s_tty_fd >= 0) {
         if(s_have_kb_mode) ioctl(s_tty_fd, KDSKBMODE, s_old_kb_mode);
-        if(s_graphics) ioctl(s_tty_fd, KDSETMODE, s_have_kd_mode ? s_old_kd_mode : KD_TEXT);
+        // 这里必须无条件切回 KD_TEXT,不能恢复启动时读到的那个模式。若读到的本来就是
+        // KD_GRAPHICS,说明上一轮 app 没能正常收尾(被 SIGKILL、掉电),照抄回去就是
+        // 把「冻在最后一帧、键盘全进隐身 shell」的状态一代代传下去。切回文字模式后
+        // 还要再写一次,内核才会重画控制台;否则屏幕上一直留着 app 的最后一帧,看着
+        // 像还在跑,会被当成「键盘没反应」。
+        if(s_graphics) {
+            ioctl(s_tty_fd, KDSETMODE, KD_TEXT);
+            const char *show = "\033[?25h\033[0m\033[2J\033[H[pjournal-lvgl exited]\n";
+            write(s_tty_fd, show, strlen(show));
+        }
         if(s_have_termios) tcsetattr(s_tty_fd, TCSANOW, &s_old_termios);
-        const char *show = "\033[?25h\033[0m";
-        write(s_tty_fd, show, strlen(show));
         close(s_tty_fd);
         s_tty_fd = -1;
     }
     s_have_termios = false;
-    s_have_kd_mode = false;
     s_have_kb_mode = false;
     s_graphics = false;
 }
@@ -82,12 +86,6 @@ bool linux_console_enter_graphics() {
     if(s_tty_fd < 0) s_tty_fd = open("/dev/tty0", O_RDWR | O_CLOEXEC);
     if(s_tty_fd < 0) s_tty_fd = open("/dev/console", O_RDWR | O_CLOEXEC);
     if(s_tty_fd < 0) return false;
-
-    int kd_mode = KD_TEXT;
-    if(ioctl(s_tty_fd, KDGETMODE, &kd_mode) == 0) {
-        s_old_kd_mode = kd_mode;
-        s_have_kd_mode = true;
-    }
 
     if(tcgetattr(s_tty_fd, &s_old_termios) == 0) {
         s_have_termios = true;
