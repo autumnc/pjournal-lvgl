@@ -53,7 +53,9 @@ VerticalLayoutMetrics vertical_metrics(int x, int y, int w, int h, int line_heig
     m.w = w;
     m.h = h;
     m.rowAdvance = line_height + 2;
-    m.colAdvance = line_height + 6;
+    // 列间距要容得下着重号/波浪线这些小装饰:它们画在格左边界之外(最远到 -6),
+    // 参考线又落在两列正中,间距太小装饰就会越过参考线压到隔壁列的字上。
+    m.colAdvance = line_height + 14;
     m.rows = h / m.rowAdvance;
     if(m.rows < 1) m.rows = 1;
     m.cols = w / m.colAdvance;
@@ -116,15 +118,18 @@ VerticalData build_vertical_data(const std::vector<std::string> &lines, int rows
                 // 水平线/围栏行:原样字符竖排,样式弱化
                 vt_append_raw(line, 0, VerticalCellKind::Rule, cs);
             } else {
-                // 列表/引用的前导空格占空白格,保住缩进;块标记本身也归这一段
-                for(int p = 0; p < lead; ++p) cs.push_back({p, p + 1, " ", kind, false, MdStyle {}});
+                // 列表/引用的前导空格占空白格,保住缩进;块标记本身也归这一段。
+                // 光标停在标记里时前缀就是原文(含缩进),不再另排缩进格。
+                if(!r.plain_marker)
+                    for(int p = 0; p < lead; ++p) cs.push_back({p, p + 1, " ", kind, false, MdStyle {}});
                 // 替换型块标记:尾部空格丢掉,所有格共享同一段原始字节
                 int pend = r.prefix_bytes;
                 while(pend > 0 && r.text[pend - 1] == ' ') pend--;
                 MdStyle pst = md_style_at(r, 0);
                 for(int p = 0; p < pend;) {
                     size_t n = md_utf8_step(r.text, p);
-                    cs.push_back({lead, r.body_off, r.text.substr(p, n - p), kind, false, pst});
+                    if(r.plain_marker) cs.push_back({p, (int)n, r.text.substr(p, n - p), kind, false, pst});
+                    else cs.push_back({lead, r.body_off, r.text.substr(p, n - p), kind, false, pst});
                     p = (int)n;
                 }
                 // 正文:成对行内标记整段隐藏

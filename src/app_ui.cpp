@@ -225,6 +225,7 @@ static int g_md_view_h = 0;
 static std::vector<lv_area_t> g_md_sel_rects;  // 选区高亮块(每帧由 refresh 重算)
 static std::vector<lv_area_t> g_md_box_rects;  // 反白底色块(`code` / 链接)
 static std::vector<lv_area_t> g_md_dot_rects;  // 着重号小方点(==高亮==)
+static std::vector<lv_area_t> g_md_wave_rects;  // 书名波浪线(《书名》)
 
 // 只读渲染(阅读视图 / 历史预览):与编辑器叠加层共用行级排版,但没有光标/选区/折叠。
 // 定义在编辑器模块里,这里先声明给上面的 render_viewer / render_history 用。
@@ -245,6 +246,7 @@ static lv_obj_t *g_vt_caret = nullptr;
 static std::vector<lv_obj_t *> g_vt_cols;   // 每列一个标签(字符以 \n 竖排)
 static std::vector<lv_obj_t *> g_vt_marks;  // 选区高亮块(池化复用)
 static std::vector<lv_obj_t *> g_vt_cells;  // 带样式的列改用逐格标签
+static std::vector<lv_obj_t *> g_vt_prompt_cols;  // 竖排提示词自己的列标签
 static int g_ed_sel_anchor = -1;            // 编辑器选区锚点(字节),-1 = 无选区;横排/竖排共用
 static int g_vt_scroll = 0;                 // 首列列号
 static VerticalLayoutMetrics g_vt_m;        // 当前排版度量
@@ -1532,6 +1534,7 @@ static void clear_root() {
     g_md_sel_rects.clear();
     g_md_box_rects.clear();
     g_md_dot_rects.clear();
+    g_md_wave_rects.clear();
     g_ro_view = nullptr;
     g_ro_content = nullptr;
     g_ro_labels.clear();
@@ -1543,6 +1546,7 @@ static void clear_root() {
     g_vt_cols.clear();
     g_vt_marks.clear();
     g_vt_cells.clear();
+    g_vt_prompt_cols.clear();
     g_vt_box_rects.clear();
     g_vt_deco_rects.clear();
     g_ed_sel_anchor = -1;
@@ -1678,12 +1682,14 @@ static void ime_bar_layout_horizontal(int x, int y, int bar_w) {
     lv_obj_set_size(g_ime_bar, bar_w, ime_bar_h());
 }
 
-// 竖排:正文是一列列竖着的字,候选条贴着光标那一格竖着排,一行一个候选。
-// 光标下面放不下整块候选区时改成从下往上长,顺序也跟着倒过来,让 1 号候选始终贴着光标。
+// 竖排:正文是一列列竖着的字,候选条排在光标那一列旁边竖着铺开,一行一个候选。
+// 分页固定 9 个,框体高度也就按满页 9 行定死,候选不够一页也不缩;整块在竖直方向
+// 固定居中,不跟着光标上下跑——否则每敲一个字框就跳一下,反而看不清候选。
 static void ime_bar_layout_vertical() {
     const lv_font_t *f = ime_font();
     int lh = f ? lv_font_get_line_height(f) : 24;
     int row_h = lh + 2;
+    static constexpr int kRows = 9;
 
     lv_obj_update_layout(g_vt_view);
     lv_area_t va {};
@@ -1692,20 +1698,8 @@ static void ime_bar_layout_vertical() {
     lv_area_t cc {};
     if(caret_on) lv_obj_get_coords(g_vt_caret, &cc);
 
-    int below_top = (caret_on ? cc.y2 : va.y1) + 6;                    // 向下时的起始边
-    int above_bottom = (caret_on ? cc.y1 : va.y1) - 6;                 // 向上时的收尾边
-    int space_down = chrome_bottom() - below_top;
-    int space_up = above_bottom - 8;
-    // 编码行加两个候选算"够用",不够就翻转;两边都挤时挑空的那边
-    int need = row_h * 3 + 8;
-    bool upward = space_down < need && space_up > space_down;
-
-    // 先扣掉编码那行,再扣底边;页内至少 1 个候选、最多 9 个
-    int cap = ((upward ? space_up : space_down) - 8) / row_h - 1;
-    if(cap < 1) cap = 1;
-    if(cap > 9) cap = 9;
     g_linux_ime.set_display_width(0);  // 竖排按行数分页,不走像素宽度那条路
-    g_linux_ime.set_page_size(cap);
+    g_linux_ime.set_page_size(kRows);
 
     const auto &c = g_linux_ime.candidates();
     int hi = g_linux_ime.highlight_index();
@@ -1713,31 +1707,24 @@ static void ime_bar_layout_vertical() {
                        std::to_string(g_linux_ime.current_page()) + "/" +
                        std::to_string(g_linux_ime.total_pages());
     int wmax = f ? (int)lv_text_get_width(head.c_str(), (uint32_t)head.size(), f, 0) : 0;
-    std::vector<std::string> lines;
+    std::string s = head;
     for(size_t i = 0; i < c.size(); ++i) {
         std::string part = std::to_string((int)i + 1) + "." + c[i];
         if((int)i == hi) part = "[" + part + "]";
-        lines.push_back(part);
+        s += "\n" + part;
         int pw = f ? (int)lv_text_get_width(part.c_str(), (uint32_t)part.size(), f, 0) : 0;
         if(pw > wmax) wmax = pw;
-    }
-    // 向下:编码行在上,候选 1 紧贴光标。向上:编码行翻到最上,候选从 1 号往上递增。
-    std::string s = head;
-    if(upward) {
-        for(size_t i = lines.size(); i-- > 0;) s += "\n" + lines[i];
-    } else {
-        for(size_t i = 0; i < lines.size(); ++i) s += "\n" + lines[i];
     }
 
     int w = wmax + 14;
     if(w < 120) w = 120;
     if(w > 320) w = 320;
-    int h = ((int)c.size() + 1) * row_h + 8;
-    int x = caret_on ? cc.x1 - w - 6 : va.x1 + 6;  // 优先排在光标左边
+    int h = (kRows + 1) * row_h + 8;  // 编码行 + 满页 9 个候选
+    int x = caret_on ? cc.x1 - w - 6 : va.x1 + 6;  // 左右仍贴着光标那一列
     if(x < 8) x = (caret_on ? cc.x2 + 6 : va.x1 + 6);
     if(x + w > 1016) x = 1016 - w;
     if(x < 8) x = 8;
-    int y = upward ? above_bottom - h : below_top;
+    int y = va.y1 + (va.y2 - va.y1 + 1 - h) / 2;
     if(y + h > chrome_bottom()) y = chrome_bottom() - h;
     if(y < 8) y = 8;
 
@@ -1975,7 +1962,8 @@ static void render_editor() {
     clear_root();
     int editor_y = 8;
     int editor_h = 552;
-    if(g_quick_slot < 0 && g_edit_file.empty() && !g_prompt.empty()) {
+    // 竖排的提示词排在正文右侧的竖列里(见 editor_vt_refresh),不占顶部横条
+    if(!editor_vertical() && g_quick_slot < 0 && g_edit_file.empty() && !g_prompt.empty()) {
         lv_obj_t *prompt = label(g_root, "提示: " + g_prompt, 8, 8, 1008, 58);
         lv_label_set_long_mode(prompt, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_color(prompt, g_theme.muted, 0);
@@ -6153,7 +6141,7 @@ static void editor_md_draw_deco(lv_event_t *e) {
     dsc.border_width = 0;
     dsc.bg_color = g_theme.fg;
     dsc.bg_opa = LV_OPA_COVER;
-    for(const std::vector<lv_area_t> *tbl : {&g_md_box_rects, &g_md_dot_rects}) {
+    for(const std::vector<lv_area_t> *tbl : {&g_md_box_rects, &g_md_dot_rects, &g_md_wave_rects}) {
         for(const lv_area_t &a : *tbl) {
             lv_area_t r{a.x1 + org.x1, a.y1 + org.y1, a.x2 + org.x1, a.y2 + org.y1};
             lv_draw_rect(layer, &dsc, &r);
@@ -6204,14 +6192,36 @@ static lv_obj_t *md_rule_in(std::vector<lv_obj_t *> &pool, lv_obj_t *parent, int
     return o;
 }
 
+// 书名波浪线:周期 8px、振幅 2px 的三角波,和 ESP32 那条同一套几何。
+// 横排沿 x 走、画在字下;竖排沿 y 走、画在列左侧。每段 2px 宽、2px 高。
+static void md_push_wave(int x, int y, int w, std::vector<lv_area_t> &out) {
+    for(int dx = 0; dx < w; dx += 2) {
+        int ph = dx & 7;
+        int dy = ph < 2 ? 0 : (ph < 4 ? 1 : (ph < 6 ? 2 : 1));
+        int x2 = (dx + 1 < w) ? x + dx + 1 : x + dx;
+        out.push_back({x + dx, y + dy, x2, y + dy + 1});
+    }
+}
+
+static void vt_push_wave(int x, int y, int h, std::vector<lv_area_t> &out) {
+    for(int dy = 0; dy < h; dy += 2) {
+        int ph = dy & 7;
+        int dx = ph < 2 ? 0 : (ph < 4 ? 1 : (ph < 6 ? 2 : 1));
+        int y2 = (dy + 1 < h) ? y + dy + 1 : y + dy;
+        out.push_back({x + dx, y + dy, x + dx + 1, y2});
+    }
+}
+
 // 一行的反白底块与着重号小方点,推进绘制回调要用的矩形表。
 static void md_push_deco(const std::string &disp, const std::vector<MdPiece> &pieces,
                          int line_y, int line_h, int letter_h, int letter_space) {
     for(const MdPiece &q : pieces) {
         if(q.hi <= q.lo) continue;
         int ry = line_y + q.row * line_h;
+        int extra = q.faux_bold ? 1 : 0;
         if(q.st.invert)
-            g_md_box_rects.push_back({q.x, ry, q.x + q.w + (q.faux_bold ? 1 : 0) - 1, ry + letter_h - 1});
+            g_md_box_rects.push_back({q.x, ry, q.x + q.w + extra - 1, ry + letter_h - 1});
+        if(q.st.wavy) md_push_wave(q.x, ry + letter_h - 3, q.w + extra, g_md_wave_rects);
         if(q.st.emph) {
             // 和 ESP32 一样落在字脚下面:基线再往下一个 descent,正好压住 em 框下沿
             int dy = ry + letter_h + 1;
@@ -6287,6 +6297,7 @@ static void editor_md_refresh() {
     g_md_sel_rects.clear();
     g_md_box_rects.clear();
     g_md_dot_rects.clear();
+    g_md_wave_rects.clear();
     int sel_lo = -1, sel_hi = -1;
     if(g_ed_sel_anchor >= 0 && g_ed_sel_anchor != (int)caret_byte) {
         sel_lo = g_ed_sel_anchor < (int)caret_byte ? g_ed_sel_anchor : (int)caret_byte;
@@ -6518,6 +6529,7 @@ static void md_render_readonly(const std::string &text, int content_w, int line_
 
     g_md_box_rects.clear();
     g_md_dot_rects.clear();
+    g_md_wave_rects.clear();
 
     MdDoc doc;
     md_split_caret(text, 0, doc);
@@ -6607,6 +6619,12 @@ static const lv_font_t *editor_font() {
     return g_editor_font ? g_editor_font : lv_font_default();
 }
 
+// 提示写作的题目:只有「提示写作」起始的这次编辑才有(新建/编辑已有日记都没有)。
+static std::string editor_prompt_text() {
+    if(g_quick_slot >= 0 || !g_edit_file.empty() || g_prompt.empty()) return "";
+    return "提示:" + g_prompt;
+}
+
 // 参考线画在视口自己的图层上,子标签之后绘制,正好压在线右侧。
 static void editor_vt_draw_guides(lv_event_t *e) {
     if(!g_vt_view || !g_settings.vertical_reference_line()) return;
@@ -6679,7 +6697,8 @@ static void editor_vt_draw_deco(lv_event_t *e) {
     }
 }
 
-static lv_obj_t *vt_col_at(int idx) {    if(idx < (int)g_vt_cols.size()) return g_vt_cols[idx];
+static lv_obj_t *vt_col_at(int idx) {
+    if(idx < (int)g_vt_cols.size()) return g_vt_cols[idx];
     lv_obj_t *o = lv_label_create(g_vt_view);
     lv_label_set_long_mode(o, LV_LABEL_LONG_CLIP);
     lv_obj_set_style_pad_all(o, 0, 0);
@@ -6690,6 +6709,23 @@ static lv_obj_t *vt_col_at(int idx) {    if(idx < (int)g_vt_cols.size()) return 
     lv_obj_set_style_text_letter_space(o, 0, 0);
     lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
     g_vt_cols.push_back(o);
+    return o;
+}
+
+// 提示词的竖列:只用弱化色,与正文区分。
+static lv_obj_t *vt_prompt_col_at(int idx) {
+    if(idx < (int)g_vt_prompt_cols.size()) return g_vt_prompt_cols[idx];
+    lv_obj_t *o = lv_label_create(g_vt_view);
+    lv_label_set_long_mode(o, LV_LABEL_LONG_CLIP);
+    lv_obj_set_style_pad_all(o, 0, 0);
+    lv_obj_set_style_border_width(o, 0, 0);
+    lv_obj_set_style_shadow_width(o, 0, 0);
+    lv_obj_set_style_text_align(o, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(o, editor_font(), 0);
+    lv_obj_set_style_text_color(o, g_theme.muted, 0);
+    lv_obj_set_style_text_letter_space(o, 0, 0);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+    g_vt_prompt_cols.push_back(o);
     return o;
 }
 
@@ -6728,10 +6764,198 @@ static lv_color_t vt_kind_color(VerticalCellKind kind) {
     return g_theme.fg;
 }
 
+// ---------------------------------------------------------------------------
+// 竖排标点
+//
+// 横排标点的墨迹是给横排设计的:、。，在字面左下角,：；！？贴着左边。竖排里
+// 这些得挪到格的右上角(句读)或居中。字体自带竖排表现形(︵︶ ︽︾ ﹁﹂ ﹃﹄ ︱ 那批)
+// 就直接换码点,让字体给真正的竖排字形;字体没有的(︐︑︒︓︔︕︖︙ 全缺)才退回
+// 平移:把原字形在格内挪一下,不去动字库。
+// ---------------------------------------------------------------------------
+
+// 横排标点 → 竖排表现形(与 ESP32 同一张表)
+static uint32_t vt_punct_cp(uint32_t cp) {
+    switch(cp) {
+    case 0x3001: return 0xFE11;  // 、 → ︑
+    case 0x3002: return 0xFE12;  // 。 → ︒
+    case 0xFF0C: return 0xFE10;  // ， → ︐
+    case 0xFF61: return 0xFE12;  // ｡ → ︒
+    case 0xFF62: return 0xFE41;  // ｢ → ﹁
+    case 0xFF63: return 0xFE42;  // ｣ → ﹂
+    case 0xFF64: return 0xFE11;  // ､ → ︑
+    case 0xFF1A: return 0xFE13;  // ： → ︓
+    case 0xFF1B: return 0xFE14;  // ； → ︔
+    case 0xFF01: return 0xFE15;  // ！ → ︕
+    case 0xFF1F: return 0xFE16;  // ？ → ︖
+    case 0x2026: return 0xFE19;  // … → ︙
+    case 0xFF08: return 0xFE35;  // （ → ︵
+    case 0xFF09: return 0xFE36;  // ） → ︶
+    case 0x3008: return 0xFE3F;  // 〈 → ︿
+    case 0x3009: return 0xFE40;  // 〉 → ﹀
+    case 0x300A: return 0xFE3D;  // 《 → ︽
+    case 0x300B: return 0xFE3E;  // 》 → ︾
+    case 0x300C: return 0xFE41;  // 「 → ﹁
+    case 0x300D: return 0xFE42;  // 」 → ﹂
+    case 0x300E: return 0xFE43;  // 『 → ﹃
+    case 0x300F: return 0xFE44;  // 』 → ﹄
+    case 0x201C: return 0xFE41;  // “ → ﹁
+    case 0x201D: return 0xFE42;  // ” → ﹂
+    case 0x2018: return 0xFE43;  // ‘ → ﹃
+    case 0x2019: return 0xFE44;  // ’ → ﹄
+    case 0x2014: return 0xFE31;  // — → ︱
+    default: return 0;
+    }
+}
+
+// 字库里有这个字形吗。必须看 is_placeholder:缺字时 FreeType 会退回 .notdef,
+// 而这份字体的 .notdef 是有轮廓的方框,靠 box_w 判会把缺字当成有字。
+static bool vt_font_has_glyph(const lv_font_t *f, uint32_t cp) {
+    if(!f) return false;
+    lv_font_glyph_dsc_t dsc {};
+    if(!lv_font_get_glyph_dsc(f, &dsc, cp, 0)) return false;
+    if(dsc.is_placeholder) return false;
+    return dsc.box_w > 0 || dsc.box_h > 0;
+}
+
+static std::string vt_utf8_from_cp(uint32_t cp) {
+    std::string s;
+    if(cp < 0x80) {
+        s += (char)cp;
+    } else if(cp < 0x800) {
+        s += (char)(0xC0 | (cp >> 6));
+        s += (char)(0x80 | (cp & 0x3F));
+    } else if(cp < 0x10000) {
+        s += (char)(0xE0 | (cp >> 12));
+        s += (char)(0x80 | ((cp >> 6) & 0x3F));
+        s += (char)(0x80 | (cp & 0x3F));
+    } else {
+        s += (char)(0xF0 | (cp >> 18));
+        s += (char)(0x80 | ((cp >> 12) & 0x3F));
+        s += (char)(0x80 | ((cp >> 6) & 0x3F));
+        s += (char)(0x80 | (cp & 0x3F));
+    }
+    return s;
+}
+
+// 整格正好一个字符时给出它的码点;空串/多字符格返回 0
+static uint32_t vt_cell_cp(const std::string &g) {
+    if(g.empty()) return 0;
+    unsigned char c = (unsigned char)g[0];
+    size_t n = 1;
+    uint32_t cp = c;
+    if((c & 0xE0) == 0xC0) { n = 2; cp = c & 0x1F; }
+    else if((c & 0xF0) == 0xE0) { n = 3; cp = c & 0x0F; }
+    else if((c & 0xF8) == 0xF0) { n = 4; cp = c & 0x07; }
+    if(n != g.size()) return 0;
+    for(size_t k = 1; k < n; ++k) {
+        unsigned char cc = (unsigned char)g[k];
+        if((cc & 0xC0) != 0x80) return 0;
+        cp = (cp << 6) | (cc & 0x3F);
+    }
+    return cp;
+}
+
+// 字体没有竖排字形、只能平移的几类。TopRight/MidRight 是格内偏移,Stack 是省略号:
+// 横排的三点要竖过来,平移做不到,改画三个小方点。
+enum class VtPunctPlace { None, TopRight, MidRight, Stack };
+
+static VtPunctPlace vt_punct_place(uint32_t cp) {
+    switch(cp) {
+    case 0x3001: case 0x3002: case 0xFF0C: case 0xFF61: case 0xFF64:
+        return VtPunctPlace::TopRight;  // 、。，｡､ → 右上角
+    case 0xFF1A: case 0xFF1B: case 0xFF01: case 0xFF1F:
+        return VtPunctPlace::MidRight;  // ：；！？ → 向右居中
+    case 0x2026:
+        return VtPunctPlace::Stack;
+    default: return VtPunctPlace::None;
+    }
+}
+
+// 该列有没有需要格内挪位的格。有的话整列得逐格摆,列标签没法只挪其中一格。
+static bool vt_col_has_placed_punct(const std::vector<VerticalCell> &cells, int start, int end) {
+    for(int i = start; i < end; ++i)
+        if(vt_punct_place(vt_cell_cp(cells[i].glyph)) != VtPunctPlace::None) return true;
+    return false;
+}
+
+// 同上,给不是格数据的整串文字(提示词列)用
+static bool vt_needs_place(const std::string &s) {
+    for(size_t p = 0; p < s.size();) {
+        size_t n = md_utf8_step(s, p);
+        if(vt_punct_place(vt_cell_cp(s.substr(p, n - p))) != VtPunctPlace::None) return true;
+        p = n;
+    }
+    return false;
+}
+
+// 整串过一遍竖排标点(提示词列不走格数据,自己换码点)
+static std::string vt_punct_text(const std::string &s, const lv_font_t *f) {
+    std::string out;
+    for(size_t p = 0; p < s.size();) {
+        size_t n = md_utf8_step(s, p);
+        std::string ch = s.substr(p, n - p);
+        uint32_t vcp = vt_punct_cp(vt_cell_cp(ch));
+        out += (vcp && vt_font_has_glyph(f, vcp)) ? vt_utf8_from_cp(vcp) : ch;
+        p = n;
+    }
+    return out;
+}
+
+// 格内偏移(相对格的左上角,格宽是 lh)。字体行高 = 字号(Go-Lava 的 ascent+descent
+// 正好是一个 em),所以按 lh 取分数就能落在该落的地方。
+static lv_point_t vt_punct_offset(VtPunctPlace pl, int lh) {
+    if(pl == VtPunctPlace::TopRight) return {lh / 2, -lh / 2};
+    if(pl == VtPunctPlace::MidRight) return {lh / 3, 0};
+    return {0, 0};
+}
+
+static bool vt_cell_is_ascii_alnum(const std::vector<VerticalCell> &cells, int idx) {
+    if(idx < 0 || idx >= (int)cells.size()) return false;
+    const std::string &g = cells[idx].glyph;
+    if(g.size() != 1) return false;
+    unsigned char c = (unsigned char)g[0];
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
+// ASCII 直引号在竖排里按开合次序换成竖排引号(﹁﹂ / ﹃﹄)。词内的撇号(don't)不动,
+// 否则英文单词会被拆成引号对。
+static void vt_normalize_quotes(std::vector<VerticalCell> &cells, const lv_font_t *f) {
+    bool dq_open = true, sq_open = true;
+    for(size_t i = 0; i < cells.size(); ++i) {
+        uint32_t cp = vt_cell_cp(cells[i].glyph);
+        bool dq = (cp == '"' || cp == 0xFF02);        // " / ＂
+        bool sq = (cp == '\'' || cp == 0xFF07);       // ' / ＇
+        if(!dq && !sq) continue;
+        if(sq && cp == '\'' && vt_cell_is_ascii_alnum(cells, (int)i - 1) &&
+           vt_cell_is_ascii_alnum(cells, (int)i + 1))
+            continue;
+        uint32_t want = dq ? (dq_open ? 0xFE41 : 0xFE42) : (sq_open ? 0xFE43 : 0xFE44);
+        if(!vt_font_has_glyph(f, want)) continue;
+        cells[i].glyph = vt_utf8_from_cp(want);
+        if(dq) dq_open = !dq_open;
+        else sq_open = !sq_open;
+    }
+}
+
+// 逐格过一遍竖排标点:能换竖排字形的换掉,换不了的留在原字形上由渲染层挪位。
+static void vt_apply_punct(VerticalData &data, const lv_font_t *f) {
+    if(!f) return;
+    for(auto &cells : data.cells) {
+        vt_normalize_quotes(cells, f);
+        for(auto &c : cells) {
+            uint32_t cp = vt_cell_cp(c.glyph);
+            if(!cp) continue;
+            uint32_t vcp = vt_punct_cp(cp);
+            if(vcp && vt_font_has_glyph(f, vcp)) c.glyph = vt_utf8_from_cp(vcp);
+        }
+    }
+}
+
 static void editor_vt_create(int x, int y, int w, int h) {
     g_vt_cols.clear();
     g_vt_marks.clear();
     g_vt_cells.clear();
+    g_vt_prompt_cols.clear();
     g_vt_box_rects.clear();
     g_vt_deco_rects.clear();
     g_ed_sel_anchor = -1;
@@ -6784,7 +7008,27 @@ static void editor_vt_refresh() {
     }
 
     int lh = lv_font_get_line_height(editor_font());
-    g_vt_m = vertical_metrics(0, 0, lv_obj_get_width(g_vt_view), g_vt_h, lh);
+    int vt_w = lv_obj_get_width(g_vt_view);
+    g_vt_m = vertical_metrics(0, 0, vt_w, g_vt_h, lh);
+
+    // 提示写作的题目竖排在右侧:正文整块让出左边,提示自己占最右的若干列。
+    // 提示列数与正文列数一样受窗口高度限制,最多占一半宽度,免得正文挤没了。
+    std::string prompt = vt_punct_text(editor_prompt_text(), editor_font());
+    int prompt_cols = 0;
+    if(!prompt.empty()) {
+        int chars = 0;
+        for(size_t p = 0; p < prompt.size();) {
+            p = md_utf8_step(prompt, p);
+            ++chars;
+        }
+        int need = (chars + g_vt_m.rows - 1) / g_vt_m.rows;
+        int cap = g_vt_m.cols / 2;
+        if(need > cap) need = cap;
+        if(need > 0) {
+            prompt_cols = need;
+            g_vt_m = vertical_metrics(0, 0, vt_w - need * g_vt_m.colAdvance, g_vt_h, lh);
+        }
+    }
 
     auto hidden = vertical_fold_hidden(ml.lines, &g_md_folded, md_on);
     // 光标跑进折叠区时把它展开,否则打字看不见
@@ -6797,6 +7041,7 @@ static void editor_vt_refresh() {
 
     VerticalData data = build_vertical_data(ml.lines, g_vt_m.rows, &hidden, md_on, &g_md_folded,
                                             ml.caret_line, ml.caret_rel);
+    vt_apply_punct(data, editor_font());
     g_vt_data = data;
     g_vt_doc = ml;
 
@@ -6828,9 +7073,12 @@ static void editor_vt_refresh() {
         bool styled = false;
         for(int i = col.start; i < col.end && !styled; ++i)
             styled = cells[i].style.bold || cells[i].style.italic || cells[i].style.strike ||
-                     cells[i].style.underline || cells[i].style.invert || cells[i].style.emph;
+                     cells[i].style.underline || cells[i].style.invert || cells[i].style.emph ||
+                     cells[i].style.wavy;
+        // 有需要格内挪位的竖排标点时整列也得逐格摆:列标签里没法只挪其中一个字
+        bool punct = !styled && vt_col_has_placed_punct(cells, col.start, col.end);
 
-        if(styled) {
+        if(styled || punct) {
             // 带样式的列整列改成逐格标签:每格一个字符、用自己的字体和颜色,
             // 伪粗体的格再多画一层偏移 1px 的副本。
             lv_obj_add_flag(vt_col_at(ci), LV_OBJ_FLAG_HIDDEN);
@@ -6841,33 +7089,51 @@ static void editor_vt_refresh() {
                 bool faux = false;
                 const lv_font_t *f = md_style_font(c.style, faux);
                 int cy = g_vt_m.y + row * g_vt_m.rowAdvance;
-                if(c.style.invert)
-                    g_vt_box_rects.push_back({cx, cy, cx + lh - 1, cy + lh - 1});
+                if(c.style.invert) {
+                    // 反白块铺满整格行距,否则连续反白的两字之间会露出 2px 缝
+                    bool next_inv = (i + 1 < col.end) && cells[i + 1].style.invert;
+                    int bh = next_inv ? g_vt_m.rowAdvance : lh;
+                    g_vt_box_rects.push_back({cx, cy, cx + lh - 1, cy + bh - 1});
+                }
+                VtPunctPlace pl = vt_punct_place(vt_cell_cp(c.glyph));
+                lv_point_t off = vt_punct_offset(pl, lh);
                 for(int d = 0; d < (faux ? 2 : 1); ++d) {
                     lv_obj_t *g = vt_cell_at(cell_i++);
                     lv_obj_remove_flag(g, LV_OBJ_FLAG_HIDDEN);
                     lv_obj_set_style_text_font(g, f, 0);
                     lv_obj_set_style_text_decor(g, LV_TEXT_DECOR_NONE, 0);
                     lv_obj_set_style_text_color(g, c.style.invert ? g_theme.bg : vt_kind_color(c.kind), 0);
-                    lv_obj_set_pos(g, cx + d, cy);
+                    lv_obj_set_pos(g, cx + d + off.x, cy + off.y);
                     lv_obj_set_size(g, lh, g_vt_m.rowAdvance);
-                    lv_label_set_text(g, c.glyph.c_str());
+                    // 省略号画成小方点,横排那三个点就别再画了
+                    lv_label_set_text(g, pl == VtPunctPlace::Stack ? "" : c.glyph.c_str());
+                }
+                if(pl == VtPunctPlace::Stack) {
+                    // 省略号:横排的三点竖过来,平移做不到,画成三个小方点
+                    int px = cx + lh / 2 - 1;
+                    for(int py : {cy + 3, cy + lh / 2 - 1, cy + lh - 5})
+                        g_vt_deco_rects.push_back({px, py, px + 2, py + 2});
                 }
             }
-            // 下划线/删除线:同意样式的连续格并成一条竖线
-            for(int flag = 0; flag < 2; ++flag) {
+            // 下划线/删除线是竖线,波浪线是折线:同意样式的连续格并成一条
+            for(int flag = 0; flag < 3; ++flag) {
                 int rs = -1;
                 for(int i = col.start; i <= col.end; ++i) {
-                    bool on = i < col.end && (flag == 0 ? cells[i].style.underline : cells[i].style.strike);
+                    const MdStyle *s = i < col.end ? &cells[i].style : nullptr;
+                    bool on = s && (flag == 0 ? s->underline : (flag == 1 ? s->strike : s->wavy));
                     if(on && rs < 0) rs = i;
                     if(rs >= 0 && !on) {
                         int row0 = rs - col.start, row1 = i - col.start;
                         int y0 = g_vt_m.y + row0 * g_vt_m.rowAdvance + 2;
                         int hh = (row1 - row0 - 1) * g_vt_m.rowAdvance + lh - 4;
                         if(hh > 0) {
-                            int x0 = flag == 0 ? cx - 2 : cx + lh / 2;
-                            int w0 = flag == 0 ? 1 : 2;
-                            g_vt_deco_rects.push_back({x0, y0, x0 + w0 - 1, y0 + hh - 1});
+                            if(flag == 2) {
+                                vt_push_wave(cx - 4, y0, hh, g_vt_deco_rects);
+                            } else {
+                                int x0 = flag == 0 ? cx - 2 : cx + lh / 2;
+                                int w0 = flag == 0 ? 1 : 2;
+                                g_vt_deco_rects.push_back({x0, y0, x0 + w0 - 1, y0 + hh - 1});
+                            }
                         }
                         rs = -1;
                     }
@@ -6897,6 +7163,74 @@ static void editor_vt_refresh() {
     }
     for(int ci = g_vt_m.cols; ci < (int)g_vt_cols.size(); ++ci)
         lv_obj_add_flag(g_vt_cols[ci], LV_OBJ_FLAG_HIDDEN);
+
+    // 提示词的列:从最右列往左排,每列顶天立地放满 rows 个字
+    if(prompt_cols > 0) {
+        std::vector<std::string> parts;
+        std::string cur;
+        int n = 0;
+        for(size_t p = 0; p < prompt.size();) {
+            size_t step = md_utf8_step(prompt, p);
+            cur += prompt.substr(p, step - p);
+            p = step;
+            if(++n == g_vt_m.rows && (int)parts.size() + 1 < prompt_cols) {
+                parts.push_back(cur);
+                cur.clear();
+                n = 0;
+            }
+        }
+        if(!cur.empty()) parts.push_back(cur);
+        int prow = g_vt_m.x + vt_w - g_vt_m.colAdvance;
+        int pcol_h = g_vt_m.rows * g_vt_m.rowAdvance;
+        for(int k = 0; k < (int)parts.size(); ++k) {
+            int px = prow - k * g_vt_m.colAdvance;
+            lv_obj_t *o = vt_prompt_col_at(k);
+            if(vt_needs_place(parts[k])) {
+                // 这一列里有要挪位的标点,整列逐字摆(与正文同一套偏移)
+                lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+                int row = 0;
+                for(size_t p = 0; p < parts[k].size(); ++row) {
+                    size_t step = md_utf8_step(parts[k], p);
+                    std::string ch = parts[k].substr(p, step - p);
+                    p = step;
+                    VtPunctPlace pl = vt_punct_place(vt_cell_cp(ch));
+                    lv_point_t off = vt_punct_offset(pl, lh);
+                    int cy = g_vt_m.y + row * g_vt_m.rowAdvance;
+                    lv_obj_t *g = vt_cell_at(cell_i++);
+                    lv_obj_remove_flag(g, LV_OBJ_FLAG_HIDDEN);
+                    lv_obj_set_style_text_font(g, editor_font(), 0);
+                    lv_obj_set_style_text_decor(g, LV_TEXT_DECOR_NONE, 0);
+                    lv_obj_set_style_text_color(g, g_theme.muted, 0);
+                    lv_obj_set_pos(g, px + off.x, cy + off.y);
+                    lv_obj_set_size(g, lh, g_vt_m.rowAdvance);
+                    lv_label_set_text(g, pl == VtPunctPlace::Stack ? "" : ch.c_str());
+                    if(pl == VtPunctPlace::Stack) {
+                        int dx = px + lh / 2 - 1;
+                        for(int py : {cy + 3, cy + lh / 2 - 1, cy + lh - 5})
+                            g_vt_deco_rects.push_back({dx, py, dx + 2, py + 2});
+                    }
+                }
+                continue;
+            }
+            std::string disp;
+            for(size_t p = 0; p < parts[k].size();) {
+                size_t step = md_utf8_step(parts[k], p);
+                if(!disp.empty()) disp += "\n";
+                disp += parts[k].substr(p, step - p);
+                p = step;
+            }
+            lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_pos(o, px, g_vt_m.y);
+            lv_obj_set_size(o, lh, pcol_h);
+            lv_obj_set_style_text_line_space(o, g_vt_m.rowAdvance - lh, 0);
+            lv_label_set_text(o, disp.c_str());
+        }
+        for(int k = (int)parts.size(); k < (int)g_vt_prompt_cols.size(); ++k)
+            lv_obj_add_flag(g_vt_prompt_cols[k], LV_OBJ_FLAG_HIDDEN);
+    } else {
+        for(lv_obj_t *o : g_vt_prompt_cols) lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+    }
+    // 提示列也用格标签,残留的空闲标签等它排完再收
     for(int k = cell_i; k < (int)g_vt_cells.size(); ++k)
         lv_obj_add_flag(g_vt_cells[k], LV_OBJ_FLAG_HIDDEN);
 

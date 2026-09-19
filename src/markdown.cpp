@@ -65,14 +65,14 @@ void md_inline_runs(const std::string &body, int caret_rel,
                     std::vector<std::pair<int,int>> &padded_out,
                     std::vector<MdRun> &runs_out) {
     static const struct { const char *s; size_t len; bool undersc; MdStyle st; } marks[] = {
-        {"***", 3, false, {true,  true,  false, false, false, false}},
-        {"**",  2, false, {true,  false, false, false, false, false}},
-        {"__",  2, true,  {true,  false, false, false, false, false}},
-        {"==",  2, false, {false, false, false, false, false, true }},
-        {"~~",  2, false, {false, false, true,  false, false, false}},
-        {"`",   1, false, {false, false, false, false, true,  false}},
-        {"*",   1, false, {false, true,  false, false, false, false}},
-        {"_",   1, true,  {false, true,  false, false, false, false}},
+        {"***", 3, false, {true,  true,  false, false, false, false, false}},
+        {"**",  2, false, {true,  false, false, false, false, false, false}},
+        {"__",  2, true,  {false, false, false, true,  false, false, false}},
+        {"==",  2, false, {false, false, false, false, false, true,  false}},
+        {"~~",  2, false, {false, false, true,  false, false, false, false}},
+        {"`",   1, false, {false, false, false, false, true,  false, false}},
+        {"*",   1, false, {false, true,  false, false, false, false, false}},
+        {"_",   1, true,  {false, true,  false, false, false, false, false}},
     };
     const int nmark = (int)(sizeof(marks) / sizeof(marks[0]));
     std::set<int> used;  // 已经配过对的标记位置,不能再当开标记用
@@ -90,6 +90,25 @@ void md_inline_runs(const std::string &body, int caret_rel,
             continue;
         }
 
+        // 书名号《…》:两个书名号都隐藏,中间的文字画波浪线,与粗体的处理完全一致
+        if(body.compare(i, 3, "\xe3\x80\x8a") == 0) {
+            size_t close = body.find("\xe3\x80\x8b", i + 3);
+            if(close != std::string::npos) {
+                int a1 = (int)i, b2 = (int)close + 3;
+                if(!(caret_rel >= a1 && caret_rel < b2)) {
+                    hidden_out.push_back({a1, (int)i + 3});
+                    hidden_out.push_back({(int)close, b2});
+                    if(close > i + 3)
+                        runs_out.push_back({(int)(i + 3), (int)close,
+                                            {false, false, false, false, false, false, true}});
+                }
+                i = (size_t)b2;
+                continue;
+            }
+            i = md_utf8_step(body, i);
+            continue;
+        }
+
         // 链接 `[文字](url)`:方括号与整个 URL 换成同宽空白,文字反白+下划线
         if(body[i] == '[') {
             size_t p = body.find("](", i + 1);
@@ -102,7 +121,7 @@ void md_inline_runs(const std::string &body, int caret_rel,
                         padded_out.push_back({(int)p, end});
                         if(p > i + 1)
                             runs_out.push_back({(int)(i + 1), (int)p,
-                                                {false, false, false, true, true, false}});
+                                                {false, false, false, true, true, false, false}});
                     }
                     i = (size_t)end;
                     continue;
@@ -145,7 +164,8 @@ void md_inline_runs(const std::string &body, int caret_rel,
                 hidden_out.push_back({a1, (int)(i + ml)});
                 hidden_out.push_back({(int)close, b2});
                 if((marks[m].st.bold || marks[m].st.italic || marks[m].st.strike ||
-                    marks[m].st.underline || marks[m].st.invert || marks[m].st.emph) &&
+                    marks[m].st.underline || marks[m].st.invert || marks[m].st.emph ||
+                    marks[m].st.wavy) &&
                    close > i + ml)
                     runs_out.push_back({(int)(i + ml), (int)close, marks[m].st});
             }
@@ -226,11 +246,22 @@ MdRender md_build_line(const std::string &raw, bool in_code, int caret_rel) {
                 }
             }
         }
+
+        // 光标落在块标记(#、-、1.、一、、>)的字节范围里时,标记原样平文显示;
+        // 离开这一小段才换成图标/子弹并套上标题样式,与行内标记的显隐规则一致。
+        if(l.body_off > 0 && caret_rel >= 0 && caret_rel < l.body_off) {
+            prefix = raw.substr(0, (size_t)l.body_off);
+            l.plain_marker = true;
+            if(l.heading) { l.heading = false; l.level = 0; }
+        }
     }
 
     const std::string body = raw.substr((size_t)l.body_off);
+    // caret_rel 是行内偏移,而 md_inline_runs 里的标记区间是相对正文起点(body_off)的:
+    // 标题、列表、引用这些带前缀的行必须先换算,否则光标落点跟标记对不上,
+    // 该平文显示的时候渲染了、该渲染的时候又平文显示。
     std::vector<MdRun> raw_runs;
-    md_inline_runs(body, caret_rel, l.hidden, l.padded, raw_runs);
+    md_inline_runs(body, caret_rel - l.body_off, l.hidden, l.padded, raw_runs);
 
     // 重叠的样式区间(如 ***粗斜***)按位取并集,再逐字节压成不重叠的显示片段。
     std::vector<char> hid(body.size(), 0), pad(body.size(), 0);
@@ -252,6 +283,7 @@ MdRender md_build_line(const std::string &raw, bool in_code, int caret_rel) {
             sty[(size_t)k].underline |= r.st.underline;
             sty[(size_t)k].invert |= r.st.invert;
             sty[(size_t)k].emph |= r.st.emph;
+            sty[(size_t)k].wavy |= r.st.wavy;
         }
     }
 
@@ -262,7 +294,7 @@ MdRender md_build_line(const std::string &raw, bool in_code, int caret_rel) {
         if(hid[k]) continue;
         char ch = pad[k] ? ' ' : body[k];
         MdStyle s = sty[k];
-        if(!s.bold && !s.italic && !s.strike && !s.underline && !s.invert && !s.emph) {
+        if(!s.bold && !s.italic && !s.strike && !s.underline && !s.invert && !s.emph && !s.wavy) {
             l.text += ch;
             continue;
         }
@@ -270,7 +302,8 @@ MdRender md_build_line(const std::string &raw, bool in_code, int caret_rel) {
         if(!l.runs.empty() && l.runs.back().hi == at &&
            l.runs.back().st.bold == s.bold && l.runs.back().st.italic == s.italic &&
            l.runs.back().st.strike == s.strike && l.runs.back().st.underline == s.underline &&
-           l.runs.back().st.invert == s.invert && l.runs.back().st.emph == s.emph)
+           l.runs.back().st.invert == s.invert && l.runs.back().st.emph == s.emph &&
+           l.runs.back().st.wavy == s.wavy)
             l.runs.back().hi = at + 1;
         else
             l.runs.push_back({at, at + 1, s});
@@ -285,7 +318,8 @@ MdRender md_build_line(const std::string &raw, bool in_code, int caret_rel) {
 
 // 原始行内偏移 → 显示文本里的字节偏移。
 int md_display_offset(const MdRender &l, int raw_rel) {
-    if(raw_rel < l.body_off) return 0;
+    // 光标在块标记里时前缀是原文,偏移一一对应,光标跟着标记走;否则整段前缀只算一个落点。
+    if(raw_rel < l.body_off) return (l.plain_marker && raw_rel > 0) ? raw_rel : 0;
     int rel = raw_rel - l.body_off;
     int d = l.prefix_bytes + rel;
     for(const auto &hs : l.hidden) {

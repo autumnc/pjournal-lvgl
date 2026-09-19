@@ -17,6 +17,7 @@ struct MdStyle {
     bool underline = false;
     bool invert = false;
     bool emph = false;
+    bool wavy = false;  // 《书名》:波浪线,横排画在字下、竖排画在列左侧
 };
 
 // 一段带样式的显示文本区间(相对 MdRender::text 的字节范围)。
@@ -36,6 +37,9 @@ struct MdRender {
     bool heading = false;
     bool rule = false;
     bool muted = false;
+    // 光标停在块标记(#、-、1.、一、、>)里:前缀原样显示,不再换成图标。
+    // 此时前缀与原始字节一一对应,光标可以直接在前缀里挪。
+    bool plain_marker = false;
     int level = 0;
 };
 
