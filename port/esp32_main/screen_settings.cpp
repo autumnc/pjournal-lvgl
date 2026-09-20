@@ -6,6 +6,7 @@
 #include "ime/IME.h"
 #include "pcf85063.h"
 #include "quick_edit.h"
+#include "file_edit.h"
 #include "typing_click.h"
 #include "ui_helpers.h"
 #include <cstdio>
@@ -138,6 +139,13 @@ static int voiceAsrServiceIndex(const char *k) {
 static const char *voiceAsrServiceNext(int idx) {
     int n = (int)(sizeof(VOICE_ASR_SERVICE_OPTS) / sizeof(VOICE_ASR_SERVICE_OPTS[0]));
     return VOICE_ASR_SERVICE_OPTS[(idx + 1) % n].key;
+}
+
+static const char *appModeLabel() {
+    std::string mode = g_settings.appMode();
+    if (mode == "quick") return "快捷编辑";
+    if (mode == "file") return "文件编辑";
+    return "个人日记";
 }
 // UI 序号(跳过隐藏行)→ SETTINGS_FIELDS 真实下标;越界返回最后一个可见行
 static int fieldAt(int sel) {
@@ -781,7 +789,7 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
 
     // ── Browse mode ────────────────────────────────────────────────────
     if (key == 'q' || key == 'Q' || key == 0x1B) {
-        ctx.nextState = g_quickEdit ? APP_EDITOR : APP_MAIN;
+        ctx.nextState = (g_quickEdit || g_fileEdit) ? APP_EDITOR : APP_MAIN;
         return ctx.nextState;
     }
     if (key == 'k' || key == KEY_UP) { if (g_settingsState.selection > 0) g_settingsState.selection--; }
@@ -794,7 +802,8 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
         auto &f = SETTINGS_FIELDS[fieldAt(g_settingsState.selection)];
         if (f.action) {
             if (strcmp(f.key, "_app_mode") == 0) {
-                std::string next = (g_settings.appMode() == "quick") ? "journal" : "quick";
+                std::string cur = g_settings.appMode();
+                std::string next = (cur == "journal") ? "quick" : (cur == "quick" ? "file" : "journal");
                 g_settings.setString("app_mode", next);
                 ctx.statusMessage = "切换模式需重启生效";
                 return APP_SETTINGS;
@@ -985,7 +994,7 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
                          g_settings.polishPrompt().empty() ? "(未设置)" : "(已设置)");
             } else if (strcmp(f.key, "_app_mode") == 0) {
                 snprintf(buf, sizeof(buf), "▶ %s: %s", f.label,
-                         g_settings.appMode() == "quick" ? "快捷编辑" : "个人日记");
+                         appModeLabel());
             } else if (strcmp(f.key, "_home_view") == 0) {
                 snprintf(buf, sizeof(buf), "▶ %s: %s", f.label,
                          g_settings.homeView() == "month" ? "月视图" : "周视图");

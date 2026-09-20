@@ -6,6 +6,7 @@
 #include "wifi_manager.h"
 #include "settings_manager.h"
 #include "quick_edit.h"
+#include "file_edit.h"
 #include "typing_click.h"
 #include "ui_helpers.h"
 #include "markdown_render.h"
@@ -14,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <algorithm>
 #include <set>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
@@ -84,6 +86,7 @@ static struct {
     std::string recoveryMeta;
     uint32_t lastRecoveryHash = 0;
     bool promptGenerating = false;
+    bool fileEditSession = false;
 
     // Selection
     bool hasSelection = false;
@@ -107,6 +110,20 @@ static struct {
     // 快捷键帮助对话框 (Ctrl+?)
     bool helpActive = false;
     int helpScroll = 0;
+
+    // File edit manager panel (Ctrl+E in file mode)
+    struct {
+        bool active = false;
+        std::vector<FileEditEntry> entries;
+        int selection = 0;
+        int scroll = 0;
+        bool prompt = false;
+        bool rename = false;
+        bool confirmDelete = false;
+        std::string input;
+        int inputCur = 0;
+        std::string message;
+    } filePanel;
 } g_editor;
 
 static volatile bool s_promptTaskDone = false;
@@ -173,6 +190,14 @@ static std::string metaValue(const std::string &meta, const char *key) {
     pos += prefix.size();
     size_t end = meta.find('\n', pos);
     return meta.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+}
+
+static bool isSafeJournalFilename(const std::string &fn) {
+    if (fn.empty() || fn[0] == '.' || fn.find('/') != std::string::npos || fn.find("..") != std::string::npos) return false;
+    size_t dot = fn.rfind('.');
+    if (dot == std::string::npos) return false;
+    std::string ext = fn.substr(dot);
+    return ext == ".txt" || ext == ".md";
 }
 
 // ── Selection helpers ────────────────────────────────────────────────────
@@ -481,10 +506,211 @@ static bool inQuickFileSession() {
     return g_quickEdit && g_editor.savedFilename.empty();
 }
 
+static void drawEditor();
+
+static bool inFileEditSession() {
+    return g_fileEdit && g_editor.fileEditSession;
+}
+
+static void filePanelReload(const std::string &prefer = "") {
+    auto &p = g_editor.filePanel;
+    p.entries = fileEditList();
+    if (p.entries.empty()) {
+        fileEditCreate(fileEditLastName());
+        p.entries = fileEditList();
+    }
+    int found = -1;
+    std::string wanted = prefer.empty() ? g_editor.savedFilename : prefer;
+    for (int i = 0; i < (int)p.entries.size(); i++) {
+        if (p.entries[i].name == wanted) { found = i; break; }
+    }
+    if (found >= 0) p.selection = found;
+    if (p.selection < 0) p.selection = 0;
+    if (p.selection >= (int)p.entries.size()) p.selection = (int)p.entries.size() - 1;
+    if (p.selection < 0) p.selection = 0;
+}
+
+static int panelUtf8Prev(const std::string &s, int pos) {
+    if (pos <= 0) return 0;
+    int prev = pos - 1;
+    while (prev > 0 && ((unsigned char)s[prev] & 0xC0) == 0x80) prev--;
+    return prev;
+}
+
+static int panelUtf8Next(const std::string &s, int pos) {
+    if (pos < 0 || pos >= (int)s.length()) return (int)s.length();
+    int next = pos + 1;
+    while (next < (int)s.length() && ((unsigned char)s[next] & 0xC0) == 0x80) next++;
+    return next;
+}
+
+static void fileEditLoadCurrent(const std::string &name) {
+    std::string clean = fileEditSanitizeName(name);
+    loadLinesIntoEditor(fileEditLoad(clean));
+    g_editor.savedFilename = clean;
+    fileEditSetLastName(clean);
+    g_editor.scroll = 0;
+    g_editor.targetCx = -1;
+    g_editor.hasSelection = false;
+    g_editor.modifiedSinceSave = false;
+    g_editor.autoSaveTime = 0;
+    markDirty();
+    clearUndoHistory();
+}
+
+static bool fileEditSwitchTo(const std::string &name) {
+    if (!inFileEditSession()) return false;
+    if (!fileEditSave(g_editor.savedFilename, currentEditorText())) return false;
+    g_journal.clearRecoveryDraft();
+    fileEditLoadCurrent(name);
+    return true;
+}
+
+static void filePanelBeginPrompt(bool rename) {
+    auto &p = g_editor.filePanel;
+    p.prompt = true;
+    p.rename = rename;
+    p.confirmDelete = false;
+    if (rename && !p.entries.empty()) p.input = p.entries[p.selection].name;
+    else p.input = "untitled.txt";
+    p.inputCur = (int)p.input.length();
+    p.message.clear();
+}
+
+static void drawFilePanel() {
+    auto &p = g_editor.filePanel;
+    if (!p.active) return;
+    const int panelW = SCREEN_W / 3;
+    const int rowH = LINE_SPACING;
+    u8g2_SetDrawColor(g_u8g2, 1);
+    u8g2_DrawBox(g_u8g2, 0, 0, panelW, SCREEN_H);
+    u8g2_SetDrawColor(g_u8g2, 0);
+    u8g2_DrawFrame(g_u8g2, 0, 0, panelW, SCREEN_H);
+    ui_draw_text(6, FONT_H, "文件", false, true);
+    u8g2_DrawHLine(g_u8g2, 4, FONT_H + g_font.descent(), panelW - 8);
+    int listY = FONT_H + rowH;
+    int visible = (STATUS_Y - listY + rowH - 1) / rowH;
+    if (visible < 1) visible = 1;
+    if (p.selection < p.scroll) p.scroll = p.selection;
+    if (p.selection >= p.scroll + visible) p.scroll = p.selection - visible + 1;
+    if (p.scroll < 0) p.scroll = 0;
+    if (p.entries.empty()) {
+        ui_draw_text(8, listY, "空目录");
+    } else {
+        for (int i = 0; i < visible && p.scroll + i < (int)p.entries.size(); i++) {
+            int idx = p.scroll + i;
+            std::string name = p.entries[idx].name;
+            int maxW = panelW - 16;
+            while (!name.empty() && g_font.textWidth(name.c_str()) > maxW) {
+                name.erase(panelUtf8Prev(name, (int)name.size()));
+            }
+            ui_draw_text(6, listY + i * rowH, name.c_str(), idx == p.selection);
+        }
+    }
+    if (p.prompt) {
+        int y = STATUS_Y - rowH;
+        std::string label = p.rename ? "改名:" : "新建:";
+        ui_draw_text(6, y, label.c_str());
+        int tx = 6 + g_font.textWidth(label.c_str());
+        std::string disp = p.input;
+        while (!disp.empty() && g_font.textWidth(disp.c_str()) > panelW - tx - 8) {
+            disp.erase(0, panelUtf8Next(disp, 0));
+        }
+        g_font.drawText(tx, y, disp.c_str());
+        int cx = tx + g_font.textWidth(disp.c_str());
+        u8g2_DrawBox(g_u8g2, cx, y + 4, 6, 3);
+    } else if (!p.message.empty()) {
+        ui_draw_text(6, STATUS_Y - rowH, p.message.c_str());
+    }
+    ui_draw_text(6, STATUS_Y + g_font.ascent(),
+                 p.confirmDelete ? "Enter确认 Esc取消" : "a新 d删 r改 Enter开");
+    u8g2_SetDrawColor(g_u8g2, 1);
+}
+
+static AppState screen_editor_file_panel_handle(int key, ScreenContext &ctx) {
+    (void)ctx;
+    auto &p = g_editor.filePanel;
+    if (p.confirmDelete) {
+        if (key == 0x0A || key == 0x0D || key == 'y' || key == 'Y') {
+            if (!p.entries.empty()) {
+                std::string name = p.entries[p.selection].name;
+                p.message = fileEditRemove(name) ? "已删除" : "删除失败";
+                filePanelReload();
+            }
+            p.confirmDelete = false;
+        } else if (key == 0x1B || key == 'n' || key == 'N' || key == 'q' || key == 'Q') {
+            p.confirmDelete = false;
+            p.message = "已取消";
+        }
+        ui_clear(); drawEditor(); drawFilePanel(); ui_commit();
+        return APP_EDITOR;
+    }
+    if (p.prompt) {
+        if (key == 0x1B) {
+            p.prompt = false;
+            p.input.clear();
+        } else if (key == 0x0A || key == 0x0D) {
+            std::string name = fileEditSanitizeName(p.input);
+            bool ok = false;
+            if (p.rename && !p.entries.empty()) {
+                std::string old = p.entries[p.selection].name;
+                ok = fileEditRename(old, name);
+                if (ok && old == g_editor.savedFilename) g_editor.savedFilename = name;
+            } else {
+                ok = fileEditCreate(name);
+            }
+            p.prompt = false;
+            p.message = ok ? "完成" : "失败";
+            filePanelReload(name);
+        } else if (key == 0x08 || key == 0x7F) {
+            if (p.inputCur > 0) {
+                p.input.erase(p.inputCur - 1, 1);
+                p.inputCur--;
+            }
+        } else if (key >= 0x20 && key <= 0x7E) {
+            p.input.insert(p.inputCur, 1, (char)key);
+            p.inputCur++;
+        }
+        ui_clear(); drawEditor(); drawFilePanel(); ui_commit();
+        return APP_EDITOR;
+    }
+    if (key == 0x05 || key == 0x1B || key == 'q' || key == 'Q') {
+        p.active = false;
+        ui_clear(); drawEditor(); ui_commit();
+        return APP_EDITOR;
+    }
+    if (key == KEY_UP || key == 'k') {
+        if (p.selection > 0) p.selection--;
+    } else if (key == KEY_DOWN || key == 'j') {
+        if (p.selection < (int)p.entries.size() - 1) p.selection++;
+    } else if (key == 'a' || key == 'A') {
+        filePanelBeginPrompt(false);
+    } else if ((key == 'r' || key == 'R') && !p.entries.empty()) {
+        filePanelBeginPrompt(true);
+    } else if ((key == 'd' || key == 'D') && !p.entries.empty()) {
+        std::string name = p.entries[p.selection].name;
+        if (name == g_editor.savedFilename) {
+            p.message = "当前文件不可删";
+        } else {
+            p.confirmDelete = true;
+            p.message = "删除 " + name + "?";
+        }
+    } else if ((key == 0x0A || key == 0x0D) && !p.entries.empty()) {
+        std::string name = p.entries[p.selection].name;
+        if (fileEditSwitchTo(name)) {
+            p.active = false;
+        } else {
+            p.message = "打开失败";
+        }
+    }
+    ui_clear(); drawEditor(); drawFilePanel(); ui_commit();
+    return APP_EDITOR;
+}
+
 static bool saveRecoveryDraftIfChanged() {
     std::string text = currentEditorText();
     std::string meta;
-    meta += std::string("mode=") + (inQuickFileSession() ? "quick" : "journal") + "\n";
+    meta += std::string("mode=") + (inQuickFileSession() ? "quick" : (inFileEditSession() ? "file" : "journal")) + "\n";
     meta += "filename=" + g_editor.savedFilename + "\n";
     meta += "quick_index=" + std::to_string(quickEditIndex()) + "\n";
     time_t now;
@@ -1290,6 +1516,7 @@ static void drawEditor() {
             int wc = getWordCount();
             char left[48];
             if (inQuickFileSession()) snprintf(left, sizeof(left), "[%d] 竖排", quickEditIndex());
+            else if (inFileEditSession()) snprintf(left, sizeof(left), "%s 竖排", g_editor.savedFilename.c_str());
             else snprintf(left, sizeof(left), "%s 竖排", g_editor.promptMode ? "提示写作" : "自由写作");
             std::string imeLabel;
             if (!g_editor.imeActive) imeLabel = "EN";
@@ -1479,6 +1706,8 @@ static void drawEditor() {
         char left[48];
         if (inQuickFileSession()) {
             snprintf(left, sizeof(left), "[%d]", quickEditIndex());
+        } else if (inFileEditSession()) {
+            snprintf(left, sizeof(left), "%s", g_editor.savedFilename.c_str());
         } else {
             const char *mode = g_editor.promptMode ? "提示写作" : "自由写作";
             snprintf(left, sizeof(left), "%s", mode);
@@ -1567,6 +1796,11 @@ static bool saveCurrentContent(bool createHistory = true) {
         if (ok) g_journal.clearRecoveryDraft();
         return ok;
     }
+    if (inFileEditSession()) {
+        bool ok = fileEditSave(g_editor.savedFilename, text);
+        if (ok) g_journal.clearRecoveryDraft();
+        return ok;
+    }
     if (text.empty()) return false;
 
     time_t now; time(&now); struct tm *tm = localtime(&now);
@@ -1607,11 +1841,17 @@ void screen_editor_init(ScreenContext &ctx) {
     g_editor.lines.clear();
     g_editor.autoSaveTime = 0;
     g_editor.savedFilename = ctx.editFilename;
+    g_editor.fileEditSession = false;
 
     // 快捷编辑主会话: 直接加载 /sdcard/{n}.txt; 有传入内容(灵感/日记编辑)时不走快捷文件
     bool quickFile = g_quickEdit && ctx.editContent.empty() && g_editor.savedFilename.empty();
+    bool fileEditFile = g_fileEdit && ctx.editContent.empty() && g_editor.savedFilename.empty();
     if (quickFile) {
         loadQuickEditFile();
+    } else if (fileEditFile) {
+        g_editor.fileEditSession = true;
+        fileEditInit();
+        fileEditLoadCurrent(fileEditLastName());
     } else if (!ctx.editContent.empty()) {
         size_t pos = 0;
         while (pos < ctx.editContent.length()) {
@@ -1637,11 +1877,15 @@ void screen_editor_init(ScreenContext &ctx) {
     g_ime.setFullwidth(false);
     g_ime.setEnglish(false);
     g_editor.confirmSave = false;
+    g_editor.filePanel.active = false;
+    g_editor.filePanel.prompt = false;
+    g_editor.filePanel.confirmDelete = false;
+    g_editor.filePanel.message.clear();
     g_editor.modifiedSinceSave = false;
     g_editor.drawnOnce = false;
     markDirty();
     g_editor.promptText = ctx.promptText;
-    g_editor.promptMode = ctx.promptMode && !quickFile;
+    g_editor.promptMode = ctx.promptMode && !quickFile && !fileEditFile;
     ctx.editFilename.clear();
 
     // 重置查找/替换对话框(重开编辑器时关闭)
@@ -1656,7 +1900,12 @@ void screen_editor_init(ScreenContext &ctx) {
     clearUndoHistory();
 
     std::string recoveryContent, recoveryMeta;
-    if (g_settings.recoveryDraft() && g_journal.loadRecoveryDraft(recoveryContent, recoveryMeta)) {
+    bool normalJournalSession = !quickFile && !fileEditFile && !inQuickFileSession() && !inFileEditSession();
+    std::string recoveryMode;
+    if (normalJournalSession && g_settings.recoveryDraft() &&
+        g_journal.loadRecoveryDraft(recoveryContent, recoveryMeta) &&
+        !recoveryContent.empty() &&
+        ((recoveryMode = metaValue(recoveryMeta, "mode")).empty() || recoveryMode == "journal")) {
         g_editor.recoveryPrompt = true;
         g_editor.recoveryContent = recoveryContent;
         g_editor.recoveryMeta = recoveryMeta;
@@ -1700,7 +1949,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
     if (g_editor.recoveryPrompt) {
         if (key == 0x0A || key == 0x0D || key == 'y' || key == 'Y') {
             std::string fn = metaValue(g_editor.recoveryMeta, "filename");
-            if (!fn.empty()) g_editor.savedFilename = fn;
+            if (isSafeJournalFilename(fn)) g_editor.savedFilename = fn;
             loadLinesIntoEditor(g_editor.recoveryContent);
             g_editor.scroll = 0;
             g_editor.targetCx = -1;
@@ -1760,10 +2009,23 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         return APP_EDITOR;
     }
 
+    if (g_editor.filePanel.active) {
+        return screen_editor_file_panel_handle(key, ctx);
+    }
+    if (key == 0x05 && inFileEditSession()) {  // Ctrl+E
+        g_editor.filePanel.active = true;
+        g_editor.filePanel.prompt = false;
+        g_editor.filePanel.confirmDelete = false;
+        g_editor.filePanel.message.clear();
+        filePanelReload();
+        ui_clear(); drawEditor(); drawFilePanel(); ui_commit();
+        return APP_EDITOR;
+    }
+
     if (key == 0x1B) {
-        if (inQuickFileSession()) {
-            // 快捷编辑: 自动保存后跳到设置面板
-            if (quickEditSave(quickEditIndex(), currentEditorText())) g_journal.clearRecoveryDraft();
+        if (inQuickFileSession() || inFileEditSession()) {
+            // 快捷/文件编辑: 自动保存后跳到设置面板
+            if (saveCurrentContent()) g_journal.clearRecoveryDraft();
             g_editor.modifiedSinceSave = false;
             ctx.nextState = APP_SETTINGS;
             return APP_SETTINGS;
@@ -1891,8 +2153,8 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         return APP_EDITOR;
     }  // Ctrl+S
     if (key == 0x11) {
-        if (inQuickFileSession()) {
-            if (quickEditSave(quickEditIndex(), currentEditorText())) g_journal.clearRecoveryDraft();
+        if (inQuickFileSession() || inFileEditSession()) {
+            if (saveCurrentContent()) g_journal.clearRecoveryDraft();
             g_editor.modifiedSinceSave = false;
             ctx.nextState = APP_SETTINGS;
             return APP_SETTINGS;
@@ -1920,8 +2182,8 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         return APP_EDITOR;
     }
     if (key == 0x19) {  // Ctrl+Y → 当前日记历史版本
-        if (inQuickFileSession()) {
-            ctx.statusMessage = "快捷编辑历史暂未支持";
+        if (inQuickFileSession() || inFileEditSession()) {
+            ctx.statusMessage = inFileEditSession() ? "文件编辑历史暂未支持" : "快捷编辑历史暂未支持";
             ctx.statusDuration = 30;
             ui_clear(); drawEditor(); ui_commit();
             return APP_EDITOR;
@@ -2283,10 +2545,10 @@ bool screen_editor_idle(ScreenContext &ctx, bool forceRedraw) {
         }
         return false;
     }
-    // Auto-save on idle ticks (快捷编辑始终自动保存)
+    // Auto-save on idle ticks (快捷/文件编辑始终自动保存)
     if (g_editor.autoSaveTime > 0 && esp_timer_get_time() > g_editor.autoSaveTime) {
         g_editor.autoSaveTime = 0;
-        bool shouldCommit = inQuickFileSession() || g_settings.autoSave();
+        bool shouldCommit = inQuickFileSession() || inFileEditSession() || g_settings.autoSave();
         if (shouldCommit) {
             if (saveCurrentContent(false)) {
                 g_editor.modifiedSinceSave = false;
@@ -2309,6 +2571,13 @@ bool screen_editor_idle(ScreenContext &ctx, bool forceRedraw) {
     if (g_editor.helpActive) {
         if (forceRedraw || !g_editor.drawnOnce) {
             ui_clear(); drawHelpPanel(); ui_commit();
+            return true;
+        }
+        return false;
+    }
+    if (g_editor.filePanel.active) {
+        if (forceRedraw || !g_editor.drawnOnce) {
+            ui_clear(); drawEditor(); drawFilePanel(); ui_commit();
             return true;
         }
         return false;

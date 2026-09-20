@@ -25,6 +25,8 @@ static const int IME_KEY_UP = 0x80;
 static const int IME_KEY_DOWN = 0x81;
 static const int IME_KEY_LEFT = 0x82;
 static const int IME_KEY_RIGHT = 0x83;
+static const int IME_KEY_HOME = 0x8E;
+static const int IME_KEY_END = 0x8F;
 
 static const char *BUILTIN_ENGLISH_WORDS[] = {
     "about", "after", "again", "also", "android", "api", "app", "apple",
@@ -1944,8 +1946,8 @@ bool IME::handleKey(int key, std::string &out) {
             return true;
         }
         if (key == 27) { reset(); return true; }
-        if (key == IME_KEY_UP || key == '-' || key == ';' || key == ',') { pagePrev(); return true; }
-        if (key == IME_KEY_DOWN || key == '=' || key == '.') { pageNext(); return true; }
+        if (key == IME_KEY_UP || key == IME_KEY_HOME || key == '-' || key == ';' || key == ',') { pagePrev(); return true; }
+        if (key == IME_KEY_DOWN || key == IME_KEY_END || key == '=' || key == '.') { pageNext(); return true; }
         if (_page.size() > 0) commit(0, out);
         else out = _code;
         reset();
@@ -2008,8 +2010,8 @@ bool IME::handleKey(int key, std::string &out) {
             return true;
         }
         if (key == 27) { reset(); return true; }
-        if (key == IME_KEY_UP || key == '-' || key == ';' || key == ',') { pagePrev(); return true; }
-        if (key == IME_KEY_DOWN || key == '=' || key == '\'') { pageNext(); return true; }
+        if (key == IME_KEY_UP || key == IME_KEY_HOME || key == '-' || key == ';' || key == ',') { pagePrev(); return true; }
+        if (key == IME_KEY_DOWN || key == IME_KEY_END || key == '=' || key == '\'') { pageNext(); return true; }
         return true;
     }
     if (_predicting) {
@@ -2035,8 +2037,8 @@ bool IME::handleKey(int key, std::string &out) {
             }
             return true;
         }
-        if (key == IME_KEY_UP || key == '-' || key == ';' || key == ',') { pagePrev(); return true; }
-        if (key == IME_KEY_DOWN || key == '=' || key == '\'' || key == '.') { pageNext(); return true; }
+        if (key == IME_KEY_UP || key == IME_KEY_HOME || key == '-' || key == ';' || key == ',') { pagePrev(); return true; }
+        if (key == IME_KEY_DOWN || key == IME_KEY_END || key == '=' || key == '\'' || key == '.') { pageNext(); return true; }
         if (key == '\b' || key == 27 || key == '\n') {
             _predicting = false;
             return true;
@@ -2133,8 +2135,8 @@ bool IME::handleKey(int key, std::string &out) {
         reset();
         return true;
     }
-    if (key == IME_KEY_UP || key == '-' || key == ';' || key == ',') { pagePrev(); return true; }
-    if (key == IME_KEY_DOWN || key == '=' || key == '.') { pageNext(); return true; }
+    if (key == IME_KEY_UP || key == IME_KEY_HOME || key == '-' || key == ';' || key == ',') { pagePrev(); return true; }
+    if (key == IME_KEY_DOWN || key == IME_KEY_END || key == '=' || key == '.') { pageNext(); return true; }
     if (_page.size() > 0) {
         commit(0, out);
         return true;

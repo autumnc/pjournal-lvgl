@@ -38,7 +38,7 @@ public:
     bool recoveryDraft();
     bool verticalReferenceLine();
     int fontSize();
-    std::string appMode();  // "journal"(个人日记) 或 "quick"(快捷编辑)
+    std::string appMode();  // "journal"(个人日记), "quick"(快捷编辑) 或 "file"(文件编辑)
     std::string homeView();  // "week"(周视图) 或 "month"(月视图)
     std::string inputMode();  // "normal"(正常) 或 "typewriter"(打字机)
     std::string editorOrientation();  // "horizontal"(横排) 或 "vertical"(竖排)

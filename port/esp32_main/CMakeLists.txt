@@ -6,6 +6,7 @@ idf_component_register(SRCS
     "screen_editor.cpp"
     "screen_settings.cpp"
     "quick_edit.cpp"
+    "file_edit.cpp"
     "typing_click.cpp"
     "screen_bt_manage.cpp"
     "screen_file_manager.cpp"
