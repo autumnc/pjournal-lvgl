@@ -39,6 +39,7 @@ static constexpr int APP_KEY_PAGE_DOWN = 0xA1;
 static constexpr int APP_KEY_SEARCH = 0xA2;
 static constexpr int APP_KEY_HELP = 0xA3;
 static constexpr int APP_KEY_REDO = 0xA4;
+static constexpr int APP_KEY_IM_SWITCH = 0xA5;
 
 struct InputState {
     bool shift = false;
@@ -298,6 +299,9 @@ static void console_modifier_thread(std::string device) {
     g_modifier_tap_live = true;
     bool left_down = false;
     bool used = false;
+    // Ctrl+Shift 轻点切输入法方案。combo_used 记的是「这一对按住期间按过第三个键」,
+    // 有的话就是 Ctrl+Shift+F/Z// 那类组合,不能再当成轻点。
+    bool combo_used = false;
     input_event ev {};
     while(read(fd, &ev, sizeof(ev)) == sizeof(ev)) {
         if(ev.type != EV_KEY) continue;
@@ -308,16 +312,33 @@ static void console_modifier_thread(std::string device) {
                     left_down = true;
                     used = false;
                 } else {
-                    if(left_down && !used) dispatch_key(APP_KEY_LSHIFT_TAP);
+                    if(left_down && !used) {
+                        if(g_ctrl_held.load()) {
+                            if(!combo_used) dispatch_key(APP_KEY_IM_SWITCH);
+                        } else {
+                            dispatch_key(APP_KEY_LSHIFT_TAP);
+                        }
+                    }
                     left_down = false;
                 }
             }
+            if(down && g_ctrl_held.load()) combo_used = false;
             g_shift_held = down;
             continue;
         }
-        if(ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL) { g_ctrl_held = down; continue; }
+        if(ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL) {
+            if(down && g_shift_held.load()) combo_used = false;
+            // 先松 Ctrl 也算轻点,但要把 used 立起来,免得随后松 Shift 又发一次
+            else if(!down && g_shift_held.load() && !combo_used) {
+                dispatch_key(APP_KEY_IM_SWITCH);
+                used = true;
+            }
+            g_ctrl_held = down;
+            continue;
+        }
         if(!down) continue;
         if(left_down) used = true;
+        if(g_ctrl_held.load() && g_shift_held.load()) combo_used = true;
         if(g_ctrl_held && g_shift_held) {
             if(ev.code == KEY_F) dispatch_key(APP_KEY_TRAD_TOGGLE);
             else if(ev.code == KEY_Z) dispatch_key(APP_KEY_REDO);

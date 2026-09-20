@@ -14,8 +14,12 @@ public:
     void toggle();
     void set_active(bool on);
     bool handle_key(int key, std::string &out);
+    bool switch_schema();
     std::string composition() const;
     const std::vector<std::string> &candidates() const;
+    // 当前输入法的显示名(雾凇拼音 / 永码 …),给状态栏显示首字用。内置输入法没有方案
+    // 概念,返回空串(调用方退回「中」)。
+    std::string schema_name() const;
     int current_page() const;
     int total_pages() const;
     int total_candidates() const;

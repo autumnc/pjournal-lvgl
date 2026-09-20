@@ -1346,6 +1346,18 @@ static std::string utf8_preview(const std::string &s, int max_chars) {
     return out;
 }
 
+// UTF-8 串的第一个字符。状态栏里输入法名只要头一个字:雾凇拼音 → 雾、永码 → 永。
+static std::string utf8_first_char(const std::string &s) {
+    if(s.empty()) return std::string();
+    unsigned char c = (unsigned char)s[0];
+    size_t n = 1;
+    if((c & 0xE0) == 0xC0) n = 2;
+    else if((c & 0xF0) == 0xE0) n = 3;
+    else if((c & 0xF8) == 0xF0) n = 4;
+    if(n > s.size()) n = 1;
+    return s.substr(0, n);
+}
+
 static std::string outline_project_dir(const std::string &name) {
     return outline_dir() + "/" + name;
 }
@@ -1857,7 +1869,12 @@ static void draw_file_panel() {
 static std::string editor_ime_text() {
     if(!g_linux_ime.active()) return "EN";
     if(g_linux_ime.english()) return "[英]";
-    return std::string("[中]") + (g_linux_ime.fullwidth() ? "●" : "◐") + (g_linux_ime.trad() ? "繁" : "简");
+    // [输入法名首字]:雾凇拼音 → [雾]、yong 的永码 → [永]。内置输入法没有方案概念
+    // (schema_name() 空串),退回原来的 [中]。
+    std::string name = utf8_first_char(g_linux_ime.schema_name());
+    if(name.empty()) name = "中";
+    return "[" + name + "]" + (g_linux_ime.fullwidth() ? "●" : "◐") +
+           (g_linux_ime.trad() ? "繁" : "简");
 }
 
 // 状态栏右侧:时间 + 输入法状态 + WiFi + 电池,顺序与主面板一致
@@ -1878,18 +1895,14 @@ static void ime_bar_layout_horizontal(int x, int y, int bar_w) {
     const lv_font_t *f = ime_font();
     std::string head = " " + g_linux_ime.composition() + "  ";
     int head_w = f ? (int)lv_text_get_width(head.c_str(), (uint32_t)head.size(), f, 0) : 0;
-    // 页码在 buildPage 之后才定,这里按两位数页码预留,免得页数从 9 变 10 时撑破行宽
-    int tail_w = f ? (int)lv_text_get_width(" 88/88", 6, f, 0) : 0;
     // v 模式的命中候选带方括号,宽度也留出来,免得它被挤到下一页去高亮
     int br_w = (f && g_linux_ime.highlight_index() >= 0)
                    ? (int)lv_text_get_width("[]", 2, f, 0) : 0;
-    int budget = bar_w - 8 - head_w - tail_w - br_w;  // 8 = create_ime_bar 的左右内边距
+    int budget = bar_w - 8 - head_w - br_w;  // 8 = create_ime_bar 的左右内边距
     if(budget < 80) budget = 80;
     if(budget > bar_w - 8) budget = bar_w - 8;
     g_linux_ime.set_display_width(budget);
 
-    std::string tail = " " + std::to_string(g_linux_ime.current_page()) + "/" +
-                       std::to_string(g_linux_ime.total_pages());
     // 前缀和 buildPage 量宽的 " 编号." + 候选 完全一致,分页与渲染才不会错位
     std::string s = head;
     const auto &c = g_linux_ime.candidates();
@@ -1898,12 +1911,18 @@ static void ime_bar_layout_horizontal(int x, int y, int bar_w) {
         std::string part = std::to_string((int)i + 1) + "." + c[i];
         s += ((int)i == hi) ? " [" + part + "]" : " " + part;
     }
-    s += tail;
 
     lv_obj_set_style_text_line_space(g_ime_bar, 0, 0);
     lv_label_set_text(g_ime_bar, s.c_str());
     lv_obj_set_pos(g_ime_bar, x, y);
-    lv_obj_set_size(g_ime_bar, bar_w, ime_bar_h());
+    // 框宽按内容收缩,不拉满 bar_w。分页预算仍在上面按 bar_w 算好交给 IME 了,这里
+    // 只是把框画窄——拿收缩后的宽度回喂 set_display_width() 会变成「框窄→候选被裁→
+    // 文本变短→框更窄」的死循环。
+    int ls = (int)lv_obj_get_style_text_letter_space(g_ime_bar, 0);
+    int tw = f ? (int)lv_text_get_width(s.c_str(), (uint32_t)s.size(), f, ls) + 8 : bar_w;  // 8 = pad_all 4
+    if(tw < 120) tw = 120;
+    if(tw > bar_w) tw = bar_w;
+    lv_obj_set_size(g_ime_bar, tw, ime_bar_h());
 }
 
 // 竖排:正文是一列列竖着的字,候选条排在光标那一列旁边竖着铺开,一行一个候选。
@@ -1927,9 +1946,7 @@ static void ime_bar_layout_vertical() {
 
     const auto &c = g_linux_ime.candidates();
     int hi = g_linux_ime.highlight_index();
-    std::string head = " " + g_linux_ime.composition() + "  " +
-                       std::to_string(g_linux_ime.current_page()) + "/" +
-                       std::to_string(g_linux_ime.total_pages());
+    std::string head = " " + g_linux_ime.composition() + "  ";
     int wmax = f ? (int)lv_text_get_width(head.c_str(), (uint32_t)head.size(), f, 0) : 0;
     std::string s = head;
     for(size_t i = 0; i < c.size(); ++i) {
@@ -3511,7 +3528,14 @@ static std::vector<std::pair<std::string, std::string>> setting_options(const st
     if(k == "theme") return {{"dark", "黑底白字"}, {"light", "白底黑字"}};
     if(k == "app_mode") return {{"journal", "个人日记"}, {"quick", "快捷编辑"}, {"file", "文件编辑"}};
     if(k == "home_view") return {{"week", "周视图"}, {"month", "月视图"}};
-    if(k == "input_mode") return {{"builtin", "内置"}, {"fcitx5_rime", "fcitx5+rime"}};
+    if(k == "input_mode") {
+        std::vector<std::pair<std::string, std::string>> v = {{"builtin", "内置"},
+                                                              {"fcitx5_rime", "fcitx5+rime"}};
+#ifdef PJOURNAL_HAS_YONG
+        v.push_back({"yong", "yong"});
+#endif
+        return v;
+    }
     if(k == "editor_orientation") return {{"horizontal", "横排"}, {"vertical", "竖排"}};
     if(k == "editor_mode")
         return {{"normal", "正常"},
@@ -3599,7 +3623,8 @@ static std::string vertical_style_label() {
 }
 
 static std::vector<SetItem> settings_items() {
-    std::string input = g_settings.input_mode() == "fcitx5_rime" ? "fcitx5+rime" : "内置";
+    std::string im = g_settings.input_mode();
+    std::string input = im == "fcitx5_rime" ? "fcitx5+rime" : im == "yong" ? "yong" : "内置";
     std::string appModeLabel = "个人日记";
     if(g_settings.app_mode() == "quick") appModeLabel = "快捷编辑";
     else if(g_settings.app_mode() == "file") appModeLabel = "文件编辑";
@@ -8496,6 +8521,11 @@ static void handle_key(int key) {
     // 免得被下面的输入法/文件槽位快捷键抢走。
     if(g_quit_asking) { quit_confirm_key(key); return; }
     if(key == 0x11) { quit_begin(); return; }
+    // Ctrl+Shift 轻点:只有 fcitx5 后端认(切 rime 方案),内置后端返回 false,不动。
+    if(key == KEY_IM_SWITCH) {
+        if(g_linux_ime.switch_schema()) update_ime_bar();
+        return;
+    }
     if(g_linux_ime.active()) {
         if(key == KEY_FULLWIDTH_TOGGLE) {
             g_linux_ime.toggle_fullwidth();

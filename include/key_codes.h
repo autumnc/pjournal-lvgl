@@ -24,4 +24,5 @@ enum AppKey {
     KEY_SEARCH = 0xA2,
     KEY_HELP = 0xA3,
     KEY_REDO = 0xA4,
+    KEY_IM_SWITCH = 0xA5,
 };

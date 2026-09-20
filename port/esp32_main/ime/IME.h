@@ -83,6 +83,10 @@ public:
     // 候选行可用像素宽度(0=退化为固定 _pageSize 分页);宽度变了要重排分页
     void setDisplayWidth(int w) { if (w == _displayWidth) return; _displayWidth = w; buildPage(); }
 
+    // 标点/全角转换。yong 后端的驱动侧没有 bd.txt 标点表,符号和全角都借用这两个。
+    bool handleFullwidthPunct(int key, std::string &out);
+    bool handleFullwidthChar(int key, std::string &out);
+
 private:
     IME() {}
 
@@ -191,6 +195,4 @@ private:
     bool pagePrev();
     bool pageNext();
     bool commit(int idx, std::string &out);
-    bool handleFullwidthPunct(int key, std::string &out);
-    bool handleFullwidthChar(int key, std::string &out);
 };
