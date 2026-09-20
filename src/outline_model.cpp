@@ -89,3 +89,42 @@ std::string outline_safe_filename(const std::string &title) {
     if(out.empty()) out = "untitled";
     return out + ".txt";
 }
+
+// idx 的子树在数组里铺到哪儿(含自身):后面连着的一串 level 更深的都是它的后代。
+static int outline_subtree_last(const JsonValue &nodes, int idx) {
+    int lvl = nodes[idx]["level"].asInt(0);
+    int last = idx;
+    for(int j = idx + 1; j < (int)nodes.size(); ++j) {
+        if(nodes[j]["level"].asInt(0) <= lvl) break;
+        last = j;
+    }
+    return last;
+}
+
+// 上一同层兄弟:往回找第一个同层的。先撞到更浅的一层,说明已经出了父节点的
+// 子树,上面没有同层兄弟了。(不是「上一行」——上一行可能是自己的后代。)
+static int outline_prev_sibling(const JsonValue &nodes, int idx) {
+    int lvl = nodes[idx]["level"].asInt(0);
+    for(int j = idx - 1; j >= 0; --j) {
+        int jl = nodes[j]["level"].asInt(0);
+        if(jl == lvl) return j;
+        if(jl < lvl) break;
+    }
+    return -1;
+}
+
+bool outline_shift_subtree(JsonValue &nodes, int idx, int delta) {
+    if(idx < 0 || idx >= (int)nodes.size()) return false;
+    int lvl = nodes[idx]["level"].asInt(0);
+    if(delta < 0) {
+        if(lvl <= 0) return false;
+    } else if(outline_prev_sibling(nodes, idx) < 0) {
+        return false;
+    }
+    // 整棵子树一起平移:节点和它后代的相对结构不变,降级后就挂在上一同层
+    // 兄弟底下;数组顺序不用动,level 变了树形就跟着变。
+    int last = outline_subtree_last(nodes, idx);
+    for(int j = idx; j <= last; ++j)
+        nodes[j].set("level", nodes[j]["level"].asInt(0) + delta);
+    return true;
+}

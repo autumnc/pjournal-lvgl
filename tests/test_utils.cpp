@@ -1,5 +1,6 @@
 #include "hash_utils.h"
 #include "journal_storage.h"
+#include "outline_model.h"
 #include "process_utils.h"
 #include "settings.h"
 
@@ -59,6 +60,50 @@ static int test_journal_storage() {
     return 0;
 }
 
+static JsonValue ol_node(int level, const std::string &title) {
+    JsonValue n = JsonValue::object();
+    n.set("level", level);
+    n.set("title", title);
+    return n;
+}
+
+// 把整棵树压成一行 level 数字,方便和期望值直接比。
+static std::string ol_levels(const JsonValue &nodes) {
+    std::string s;
+    for(int i = 0; i < (int)nodes.size(); ++i) s += std::to_string(nodes[i]["level"].asInt(0));
+    return s;
+}
+
+static int test_outline_shift_subtree() {
+    // A ─ B ─ C ─ C1 ─ D(C1 是 C 的子节点)
+    JsonValue nodes = JsonValue::array();
+    nodes.pushBack(ol_node(0, "A"));
+    nodes.pushBack(ol_node(1, "B"));
+    nodes.pushBack(ol_node(1, "C"));
+    nodes.pushBack(ol_node(2, "C1"));
+    nodes.pushBack(ol_node(0, "D"));
+    if(ol_levels(nodes) != "01120") return fail("outline fixture levels wrong");
+
+    // B 是 A 的第一个孩子,前面没有同层兄弟 → 降不了
+    if(outline_shift_subtree(nodes, 1, +1)) return fail("demote accepted with no previous sibling");
+    if(ol_levels(nodes) != "01120") return fail("rejected demote still changed levels");
+
+    // C 的上一同层兄弟是 B → C 连同子节点 C1 一起降
+    if(!outline_shift_subtree(nodes, 2, +1)) return fail("demote C rejected");
+    if(ol_levels(nodes) != "01230") return fail("subtree did not follow demote: " + ol_levels(nodes));
+
+    if(!outline_shift_subtree(nodes, 2, -1)) return fail("promote C rejected");
+    if(ol_levels(nodes) != "01120") return fail("subtree did not follow promote: " + ol_levels(nodes));
+
+    if(outline_shift_subtree(nodes, 0, -1)) return fail("promote accepted at top level");
+    if(ol_levels(nodes) != "01120") return fail("rejected promote still changed levels");
+
+    // D 得越过 C1(2)、C(1)、B(1)才找到同层的 A —— 找的是上一同层兄弟,不是上一行
+    if(!outline_shift_subtree(nodes, 4, +1)) return fail("demote D rejected");
+    if(ol_levels(nodes) != "01121") return fail("demote D landed under the wrong node: " + ol_levels(nodes));
+    return 0;
+}
+
 int main() {
     if(hash::md5_hex("") != "d41d8cd98f00b204e9800998ecf8427e") return fail("md5 empty mismatch");
     if(hash::md5_hex("abc") != "900150983cd24fb0d6963f7d28e17f72") return fail("md5 abc mismatch");
@@ -71,5 +116,6 @@ int main() {
     if(access(printf_path, X_OK) != 0) return fail("printf not found");
     if(process::run_capture({printf_path, "hello"}) != "hello") return fail("run_capture printf mismatch");
     if(int rc = test_journal_storage()) return rc;
+    if(int rc = test_outline_shift_subtree()) return rc;
     return 0;
 }

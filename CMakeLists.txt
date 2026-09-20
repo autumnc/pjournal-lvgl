@@ -199,11 +199,14 @@ if(BUILD_TESTING)
         tests/test_utils.cpp
         src/hash_utils.cpp
         src/journal_storage.cpp
+        src/outline_model.cpp
         src/process_utils.cpp
         src/safe_file.cpp
+        src/esp32_compat.cpp
         src/settings.cpp
+        port/esp32_main/json_parser.cpp
     )
-    target_include_directories(pjournal-tests PRIVATE include)
+    target_include_directories(pjournal-tests PRIVATE include port/esp32_main)
     target_compile_options(pjournal-tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
     add_test(NAME pjournal-tests COMMAND pjournal-tests)
 endif()

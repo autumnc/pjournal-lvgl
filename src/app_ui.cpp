@@ -6054,7 +6054,6 @@ static void handle_outline(int key) {
 
         // j/k 上下移动、h/l 升降层级(仅在不筛选时)
         if(plain && idx >= 0 && idx < (int)nodes.size()) {
-            auto &node = nodes[idx];
             if(key == 'j' && idx > 0) {
                 std::swap(nodes[idx], nodes[idx - 1]);
                 g_ol.sel--;
@@ -6066,11 +6065,9 @@ static void handle_outline(int key) {
                 outline_save();
                 outline_rebuild_filter();
             } else if(key == 'h') {
-                int lvl = node["level"].asInt(0);
-                if(lvl > 0) { node.set("level", lvl - 1); outline_save(); }
+                if(outline_shift_subtree(nodes, idx, -1)) outline_save();
             } else if(key == 'l') {
-                int lvl = node["level"].asInt(0);
-                if(idx > 0 && lvl <= nodes[idx - 1]["level"].asInt(0)) { node.set("level", lvl + 1); outline_save(); }
+                if(outline_shift_subtree(nodes, idx, +1)) outline_save();
             }
         }
 

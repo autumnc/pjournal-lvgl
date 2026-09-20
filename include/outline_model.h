@@ -26,3 +26,8 @@ std::vector<int> outline_filter_nodes(const JsonValue &nodes, const std::set<int
 
 // 标题 → 安全文件名(替换非法字符、限长 40 字节并保持 UTF-8 边界、补 .txt)。
 std::string outline_safe_filename(const std::string &title);
+
+// 把 idx 连同它整棵子树升(delta < 0)或降(delta > 0)一级。
+// 降级要有一个「上一同层兄弟」当新父节点,没有就不动;升级时已在顶层就不动。
+// 返回是否真的改了(没改就不用存盘)。
+bool outline_shift_subtree(JsonValue &nodes, int idx, int delta);
