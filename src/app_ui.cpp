@@ -1092,6 +1092,17 @@ static void gtd_clamp_sel() {
     if(g_gtd.sel < 0) g_gtd.sel = 0;
 }
 
+// 升降层级会挪动任务在树里的位置,而 sel 是 filtered 的下标。改完 parent 后
+// 按 id 把光标拣回同一个任务上,不然连按 l 会一级一级作用到别人身上。
+static void gtd_reselect(const std::string &id) {
+    auto &tasks = g_gtd.data["tasks"];
+    for(int i = 0; i < (int)g_gtd.filtered.size(); ++i)
+        if(tasks[g_gtd.filtered[i]]["id"].asString() == id) {
+            g_gtd.sel = i;
+            return;
+        }
+}
+
 static void gtd_rebuild() {
     if(g_gtd.data.isNull() || !g_gtd.data.has("tasks") || !g_gtd.data["tasks"].isArray()) {
         g_gtd.data = JsonValue::object();
@@ -5518,15 +5529,33 @@ static void handle_gtd(int key) {
             gtd_save();
             gtd_rebuild();
         } else if(key == 'h' || key == 'H') {
-            tasks[cur].set("parent", "");
-            gtd_save();
-            gtd_rebuild();
-        } else if(key == 'l' || key == 'L') {
-            if(g_gtd.sel > 0) {
-                int prev = g_gtd.filtered[g_gtd.sel - 1];
-                tasks[cur].set("parent", tasks[prev]["id"].asString());
+            // 升一级:认祖父当爹。已经是顶层(parent 为空)就什么都不做。
+            std::string pid = tasks[cur]["parent"].asString();
+            if(!pid.empty()) {
+                std::string gid;
+                for(int i = 0; i < (int)tasks.size(); ++i)
+                    if(tasks[i]["id"].asString() == pid) { gid = tasks[i]["parent"].asString(); break; }
+                std::string id = tasks[cur]["id"].asString();
+                tasks[cur].set("parent", gid);
                 gtd_save();
                 gtd_rebuild();
+                gtd_reselect(id);
+            }
+        } else if(key == 'l' || key == 'L') {
+            // 降一级:认「上一个同层兄弟」当爹,不是上一「行」。上一行可能是自己的
+            // 孩子或者更深的节点,认它当爹深度会一次跳好几级。
+            int d = g_gtd.sel < (int)g_gtd.depth.size() ? g_gtd.depth[g_gtd.sel] : 0;
+            int sib = -1;
+            for(int i = g_gtd.sel - 1; i >= 0; --i) {
+                if(g_gtd.depth[i] < d) break;  // 走到更浅的一层,说明上面没有同层兄弟了
+                if(g_gtd.depth[i] == d) { sib = g_gtd.filtered[i]; break; }
+            }
+            if(sib >= 0) {
+                std::string id = tasks[cur]["id"].asString();
+                tasks[cur].set("parent", tasks[sib]["id"].asString());
+                gtd_save();
+                gtd_rebuild();
+                gtd_reselect(id);
             }
         }
     }
