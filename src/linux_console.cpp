@@ -63,7 +63,18 @@ void linux_console_restore() {
             const char *show = "\033[?25h\033[0m\033[2J\033[H[pjournal-lvgl exited]\n";
             write(s_tty_fd, show, strlen(show));
         }
-        if(s_have_termios) tcsetattr(s_tty_fd, TCSANOW, &s_old_termios);
+        // termios 同理:不能照抄启动时读到的状态。读到 raw 说明上一轮没正常收尾(被停住的
+        // fbterm-mod 之类把 tty 留在 raw 上),照抄回去就是「键盘无回显、回车不换行」一代代
+        // 传下去。只保留波特率这些,规范位一律强制回来。
+        if(s_have_termios) {
+            termios t = s_old_termios;
+            t.c_iflag |= ICRNL | IXON;
+            t.c_oflag |= OPOST | ONLCR;
+            t.c_lflag |= ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN;
+            t.c_cc[VMIN] = 1;
+            t.c_cc[VTIME] = 0;
+            tcsetattr(s_tty_fd, TCSANOW, &t);
+        }
         close(s_tty_fd);
         s_tty_fd = -1;
     }

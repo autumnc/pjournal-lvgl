@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <fcntl.h>
 #include <linux/input.h>
 #include <linux/kd.h>
@@ -61,6 +62,9 @@ static bool console_byte_swallowed(uint8_t ch) {
     return g_ctrl_held.load() && (ch == 0x06 || ch == 0x1A || ch == 0x1F);
 }
 
+// 快捷编辑文件槽位:F1→1.txt … F9→9.txt,F10→0.txt。入参是 1..10 的键序号。
+static int fkey_file_slot(int fkey_no) { return fkey_no % 10; }
+
 static int shifted_digit(int code) {
     switch(code) {
     case KEY_1: return '!';
@@ -99,13 +103,13 @@ static int map_key(int code, const InputState &st) {
         if(code == KEY_F) return st.shift ? APP_KEY_TRAD_TOGGLE : 0x06;
         if(code == KEY_Z) return st.shift ? APP_KEY_REDO : 0x1A;
         if(code == KEY_QUESTION || (st.shift && code == KEY_SLASH)) return APP_KEY_HELP;
-        if(code >= KEY_0 && code <= KEY_9) {
-            int n = code == KEY_0 ? 0 : code - KEY_1 + 1;
-            return APP_KEY_FILE_BASE + n;
-        }
         int c = letter_of(code);
         if(c) return c - 'a' + 1;
     }
+    // F1-F10 直接对应快捷编辑的 10 个文件(F1→1.txt … F9→9.txt,F10→0.txt)。控制台模式下
+    // 真键盘的 F 键由 tty 送出字符串序列(见 parse_csi_key),这里覆盖 PJOURNAL_INPUT 那条纯 evdev 路。
+    if(!st.ctrl && !st.alt && code >= KEY_F1 && code <= KEY_F10)
+        return APP_KEY_FILE_BASE + fkey_file_slot(code - KEY_F1 + 1);
     switch(code) {
     case KEY_UP: return st.shift ? APP_KEY_SHIFT_UP : APP_KEY_UP;
     case KEY_DOWN: return st.shift ? APP_KEY_SHIFT_DOWN : APP_KEY_DOWN;
@@ -173,6 +177,14 @@ static int parse_csi_key(const std::string &seq) {
     if(seq == "[1;2B") return APP_KEY_SHIFT_DOWN;
     if(seq == "[1;2C") return APP_KEY_SHIFT_RIGHT;
     if(seq == "[1;2D") return APP_KEY_SHIFT_LEFT;
+    // F 键:keymap 把 F1-F5 定成 \033[[A..\033[[E,F6-F10 定成 \033[17~..\033[21~。
+    // 不认的话会掉进下面的 fallback 变成裸 Esc(在主页上等于打开设置)。
+    if(seq.size() == 3 && seq[0] == '[' && seq[1] == '[' && seq[2] >= 'A' && seq[2] <= 'E')
+        return APP_KEY_FILE_BASE + fkey_file_slot(seq[2] - 'A' + 1);
+    if(seq.size() >= 3 && seq[0] == '[' && seq.back() == '~') {
+        int n = atoi(seq.c_str() + 1);
+        if(n >= 17 && n <= 21) return APP_KEY_FILE_BASE + fkey_file_slot(n - 17 + 6);
+    }
     return 0;
 }
 
