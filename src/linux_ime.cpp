@@ -30,7 +30,7 @@ bool LinuxIme::begin() {
 #ifdef PJOURNAL_HAS_YONG
     if(use_yong()) return yong_ime().begin();
 #endif
-    IME::getInstance().setPageSize(9);
+    IME::getInstance().setPageSize(5);
     return IME::getInstance().begin();
 }
 
@@ -157,8 +157,10 @@ void LinuxIme::set_page_size(int n) {
         return;
     }
 #ifdef PJOURNAL_HAS_YONG
-    // yong 的分页权在引擎手里(每页几个由 EIM.CandWordMax 定),这边改不了
-    if(use_yong()) return;
+    if(use_yong()) {
+        yong_ime().set_page_size(n);
+        return;
+    }
 #endif
     IME::getInstance().setPageSize(n);
 }

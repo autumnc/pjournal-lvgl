@@ -74,7 +74,10 @@ void YongIme::set_display_width(int px) {
 }
 
 void YongIme::set_page_size(int n) {
-    if(n > 0) _rows = n;
+    if(n <= 0) return;
+    _rows = n;
+    // 英文代理那边是内置 IME 在分页,页宽也给它一份
+    IME::getInstance().setPageSize(n);
     sync_page_fit();
 }
 
@@ -132,8 +135,9 @@ void YongIme::refresh_candidates() {
     _total = n > 0 ? (_page_count - 1) * per_page + n : 0;
 }
 
-// 这一页按当前可用空间放得下几个候选:横排按像素(_budget,和候选条画出来的
-// " 编号.候选" 前缀量宽方式一致),竖排按行数(_rows)。量不出来返回 0 = 别动引擎。
+// 这一页放得下几个候选:横排和竖排都是固定行数(_rows,候选条那边给的 5 / 9),
+// 只有 set_display_width 真的给了像素宽(_budget>0)才回到按像素量那条老路。
+// 量不出来返回 0 = 别动引擎。
 int YongIme::fit_count() const {
     if(_cands.empty()) return 0;
     if(_budget > 0 && _width_fn) {
@@ -151,14 +155,15 @@ int YongIme::fit_count() const {
     return _rows;
 }
 
-// 引擎按 CandWordMax 分页。量出来的个数和引擎现在的页宽不一致,就让引擎按新页宽重排
+// 引擎按 CandWordMax 分页。算出来的个数和引擎现在的页宽不一致,就让引擎按新页宽重排
 // 第一页——放不下的候选整项挪到下一页、编号从 1 重新计,和内置输入法一个策略。
-// 每次候选表重建之后、以及候选条宽度/行数变化时都要过一遍。
+// 每次候选表重建之后、以及候选条行数变化时都要过一遍。页宽已经对上了就直接返回,
+// 不然每个键都会白跑两次引擎重排。
 //
-// 量出来的个数不能无条件当页宽。本页没满(n < CandWordMax)说明候选就这么多,"都放得下"
+// 算出来的个数不能无条件当页宽。本页没满(n < CandWordMax)说明候选就这么多,"都放得下"
 // 只意味着页宽有富余,不该拿 n 去覆盖页宽——早先没分辨这一点,一个只有 3 个候选的码就
-// 把页宽永久钉成 3,之后所有码都只出一页 3 个。反过来,页宽被压小之后满页的那一页再也
-// 量不出"本来还能放几个",得先按上限重取一次第一页当样本。
+// 把页宽永久钉成 3,之后所有码都只出一页 3 个。反过来(按像素分页那条路才有),页宽被
+// 压小之后满页的那一页再也量不出"本来还能放几个",得先按上限重取一次第一页当样本。
 void YongIme::sync_page_fit() {
     if(!_ready || _english) return;
     // 只拿第一页来量:别的页是用户自己翻过去的。同一个码的候选长短差不多,第一页量
@@ -172,7 +177,7 @@ void YongIme::sync_page_fit() {
     if(fit > kCandPerPage) fit = kCandPerPage;
     if(fit <= 0) return;
 
-    if(n >= max && fit >= n && max != kCandPerPage) {
+    if(_budget > 0 && _width_fn && n >= max && fit >= n && max != kCandPerPage) {
         // 满页且全都放得下:页宽可能先前被压小过,按上限重取一次再量
         yb_set_cand_word_max(kCandPerPage);
         yb_get_cand_words(PAGE_FIRST);

@@ -209,7 +209,10 @@ static lv_obj_t *g_file_panel = nullptr;
 static lv_obj_t *g_setting_text = nullptr;
 static lv_obj_t *g_wifi_password = nullptr;
 static lv_obj_t *g_inspiration_text = nullptr;
-static lv_obj_t *g_ime_bar = nullptr;
+static lv_obj_t *g_ime_bar = nullptr;    // 候选框本体(容器)
+static lv_obj_t *g_ime_head = nullptr;   // 编码行
+static lv_obj_t *g_ime_rule = nullptr;   // 编码行与候选行之间的分隔线
+static lv_obj_t *g_ime_cands = nullptr;  // 候选行(横排一行;竖排一列)
 static lv_obj_t *g_search_panel = nullptr;
 static lv_obj_t *g_search_input = nullptr;
 static lv_obj_t *g_search_replace = nullptr;
@@ -1672,6 +1675,9 @@ static void clear_root() {
     g_inspiration_text = nullptr;
     g_dict_text = nullptr;
     g_ime_bar = nullptr;
+    g_ime_head = nullptr;
+    g_ime_rule = nullptr;
+    g_ime_cands = nullptr;
     g_search_panel = nullptr;
     g_search_input = nullptr;
     g_search_replace = nullptr;
@@ -1766,23 +1772,65 @@ static int ime_measure_width(const char *text) {
     return (int)lv_text_get_width(text, (uint32_t)strlen(text), ime_font(), 0);
 }
 
-// 候选条高度跟着输入法字号走,字号调大也不会切掉下半截
-static int ime_bar_h() {
+// 横排一页固定 5 个候选,和 fcitx5+rime 的策略一致(rime 的 menu/page_size);
+// 内置输入法和 yong 也按这个数分页,不再按像素宽度自己裁。
+static constexpr int kImeCandPerPage = 5;
+static constexpr int kImePad = 4;      // 框内边距,和 create_ime_bar 的 pad_all 一致
+static constexpr int kImeRuleGap = 2;  // 分隔线上下各留的空隙
+static constexpr int kImeRuleH = 1;
+
+// 候选条行高跟着输入法字号走,字号调大也不会切掉下半截
+static int ime_line_h() {
     int lh = lv_font_get_line_height(ime_font());
-    if(lh < 12) lh = 12;
-    return lh + 8;
+    return lh < 12 ? 12 : lh;
 }
 
+// 框高 = 内边距 + 编码行 + 分隔线 + 候选块(cand_h 像素,横排一行、竖排满页)
+static int ime_bar_h(int cand_h = 0) {
+    if(cand_h <= 0) cand_h = ime_line_h();
+    return kImePad * 2 + ime_line_h() + kImeRuleGap * 2 + kImeRuleH + cand_h;
+}
+
+// 候选框是「编码一行、分隔线、候选一行」三块拼的,这里造齐三块,后面只改尺寸和文本。
 static void create_ime_bar() {
     if(g_ime_bar) return;
-    g_ime_bar = label(g_root, "", 8, chrome_bottom() - ime_bar_h(), 656, ime_bar_h());
-    lv_label_set_long_mode(g_ime_bar, LV_LABEL_LONG_CLIP);
-    if(g_ime_font) lv_obj_set_style_text_font(g_ime_bar, g_ime_font, 0);
-    lv_obj_set_style_bg_color(g_ime_bar, g_theme.bg, 0);
-    lv_obj_set_style_bg_opa(g_ime_bar, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(g_ime_bar, g_theme.fg, 0);
-    lv_obj_set_style_border_width(g_ime_bar, 1, 0);
-    lv_obj_set_style_pad_all(g_ime_bar, 4, 0);
+    int h = ime_bar_h();
+    g_ime_bar = box(g_root, 8, chrome_bottom() - h, 120, h);
+    lv_obj_set_style_pad_all(g_ime_bar, kImePad, 0);
+
+    g_ime_head = lv_label_create(g_ime_bar);
+    g_ime_cands = lv_label_create(g_ime_bar);
+    for(lv_obj_t *l : {g_ime_head, g_ime_cands}) {
+        lv_label_set_long_mode(l, LV_LABEL_LONG_CLIP);
+        lv_obj_set_style_text_color(l, g_theme.fg, 0);
+        lv_obj_set_style_text_font(l, ime_font(), 0);
+        lv_obj_set_style_text_letter_space(l, 0, 0);
+        lv_obj_set_style_text_line_space(l, 0, 0);
+        lv_obj_set_style_pad_all(l, 0, 0);
+        lv_obj_remove_flag(l, LV_OBJ_FLAG_SCROLLABLE);
+    }
+
+    g_ime_rule = lv_obj_create(g_ime_bar);
+    lv_obj_set_style_radius(g_ime_rule, 0, 0);
+    lv_obj_set_style_border_width(g_ime_rule, 0, 0);
+    lv_obj_set_style_pad_all(g_ime_rule, 0, 0);
+    lv_obj_set_style_bg_color(g_ime_rule, g_theme.fg, 0);
+    lv_obj_set_style_bg_opa(g_ime_rule, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(g_ime_rule, LV_OBJ_FLAG_SCROLLABLE);
+}
+
+// 三块的摆放:编码行贴顶、分隔线接着、候选块占下面 cand_h 像素。坐标相对框的内容区
+// (内边距之内),所以从 0 起。
+static void ime_bar_place(int content_w, int cand_h, int cand_line_space) {
+    int lh = ime_line_h();
+    lv_obj_set_pos(g_ime_head, 0, 0);
+    lv_obj_set_size(g_ime_head, content_w, lh);
+    int ry = lh + kImeRuleGap;
+    lv_obj_set_pos(g_ime_rule, 0, ry);
+    lv_obj_set_size(g_ime_rule, content_w, kImeRuleH);
+    lv_obj_set_style_text_line_space(g_ime_cands, cand_line_space, 0);
+    lv_obj_set_pos(g_ime_cands, 0, ry + kImeRuleH + kImeRuleGap);
+    lv_obj_set_size(g_ime_cands, content_w, cand_h);
 }
 
 static std::string editor_status_text() {
@@ -1888,41 +1936,39 @@ static void refresh_ime_status() {
     lv_label_set_text(g_status_right, editor_right_text().c_str());
 }
 
-// 横排:把候选条真正可用的像素宽度交给 IME,由它按字形宽度分页——一页塞不下的
-// 候选整项挪到下一页,编号从 1 重新计。这里只把当前页原样画出来,不再自己截断,
-// 否则会出现"页里藏着 7/8/9 却看不见、翻页又从别处开始"的错位。
-static void ime_bar_layout_horizontal(int x, int y, int bar_w) {
+// 横排候选框:上行编码、中间分隔线、下行候选。分页固定 5 个交给后端,这里不再回喂
+// set_display_width()——框宽按两行里宽的那行收缩,长句时跟着变长,再把 x 往左挪到整个
+// 框落在屏内,候选不会被框边裁掉。
+static void ime_bar_layout_horizontal(int x, int y, int max_w) {
     const lv_font_t *f = ime_font();
-    std::string head = " " + g_linux_ime.composition() + "  ";
-    int head_w = f ? (int)lv_text_get_width(head.c_str(), (uint32_t)head.size(), f, 0) : 0;
-    // v 模式的命中候选带方括号,宽度也留出来,免得它被挤到下一页去高亮
-    int br_w = (f && g_linux_ime.highlight_index() >= 0)
-                   ? (int)lv_text_get_width("[]", 2, f, 0) : 0;
-    int budget = bar_w - 8 - head_w - br_w;  // 8 = create_ime_bar 的左右内边距
-    if(budget < 80) budget = 80;
-    if(budget > bar_w - 8) budget = bar_w - 8;
-    g_linux_ime.set_display_width(budget);
+    g_linux_ime.set_display_width(0);            // 0 = 让后端把整页候选都交出来
+    g_linux_ime.set_page_size(kImeCandPerPage);
 
-    // 前缀和 buildPage 量宽的 " 编号." + 候选 完全一致,分页与渲染才不会错位
-    std::string s = head;
+    std::string head = g_linux_ime.composition();
     const auto &c = g_linux_ime.candidates();
     int hi = g_linux_ime.highlight_index();
+    std::string s;
     for(size_t i = 0; i < c.size(); ++i) {
         std::string part = std::to_string((int)i + 1) + "." + c[i];
-        s += ((int)i == hi) ? " [" + part + "]" : " " + part;
+        if((int)i == hi) part = "[" + part + "]";
+        if(!s.empty()) s += " ";
+        s += part;
     }
 
-    lv_obj_set_style_text_line_space(g_ime_bar, 0, 0);
-    lv_label_set_text(g_ime_bar, s.c_str());
+    int head_w = f ? (int)lv_text_get_width(head.c_str(), (uint32_t)head.size(), f, 0) : 0;
+    int cand_w = f ? (int)lv_text_get_width(s.c_str(), (uint32_t)s.size(), f, 0) : 0;
+    int box_w = (head_w > cand_w ? head_w : cand_w) + kImePad * 2 + 2;  // 2 = 左右边框
+    if(box_w < 120) box_w = 120;
+    if(box_w > max_w) box_w = max_w;
+    if(box_w < 120) box_w = 120;
+    if(x + box_w > 1016) x = 1016 - box_w;   // 往左挪,别顶出屏幕
+    if(x < 8) x = 8;
+
+    lv_label_set_text(g_ime_head, head.c_str());
+    lv_label_set_text(g_ime_cands, s.c_str());
+    ime_bar_place(box_w - kImePad * 2 - 2, ime_line_h(), 0);
     lv_obj_set_pos(g_ime_bar, x, y);
-    // 框宽按内容收缩,不拉满 bar_w。分页预算仍在上面按 bar_w 算好交给 IME 了,这里
-    // 只是把框画窄——拿收缩后的宽度回喂 set_display_width() 会变成「框窄→候选被裁→
-    // 文本变短→框更窄」的死循环。
-    int ls = (int)lv_obj_get_style_text_letter_space(g_ime_bar, 0);
-    int tw = f ? (int)lv_text_get_width(s.c_str(), (uint32_t)s.size(), f, ls) + 8 : bar_w;  // 8 = pad_all 4
-    if(tw < 120) tw = 120;
-    if(tw > bar_w) tw = bar_w;
-    lv_obj_set_size(g_ime_bar, tw, ime_bar_h());
+    lv_obj_set_size(g_ime_bar, box_w, ime_bar_h());
 }
 
 // 竖排:正文是一列列竖着的字,候选条排在光标那一列旁边竖着铺开,一行一个候选。
@@ -1930,7 +1976,7 @@ static void ime_bar_layout_horizontal(int x, int y, int bar_w) {
 // 固定居中,不跟着光标上下跑——否则每敲一个字框就跳一下,反而看不清候选。
 static void ime_bar_layout_vertical() {
     const lv_font_t *f = ime_font();
-    int lh = f ? lv_font_get_line_height(f) : 24;
+    int lh = ime_line_h();
     int row_h = lh + 2;
     static constexpr int kRows = 9;
 
@@ -1944,35 +1990,37 @@ static void ime_bar_layout_vertical() {
     g_linux_ime.set_display_width(0);  // 竖排按行数分页,不走像素宽度那条路
     g_linux_ime.set_page_size(kRows);
 
+    std::string head = g_linux_ime.composition();
     const auto &c = g_linux_ime.candidates();
     int hi = g_linux_ime.highlight_index();
-    std::string head = " " + g_linux_ime.composition() + "  ";
     int wmax = f ? (int)lv_text_get_width(head.c_str(), (uint32_t)head.size(), f, 0) : 0;
-    std::string s = head;
+    std::string s;
     for(size_t i = 0; i < c.size(); ++i) {
         std::string part = std::to_string((int)i + 1) + "." + c[i];
         if((int)i == hi) part = "[" + part + "]";
-        s += "\n" + part;
+        if(!s.empty()) s += "\n";
+        s += part;
         int pw = f ? (int)lv_text_get_width(part.c_str(), (uint32_t)part.size(), f, 0) : 0;
         if(pw > wmax) wmax = pw;
     }
 
-    int w = wmax + 14;
-    if(w < 120) w = 120;
-    if(w > 320) w = 320;
-    int h = (kRows + 1) * row_h + 8;  // 编码行 + 满页 9 个候选
-    int x = caret_on ? cc.x1 - w - 6 : va.x1 + 6;  // 左右仍贴着光标那一列
+    int box_w = wmax + kImePad * 2 + 2;
+    if(box_w < 120) box_w = 120;
+    if(box_w > 320) box_w = 320;
+    int box_h = ime_bar_h(kRows * row_h);
+    int x = caret_on ? cc.x1 - box_w - 6 : va.x1 + 6;  // 左右仍贴着光标那一列
     if(x < 8) x = (caret_on ? cc.x2 + 6 : va.x1 + 6);
-    if(x + w > 1016) x = 1016 - w;
+    if(x + box_w > 1016) x = 1016 - box_w;
     if(x < 8) x = 8;
-    int y = va.y1 + (va.y2 - va.y1 + 1 - h) / 2;
-    if(y + h > chrome_bottom()) y = chrome_bottom() - h;
+    int y = va.y1 + (va.y2 - va.y1 + 1 - box_h) / 2;
+    if(y + box_h > chrome_bottom()) y = chrome_bottom() - box_h;
     if(y < 8) y = 8;
 
-    lv_obj_set_style_text_line_space(g_ime_bar, row_h - lh, 0);
-    lv_label_set_text(g_ime_bar, s.c_str());
+    lv_label_set_text(g_ime_head, head.c_str());
+    lv_label_set_text(g_ime_cands, s.c_str());
+    ime_bar_place(box_w - kImePad * 2 - 2, kRows * row_h, row_h - lh);
     lv_obj_set_pos(g_ime_bar, x, y);
-    lv_obj_set_size(g_ime_bar, w, h);
+    lv_obj_set_size(g_ime_bar, box_w, box_h);
 }
 
 static void update_ime_bar() {
@@ -1993,7 +2041,7 @@ static void update_ime_bar() {
     if(g_file_panel_state.active && g_file_panel_state.prompt) {
         int y = 534;
         if(y + ime_bar_h() > 596) y = 596 - ime_bar_h();
-        ime_bar_layout_horizontal(8, y, 656);
+        ime_bar_layout_horizontal(8, y, 1016 - 16);
         lv_obj_move_foreground(g_ime_bar);
         refresh_ime_status();
         return;
@@ -2031,13 +2079,9 @@ static void update_ime_bar() {
     int bh = ime_bar_h();
     if(y + bh > chrome_bottom()) y -= 58;  // 光标太靠下就挪到上一行
     if(y < 8) y = 8;
-    int bar_w = std::min(656, 1016 - x);
-    if(bar_w < 320) {
-        x = std::max(8, 1016 - 656);
-        bar_w = std::min(656, 1016 - x);
-    }
 
-    ime_bar_layout_horizontal(x, y, bar_w);
+    // 框宽不预设上限,由 ime_bar_layout_horizontal 按内容算完再把 x 往左挪到屏内
+    ime_bar_layout_horizontal(x, y, 1016 - 16);
     lv_obj_move_foreground(g_ime_bar);
     refresh_ime_status();
 }
@@ -8371,6 +8415,25 @@ static void handle_editor_keys(int key) {
         update_ime_bar();
         return;
     }
+    // Shift+方向键选字:横排拉选区、竖排按格走。必须抢在输入法前面——fcitx5 后端会把
+    // Shift+方向键翻成 Shift+Left 发给 rime,rime 收下就轮不到编辑器了(设备键表里
+    // Shift+方向键 发的是 KEY_SHIFT_*,普通方向键走 CSI,两者本来就不冲突)。
+    if(!g_linux_ime.composing() && (key == KEY_SHIFT_LEFT || key == KEY_SHIFT_RIGHT ||
+                                    key == KEY_SHIFT_UP || key == KEY_SHIFT_DOWN)) {
+        if(g_vt_view) {
+            editor_vt_key(key);
+        } else {
+            // 先落锚点,退回锚点即取消。
+            if(g_ed_sel_anchor < 0) g_ed_sel_anchor = editor_caret_byte();
+            if(key == KEY_SHIFT_LEFT) lv_textarea_cursor_left(g_editor);
+            else if(key == KEY_SHIFT_RIGHT) lv_textarea_cursor_right(g_editor);
+            else if(key == KEY_SHIFT_UP) lv_textarea_cursor_up(g_editor);
+            else lv_textarea_cursor_down(g_editor);
+            if(g_ed_sel_anchor == editor_caret_byte()) g_ed_sel_anchor = -1;
+        }
+        update_ime_bar();
+        return;
+    }
     std::string ime_out;
     if(g_linux_ime.handle_key(key, ime_out)) {
         if(!ime_out.empty()) {
@@ -8466,17 +8529,7 @@ static void handle_editor_keys(int key) {
         update_ime_bar();
         return;
     }
-    // 横排:Shift+方向键拉选区,先落锚点,退回锚点即取消。
-    if(key == KEY_SHIFT_LEFT || key == KEY_SHIFT_RIGHT || key == KEY_SHIFT_UP || key == KEY_SHIFT_DOWN) {
-        if(g_ed_sel_anchor < 0) g_ed_sel_anchor = editor_caret_byte();
-        if(key == KEY_SHIFT_LEFT) lv_textarea_cursor_left(g_editor);
-        else if(key == KEY_SHIFT_RIGHT) lv_textarea_cursor_right(g_editor);
-        else if(key == KEY_SHIFT_UP) lv_textarea_cursor_up(g_editor);
-        else lv_textarea_cursor_down(g_editor);
-        if(g_ed_sel_anchor == editor_caret_byte()) g_ed_sel_anchor = -1;
-        update_ime_bar();
-        return;
-    }
+    // 横排:Shift+方向键拉选区(见上面输入法之前那一段),这里只剩普通方向键。
     if(key == KEY_LEFT) { g_ed_sel_anchor = -1; lv_textarea_cursor_left(g_editor); }
     else if(key == KEY_RIGHT) { g_ed_sel_anchor = -1; lv_textarea_cursor_right(g_editor); }
     else if(key == KEY_UP) { g_ed_sel_anchor = -1; lv_textarea_cursor_up(g_editor); }
