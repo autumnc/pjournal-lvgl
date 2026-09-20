@@ -75,6 +75,11 @@ static bool isSafeHistoryFilename(const std::string &fn) {
     return isJournalExt(fn);
 }
 
+static bool isSafeJournalFilename(const std::string &fn) {
+    if (fn.empty() || fn[0] == '.' || fn.find('/') != std::string::npos || fn.find("..") != std::string::npos) return false;
+    return isJournalExt(fn);
+}
+
 // SD card mutex (recursive to handle nested public method calls)
 static SemaphoreHandle_t s_sd_mutex = nullptr;
 
@@ -210,7 +215,7 @@ bool JournalStorage::saveEntry(const std::string &text) {
 }
 
 bool JournalStorage::saveEntryRaw(const std::string &filename, const std::string &content, bool createHistory) {
-    if (!mounted_) return false;
+    if (!mounted_ || !isSafeJournalFilename(filename)) return false;
     if (s_sd_mutex) xSemaphoreTakeRecursive(s_sd_mutex, portMAX_DELAY);
     ensureDir();
     std::string path = basePath() + "/" + filename;
@@ -262,7 +267,7 @@ void JournalStorage::clearRecoveryDraft() {
 
 std::vector<JournalHistoryVersion> JournalStorage::listHistoryVersions(const std::string &filename) {
     std::vector<JournalHistoryVersion> result;
-    if (!mounted_) return result;
+    if (!mounted_ || !isSafeJournalFilename(filename)) return result;
     if (s_sd_mutex) xSemaphoreTakeRecursive(s_sd_mutex, portMAX_DELAY);
     std::string dir = historyDirFor(basePath(), filename);
     DIR *d = opendir(dir.c_str());
@@ -295,7 +300,7 @@ std::vector<JournalHistoryVersion> JournalStorage::listHistoryVersions(const std
 }
 
 std::string JournalStorage::readHistoryVersion(const std::string &filename, const std::string &historyFilename) {
-    if (!mounted_ || !isSafeHistoryFilename(historyFilename)) return "";
+    if (!mounted_ || !isSafeJournalFilename(filename) || !isSafeHistoryFilename(historyFilename)) return "";
     if (s_sd_mutex) xSemaphoreTakeRecursive(s_sd_mutex, portMAX_DELAY);
     std::string content = readWholeFile(historyDirFor(basePath(), filename) + "/" + historyFilename);
     if (s_sd_mutex) xSemaphoreGiveRecursive(s_sd_mutex);
@@ -303,9 +308,10 @@ std::string JournalStorage::readHistoryVersion(const std::string &filename, cons
 }
 
 bool JournalStorage::restoreHistoryVersion(const std::string &filename, const std::string &historyFilename) {
-    if (!mounted_ || !isSafeHistoryFilename(historyFilename)) return false;
+    if (!mounted_ || !isSafeJournalFilename(filename) || !isSafeHistoryFilename(historyFilename)) return false;
+    std::string histPath = historyDirFor(basePath(), filename) + "/" + historyFilename;
+    if (!fileExists(histPath)) return false;
     std::string content = readHistoryVersion(filename, historyFilename);
-    if (content.empty()) return false;
     if (s_sd_mutex) xSemaphoreTakeRecursive(s_sd_mutex, portMAX_DELAY);
     ensureDir();
     std::string path = basePath() + "/" + filename;
@@ -320,7 +326,7 @@ bool JournalStorage::restoreHistoryVersion(const std::string &filename, const st
 }
 
 bool JournalStorage::deleteHistoryVersion(const std::string &filename, const std::string &historyFilename) {
-    if (!mounted_ || !isSafeHistoryFilename(historyFilename)) return false;
+    if (!mounted_ || !isSafeJournalFilename(filename) || !isSafeHistoryFilename(historyFilename)) return false;
     if (s_sd_mutex) xSemaphoreTakeRecursive(s_sd_mutex, portMAX_DELAY);
     bool ok = remove((historyDirFor(basePath(), filename) + "/" + historyFilename).c_str()) == 0;
     if (s_sd_mutex) xSemaphoreGiveRecursive(s_sd_mutex);
@@ -422,7 +428,7 @@ std::vector<std::pair<std::string, time_t>> JournalStorage::listFileMtimes() {
 }
 
 std::string JournalStorage::readEntry(const std::string &filename) {
-    if (!mounted_) return "";
+    if (!mounted_ || !isSafeJournalFilename(filename)) return "";
     if (s_sd_mutex) xSemaphoreTakeRecursive(s_sd_mutex, portMAX_DELAY);
     std::string path = basePath() + "/" + filename;
     repairSafeWriteFile(path);
@@ -441,7 +447,7 @@ std::string JournalStorage::readEntry(const std::string &filename) {
 }
 
 bool JournalStorage::deleteEntry(const std::string &filename) {
-    if (!mounted_) return false;
+    if (!mounted_ || !isSafeJournalFilename(filename)) return false;
     if (s_sd_mutex) xSemaphoreTakeRecursive(s_sd_mutex, portMAX_DELAY);
     bool ok = remove((basePath() + "/" + filename).c_str()) == 0;
     if (ok && m_indexValid) indexRemoveFile(filename);

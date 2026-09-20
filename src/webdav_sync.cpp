@@ -1,12 +1,12 @@
 #include "webdav_sync.h"
 
 #include "journal_storage.h"
+#include "process_utils.h"
 #include "safe_file.h"
 #include "settings.h"
 
 #include <algorithm>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <dirent.h>
@@ -23,30 +23,10 @@ struct RemoteFile {
     time_t mtime = 0;
 };
 
-static std::string shell_quote(const std::string &s) {
-    std::string out = "'";
-    for(char c : s) {
-        if(c == '\'') out += "'\\''";
-        else out += c;
-    }
-    out += "'";
-    return out;
-}
-
 static std::string trim(std::string s) {
     while(!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t')) s.pop_back();
     size_t p = s.find_first_not_of(" \t\r\n");
     return p == std::string::npos ? "" : s.substr(p);
-}
-
-static std::string run_capture(const std::string &cmd) {
-    FILE *p = popen(cmd.c_str(), "r");
-    if(!p) return "";
-    std::string out;
-    char buf[1024];
-    while(fgets(buf, sizeof(buf), p)) out += buf;
-    pclose(p);
-    return out;
 }
 
 static std::string base_url() {
@@ -55,11 +35,13 @@ static std::string base_url() {
     return u;
 }
 
-static std::string auth_arg() {
+static void append_auth(std::vector<std::string> &args) {
     std::string user = g_settings.get("webdav_user", "");
     std::string pass = g_settings.get("webdav_pass", "");
-    if(user.empty()) return "";
-    return " -u " + shell_quote(user + ":" + pass);
+    if(!user.empty()) {
+        args.push_back("-u");
+        args.push_back(user + ":" + pass);
+    }
 }
 
 static std::string remote_url(const std::string &path) {
@@ -125,8 +107,10 @@ static std::string tag_value(const std::string &block, const std::string &tag) {
 
 static std::vector<RemoteFile> list_remote() {
     std::vector<RemoteFile> out;
-    std::string cmd = "curl -sS -X PROPFIND -H 'Depth: 1'" + auth_arg() + " " + shell_quote(remote_url("journal/"));
-    std::string xml = run_capture(cmd);
+    std::vector<std::string> args = {"curl", "-sS", "-X", "PROPFIND", "-H", "Depth: 1"};
+    append_auth(args);
+    args.push_back(remote_url("journal/"));
+    std::string xml = process::run_capture(args);
     size_t pos = 0;
     while(true) {
         size_t a = xml.find("<", pos);
@@ -157,26 +141,34 @@ static std::vector<RemoteFile> list_remote() {
 }
 
 static bool curl_mkcol() {
-    std::string cmd = "curl -sS -o /dev/null -w '%{http_code}' -X MKCOL" + auth_arg() + " " + shell_quote(remote_url("journal/"));
-    std::string code = trim(run_capture(cmd));
+    std::vector<std::string> args = {"curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "-X", "MKCOL"};
+    append_auth(args);
+    args.push_back(remote_url("journal/"));
+    std::string code = trim(process::run_capture(args));
     return code == "201" || code == "405" || code == "301" || code == "302";
 }
 
 static bool curl_upload(const std::string &filename, const std::string &local_path) {
-    std::string cmd = "curl -sS -o /dev/null -w '%{http_code}' -X PUT -T " + shell_quote(local_path) + auth_arg() + " " + shell_quote(remote_url("journal/" + filename));
-    std::string code = trim(run_capture(cmd));
+    std::vector<std::string> args = {"curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "-X", "PUT", "-T", local_path};
+    append_auth(args);
+    args.push_back(remote_url("journal/" + filename));
+    std::string code = trim(process::run_capture(args));
     return code == "200" || code == "201" || code == "204";
 }
 
 static bool curl_download(const std::string &filename, const std::string &out_path) {
-    std::string cmd = "curl -sS -L -o " + shell_quote(out_path) + " -w '%{http_code}'" + auth_arg() + " " + shell_quote(remote_url("journal/" + filename));
-    std::string code = trim(run_capture(cmd));
+    std::vector<std::string> args = {"curl", "-sS", "-L", "-o", out_path, "-w", "%{http_code}"};
+    append_auth(args);
+    args.push_back(remote_url("journal/" + filename));
+    std::string code = trim(process::run_capture(args));
     return code == "200" || code == "203";
 }
 
 static bool curl_delete(const std::string &filename) {
-    std::string cmd = "curl -sS -o /dev/null -w '%{http_code}' -X DELETE" + auth_arg() + " " + shell_quote(remote_url("journal/" + filename));
-    std::string code = trim(run_capture(cmd));
+    std::vector<std::string> args = {"curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "-X", "DELETE"};
+    append_auth(args);
+    args.push_back(remote_url("journal/" + filename));
+    std::string code = trim(process::run_capture(args));
     return code == "200" || code == "202" || code == "204" || code == "404";
 }
 
@@ -201,7 +193,7 @@ static void save_state(const std::map<std::string, time_t> &state) {
 
 WebdavSyncResult webdav_sync_journal() {
     if(base_url().empty()) return {false, "请先设置 WebDAV URL"};
-    if(system("command -v curl >/dev/null 2>&1") != 0) return {false, "未找到 curl"};
+    if(!process::command_exists("curl")) return {false, "未找到 curl"};
 
     g_journal.begin();
     curl_mkcol();

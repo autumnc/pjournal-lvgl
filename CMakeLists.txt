@@ -68,6 +68,8 @@ target_include_directories(lvgl PUBLIC third_party/freetype/include)
 add_executable(pjournal-lvgl
     src/main.cpp
     src/safe_file.cpp
+    src/process_utils.cpp
+    src/hash_utils.cpp
     src/esp32_compat.cpp
     src/settings.cpp
     src/journal_storage.cpp
@@ -104,3 +106,18 @@ if(PJOURNAL_STATIC)
 endif()
 
 install(TARGETS pjournal-lvgl RUNTIME DESTINATION bin)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(pjournal-tests
+        tests/test_utils.cpp
+        src/hash_utils.cpp
+        src/journal_storage.cpp
+        src/process_utils.cpp
+        src/safe_file.cpp
+        src/settings.cpp
+    )
+    target_include_directories(pjournal-tests PRIVATE include)
+    target_compile_options(pjournal-tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    add_test(NAME pjournal-tests COMMAND pjournal-tests)
+endif()

@@ -64,6 +64,14 @@ std::string url_decode(const std::string &src) {
     return out;
 }
 
+bool safe_upload_name(const std::string &name) {
+    if(name.empty() || name == "." || name == "..") return false;
+    for(unsigned char c : name) {
+        if(c == '/' || c == '\\' || c < 0x20 || c == 0x7f) return false;
+    }
+    return true;
+}
+
 std::string json_escape(const std::string &s) {
     std::string out;
     out.reserve(s.size() + 8);
@@ -659,12 +667,8 @@ bool save_upload_body(Conn &conn, const Request &req, const std::string &tmp_pat
 void handle_upload(int fd, Conn &conn, const Request &req) {
     std::string dir = get_query_param(req, "path");
     std::string name = get_query_param(req, "name");
-    if(!is_safe_path(dir) || name.empty()) {
+    if(!is_safe_path(dir) || !safe_upload_name(name)) {
         respond_json_error(fd, "invalid path or name");
-        return;
-    }
-    if(name.find('/') != std::string::npos || name.find('\\') != std::string::npos) {
-        respond_json_error(fd, "invalid filename");
         return;
     }
     const size_t MAX_UPLOAD = 16 * 1024 * 1024;

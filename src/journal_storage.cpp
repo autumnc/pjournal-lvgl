@@ -158,13 +158,13 @@ std::vector<std::pair<std::string, time_t>> JournalStorage::list_file_mtimes() {
 }
 
 std::string JournalStorage::read_entry(const std::string &filename) {
-    if(!safe_name(filename)) return "";
+    if(!safe_name(filename) || !journal_ext(filename)) return "";
     std::lock_guard<std::recursive_mutex> lock(g_journal_mutex);
     return read_whole_file(base_path() + "/" + filename);
 }
 
 bool JournalStorage::delete_entry(const std::string &filename) {
-    if(!safe_name(filename)) return false;
+    if(!safe_name(filename) || !journal_ext(filename)) return false;
     std::lock_guard<std::recursive_mutex> lock(g_journal_mutex);
     return remove((base_path() + "/" + filename).c_str()) == 0;
 }
@@ -226,7 +226,7 @@ void JournalStorage::clear_recovery_draft() {
 
 std::vector<JournalHistoryVersion> JournalStorage::list_history_versions(const std::string &filename) {
     std::vector<JournalHistoryVersion> out;
-    if(!safe_name(filename)) return out;
+    if(!safe_name(filename) || !journal_ext(filename)) return out;
     std::string dir = history_dir_for(base_path(), filename);
     DIR *d = opendir(dir.c_str());
     if(!d) return out;
@@ -243,17 +243,19 @@ std::vector<JournalHistoryVersion> JournalStorage::list_history_versions(const s
 }
 
 std::string JournalStorage::read_history_version(const std::string &filename, const std::string &history_filename) {
-    if(!safe_name(filename) || !safe_name(history_filename)) return "";
+    if(!safe_name(filename) || !journal_ext(filename) || !safe_name(history_filename) || !journal_ext(history_filename)) return "";
     return read_whole_file(history_dir_for(base_path(), filename) + "/" + history_filename);
 }
 
 bool JournalStorage::restore_history_version(const std::string &filename, const std::string &history_filename) {
+    if(!safe_name(filename) || !journal_ext(filename) || !safe_name(history_filename) || !journal_ext(history_filename)) return false;
+    struct stat st {};
+    if(stat((history_dir_for(base_path(), filename) + "/" + history_filename).c_str(), &st) != 0) return false;
     std::string content = read_history_version(filename, history_filename);
-    if(content.empty()) return false;
     return save_entry_raw(filename, content, true);
 }
 
 bool JournalStorage::delete_history_version(const std::string &filename, const std::string &history_filename) {
-    if(!safe_name(filename) || !safe_name(history_filename)) return false;
+    if(!safe_name(filename) || !journal_ext(filename) || !safe_name(history_filename) || !journal_ext(history_filename)) return false;
     return remove((history_dir_for(base_path(), filename) + "/" + history_filename).c_str()) == 0;
 }

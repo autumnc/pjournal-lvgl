@@ -43,7 +43,7 @@ public:
     bool save_config(std::string &message);
 
 private:
-    std::string cli(const std::string &args) const;
+    std::string cli(const std::vector<std::string> &args) const;
     std::string iface_;
 };
 

@@ -36,6 +36,14 @@ static std::string urlDecode(const char *src) {
     return out;
 }
 
+static bool safeUploadName(const std::string &name) {
+    if (name.empty() || name == "." || name == "..") return false;
+    for (unsigned char c : name) {
+        if (c == '/' || c == '\\' || c < 0x20 || c == 0x7f) return false;
+    }
+    return true;
+}
+
 static bool isSafePath(const std::string &path) {
     if (path.find("..") != std::string::npos) return false;
     // /sdcard must be the mount root itself or followed by '/', otherwise
@@ -533,14 +541,8 @@ static esp_err_t __attribute__((unused)) handler_upload(httpd_req_t *req) {
     if (!authOk(req)) return sendAuthError(req);
     std::string dir = getQueryParam(req, "path");
     std::string name = getQueryParam(req, "name");
-    if (!isSafePath(dir) || name.empty()) {
+    if (!isSafePath(dir) || !safeUploadName(name)) {
         sendJsonError(req, "invalid path or name");
-        return ESP_OK;
-    }
-
-    // reject names with path separators
-    if (name.find('/') != std::string::npos || name.find('\\') != std::string::npos) {
-        sendJsonError(req, "invalid filename");
         return ESP_OK;
     }
 
