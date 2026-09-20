@@ -2,11 +2,13 @@
 
 #include "file_manager_server.h"
 #include "font_manager.h"
+#include "hash_utils.h"
 #include "journal_storage.h"
 #include "key_codes.h"
 #include "linux_ime.h"
 #include "markdown.h"
 #include "outline_model.h"
+#include "process_utils.h"
 #include "safe_file.h"
 #include "settings.h"
 #include "text_utils.h"
@@ -24,6 +26,7 @@
 #include <src/misc/lv_text_private.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -31,9 +34,11 @@
 #include <dirent.h>
 #include <functional>
 #include <map>
+#include <net/if.h>
 #include <set>
 #include <sys/stat.h>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 enum class Screen {
@@ -86,6 +91,10 @@ static lv_obj_t *g_status = nullptr;
 static lv_obj_t *g_status_right = nullptr;  // 状态栏右侧靠右对齐的那半
 static Screen g_screen = Screen::Main;
 static Screen g_prev_screen = Screen::Main;
+// 进设置界面之前是哪个界面。设置下面挂着一串子界面(文本编辑框、WiFi、词库、文件管理),
+// 它们退回设置时也走 goto_screen(Settings),不能用 g_prev_screen 记,否则会被顶成那个
+// 子界面。设置里改完东西按 Esc 要回到这里。
+static Screen g_settings_return = Screen::Main;
 static int g_main_sel = 0;
 static int g_browser_sel = 0;
 static int g_history_sel = 0;
@@ -185,6 +194,7 @@ static std::vector<WifiSavedNetwork> g_wifi_saved_entries;
 static std::string g_view_file;
 static std::string g_history_file;
 static std::string g_edit_file;
+static std::string g_file_edit_path;
 static std::string g_prompt;
 static int g_quick_slot = -1;
 static std::string g_clipboard;
@@ -195,6 +205,7 @@ static size_t g_last_recovery_hash = 0;
 static uint32_t g_next_recovery_ms = 0;
 static bool g_recovery_checked = false;
 static lv_obj_t *g_editor = nullptr;
+static lv_obj_t *g_file_panel = nullptr;
 static lv_obj_t *g_setting_text = nullptr;
 static lv_obj_t *g_wifi_password = nullptr;
 static lv_obj_t *g_inspiration_text = nullptr;
@@ -225,7 +236,40 @@ static int g_md_view_h = 0;
 static std::vector<lv_area_t> g_md_sel_rects;  // 选区高亮块(每帧由 refresh 重算)
 static std::vector<lv_area_t> g_md_box_rects;  // 反白底色块(`code` / 链接)
 static std::vector<lv_area_t> g_md_dot_rects;  // 着重号小方点(==高亮==)
+static lv_obj_t *g_focus_dim[2] = {nullptr, nullptr};  // 聚焦模式:光标行上下的压暗罩
+static lv_area_t g_md_focus_band {};                   // 聚焦模式:当前行的亮带(内容层坐标)
+static bool g_md_focus_band_on = false;
+
+static std::string meta_value(const std::string &meta, const char *key) {
+    std::string prefix = std::string(key) + "=";
+    size_t pos = meta.find(prefix);
+    if(pos == std::string::npos) return "";
+    pos += prefix.size();
+    size_t end = meta.find('\n', pos);
+    return meta.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+}
+
+static bool journal_filename_ok(const std::string &fn) {
+    if(fn.empty() || fn[0] == '.' || fn.find('/') != std::string::npos || fn.find("..") != std::string::npos) return false;
+    size_t dot = fn.rfind('.');
+    if(dot == std::string::npos) return false;
+    std::string ext = fn.substr(dot);
+    return ext == ".txt" || ext == ".md";
+}
 static std::vector<lv_area_t> g_md_wave_rects;  // 书名波浪线(《书名》)
+
+struct FilePanelState {
+    bool active = false;
+    bool prompt = false;
+    bool rename = false;
+    bool confirmDelete = false;
+    int sel = 0;
+    int scroll = 0;
+    std::vector<std::string> entries;
+    std::string input;
+    std::string message;
+};
+static FilePanelState g_file_panel_state;
 
 // 只读渲染(阅读视图 / 历史预览):与编辑器叠加层共用行级排版,但没有光标/选区/折叠。
 // 定义在编辑器模块里,这里先声明给上面的 render_viewer / render_history 用。
@@ -259,6 +303,8 @@ static size_t g_editor_clean_hash = 0;      // 上次保存/载入时正文的�
 static bool g_editor_exit_asking = false;   // 退出询问框是否显示
 static int g_editor_exit_target = 0;        // 0=主面板 1=大纲 2=快捷编辑(设置)
 static lv_obj_t *g_editor_exit_dlg = nullptr;
+static bool g_quit_asking = false;          // Ctrl+Q 退出 app 的确认框是否显示
+static lv_obj_t *g_quit_dlg = nullptr;
 static Screen g_history_return = Screen::Browser;
 static bool g_history_preview = false;
 static bool g_history_confirm_restore = false;
@@ -373,6 +419,24 @@ static void editor_vt_create(int x, int y, int w, int h);
 static bool editor_vertical();
 static void editor_sel_style_plain();
 
+// 编辑模式四选一:正常 / 打字机 / 聚焦 / 打字机聚焦。聚焦那两种只是在打字机之上多盖一层
+// 暗化罩,所以拆成两个谓词,typing 相关的代码照旧只问 editor_typewriter()。
+static bool editor_typewriter() {
+    const std::string m = g_settings.editor_mode();
+    return m == "typewriter" || m == "typewriter_focus";
+}
+static bool editor_focus() {
+    const std::string m = g_settings.editor_mode();
+    return m == "focus" || m == "typewriter_focus";
+}
+static std::string editor_mode_label() {
+    const std::string m = g_settings.editor_mode();
+    if(m == "typewriter") return "打字机";
+    if(m == "focus") return "聚焦";
+    if(m == "typewriter_focus") return "打字机聚焦";
+    return "正常";
+}
+
 static std::string time_label(time_t t) {
     tm local {};
     localtime_r(&t, &local);
@@ -431,13 +495,43 @@ static std::string battery_percent_label() {
     return cache;
 }
 
-static std::string main_status_text() {
+// 状态栏 WiFi 图标,字形沿用 tmux 那套 Nerd 码位:
+// U+3237 满格 = 已连接,U+F1EB 线框 = 接口在但没连上,U+3239 斜杠 = WiFi 关闭。
+static std::string wifi_status_label() {
+    // 逐键刷新状态栏时要读 sysfs + fork wpa_cli,缓存 5 秒
+    static std::string cache;
+    static uint32_t next_ms = 0;
+    uint32_t now = lv_tick_get();
+    if(!cache.empty() && (int32_t)(now - next_ms) < 0) return cache;
+
+    // 关 WiFi 后 wifi_switch 会 ip link down 甚至卸载驱动,所以先看链路:
+    // 目录没了或 IFF_UP 没置位都算关闭,这时也不用去打 wpa_cli。
+    std::string sys = "/sys/class/net/" + g_settings.wlan_interface();
+    struct stat st {};
+    bool link_up = false;
+    if(stat(sys.c_str(), &st) == 0) {
+        std::string flags = trim_copy(read_whole_file(sys + "/flags"));
+        link_up = (strtoul(flags.c_str(), nullptr, 0) & IFF_UP) != 0;
+    }
+    if(!link_up) cache = "\xe3\x88\xb9";
+    else if(g_wifi.status().connected) cache = "\xe3\x88\xb7";
+    else cache = "\xef\x87\xab";
+    next_ms = now + 5000;
+    return cache;
+}
+
+static std::string clock_label() {
     time_t now = time(nullptr);
     tm local {};
     localtime_r(&now, &local);
     char buf[48];
     strftime(buf, sizeof(buf), "%H:%M", &local);
-    return std::string(buf) + "  " + battery_percent_label();
+    return buf;
+}
+
+// 状态栏右侧统一顺序:时间 [输入法状态] WiFi 电池,主面板没有输入框所以省掉中括号那段
+static std::string main_status_text() {
+    return clock_label() + " " + wifi_status_label() + " " + battery_percent_label();
 }
 
 static std::string history_filename_label(const std::string &fn) {
@@ -463,6 +557,80 @@ static std::string quick_dir() {
 
 static std::string quick_file(int slot) {
     return quick_dir() + "/" + std::to_string(slot) + ".txt";
+}
+
+static std::string file_edit_dir() {
+    return g_settings.journal_dir() + "/files";
+}
+
+static std::string file_edit_clean_name(std::string name) {
+    std::string out;
+    for(unsigned char c : name) {
+        if(c == '/' || c == '\\' || c == ':' || c < 0x20) continue;
+        out.push_back((char)c);
+    }
+    size_t s = out.find_first_not_of(" \t\r\n");
+    size_t e = out.find_last_not_of(" \t\r\n");
+    if(s == std::string::npos) out.clear();
+    else out = out.substr(s, e - s + 1);
+    if(out.empty()) out = "notes.txt";
+    if(out.find('.') == std::string::npos) out += ".txt";
+    return out;
+}
+
+static std::string file_edit_path_for(const std::string &name) {
+    return file_edit_dir() + "/" + file_edit_clean_name(name);
+}
+
+// 按字符退格:输入法提交的是 UTF-8 多字节,直接 pop_back 会把一个汉字切成半个,存成文件名坏掉
+static void utf8_pop_back(std::string &s) {
+    if(s.empty()) return;
+    size_t n = s.size();
+    while(n > 0 && ((unsigned char)s[n - 1] & 0xC0) == 0x80) --n;  // 跳过续字节
+    if(n > 0) --n;                                                 // 再吃掉首字节
+    s.erase(n);
+}
+
+static bool path_is_file(const std::string &path) {
+    struct stat st {};
+    return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static std::vector<std::string> file_edit_entries() {
+    ensure_dir_path(file_edit_dir());
+    std::vector<std::string> v;
+    DIR *d = opendir(file_edit_dir().c_str());
+    if(!d) return v;
+    dirent *de = nullptr;
+    while((de = readdir(d)) != nullptr) {
+        std::string n = de->d_name;
+        if(n.empty() || n[0] == '.') continue;
+        if(n.size() >= 4 && (n.substr(n.size() - 4) == ".tmp" || n.substr(n.size() - 4) == ".bak")) continue;
+        if(path_is_file(file_edit_dir() + "/" + n)) v.push_back(n);
+    }
+    closedir(d);
+    std::sort(v.begin(), v.end());
+    return v;
+}
+
+static std::string file_edit_last_name() {
+    std::string n = file_edit_clean_name(g_settings.get("file_edit_last", "notes.txt"));
+    if(!path_is_file(file_edit_path_for(n))) {
+        auto entries = file_edit_entries();
+        if(!entries.empty()) n = entries.front();
+    }
+    return n;
+}
+
+static void file_edit_set_last(const std::string &name) {
+    g_settings.set("file_edit_last", file_edit_clean_name(name));
+}
+
+static void file_edit_ensure_default() {
+    ensure_dir_path(file_edit_dir());
+    std::string n = file_edit_last_name();
+    if(!path_is_file(file_edit_path_for(n))) safe_write_file(file_edit_path_for(n), "");
+    file_edit_set_last(n);
 }
 
 static std::string gtd_file() {
@@ -545,26 +713,6 @@ static std::string random_builtin_prompt() {
     return BUILTIN_PROMPTS[rand() % BUILTIN_PROMPT_COUNT];
 }
 
-static std::string app_shell_quote(const std::string &s) {
-    std::string out = "'";
-    for(char c : s) {
-        if(c == '\'') out += "'\\''";
-        else out += c;
-    }
-    out += "'";
-    return out;
-}
-
-static std::string app_run_capture(const std::string &cmd) {
-    FILE *p = popen(cmd.c_str(), "r");
-    if(!p) return "";
-    std::string out;
-    char buf[1024];
-    while(fgets(buf, sizeof(buf), p)) out += buf;
-    pclose(p);
-    return out;
-}
-
 static std::string extract_deepseek_content(const std::string &response) {
     size_t p = response.find("\"content\":\"");
     if(p == std::string::npos) return "";
@@ -607,7 +755,7 @@ static bool deepseek_chat(const std::string &body, std::string &out, std::string
         err = "请先在设置中配置Deepseek Key";
         return false;
     }
-    if(system("command -v curl >/dev/null 2>&1") != 0) {
+    if(!process::command_exists("curl")) {
         err = "未找到 curl";
         return false;
     }
@@ -616,11 +764,13 @@ static bool deepseek_chat(const std::string &body, std::string &out, std::string
         err = "无法写入请求文件";
         return false;
     }
-    std::string cmd = "curl -sS -m 45 -H 'Content-Type: application/json' -H " +
-                      app_shell_quote("Authorization: Bearer " + key) +
-                      " --data-binary @" + app_shell_quote(path) +
-                      " https://api.deepseek.com/chat/completions";
-    std::string response = app_run_capture(cmd);
+    std::string response = process::run_capture({
+        "curl", "-sS", "-m", "45",
+        "-H", "Content-Type: application/json",
+        "-H", "Authorization: Bearer " + key,
+        "--data-binary", "@" + path,
+        "https://api.deepseek.com/chat/completions",
+    });
     remove(path.c_str());
     out = extract_deepseek_content(response);
     if(out.empty()) {
@@ -666,12 +816,6 @@ static bool deepseek_polish_text(const std::string &text, const std::string &cus
     return deepseek_chat(body, polished, err);
 }
 
-static std::string first_token(std::string s) {
-    size_t p = s.find_first_of(" \t\r\n");
-    if(p != std::string::npos) s.resize(p);
-    return s;
-}
-
 static std::string html_escape(const std::string &s) {
     std::string out;
     for(char c : s) {
@@ -699,12 +843,8 @@ static std::string text_to_flomo_html(const std::string &text) {
 }
 
 static bool flomo_sign(const std::string &params, std::string &sign, std::string &err) {
-    if(system("command -v md5sum >/dev/null 2>&1") != 0) {
-        err = "未找到 md5sum";
-        return false;
-    }
     std::string raw = params + "dbbc3dd73364b4084c3a69346e0ce2b2";
-    sign = first_token(app_run_capture("printf %s " + app_shell_quote(raw) + " | md5sum"));
+    sign = hash::md5_hex(raw);
     if(sign.empty()) {
         err = "Flomo签名失败";
         return false;
@@ -722,7 +862,7 @@ static bool flomo_send_text(const std::string &text, std::string &msg) {
         msg = "正文为空";
         return false;
     }
-    if(system("command -v curl >/dev/null 2>&1") != 0) {
+    if(!process::command_exists("curl")) {
         msg = "未找到 curl";
         return false;
     }
@@ -741,11 +881,13 @@ static bool flomo_send_text(const std::string &text, std::string &msg) {
         msg = "无法写入Flomo请求";
         return false;
     }
-    std::string cmd = "curl -sS -m 45 -X PUT -H 'Content-Type: application/json' -H " +
-                      app_shell_quote("Authorization: Bearer " + token) +
-                      " --data-binary @" + app_shell_quote(path) +
-                      " https://flomoapp.com/api/v1/memo";
-    std::string response = app_run_capture(cmd);
+    std::string response = process::run_capture({
+        "curl", "-sS", "-m", "45", "-X", "PUT",
+        "-H", "Content-Type: application/json",
+        "-H", "Authorization: Bearer " + token,
+        "--data-binary", "@" + path,
+        "https://flomoapp.com/api/v1/memo",
+    });
     remove(path.c_str());
     if(response.find("\"code\":0") != std::string::npos) {
         msg = "已发送到Flomo";
@@ -763,7 +905,7 @@ static bool flomo_generate_token(std::string &msg) {
         msg = "请先设置Flomo邮箱和密码";
         return false;
     }
-    if(system("command -v curl >/dev/null 2>&1") != 0) {
+    if(!process::command_exists("curl")) {
         msg = "未找到 curl";
         return false;
     }
@@ -782,9 +924,12 @@ static bool flomo_generate_token(std::string &msg) {
         msg = "无法写入Flomo请求";
         return false;
     }
-    std::string cmd = "curl -sS -m 30 -X POST -H 'Content-Type: application/json' --data-binary @" +
-                      app_shell_quote(path) + " https://flomoapp.com/api/v1/user/login_by_email";
-    std::string response = app_run_capture(cmd);
+    std::string response = process::run_capture({
+        "curl", "-sS", "-m", "30", "-X", "POST",
+        "-H", "Content-Type: application/json",
+        "--data-binary", "@" + path,
+        "https://flomoapp.com/api/v1/user/login_by_email",
+    });
     remove(path.c_str());
     // {"code":0,"data":{"access_token":"..."}}
     std::string token;
@@ -1507,6 +1652,7 @@ static void clear_root() {
     g_status = nullptr;
     g_status_right = nullptr;
     g_editor = nullptr;
+    g_file_panel = nullptr;
     g_setting_text = nullptr;
     g_gtd.input = nullptr;
     g_ol.input = nullptr;
@@ -1529,6 +1675,9 @@ static void clear_root() {
     g_md_view = nullptr;
     g_md_content = nullptr;
     g_md_caret = nullptr;
+    g_focus_dim[0] = nullptr;
+    g_focus_dim[1] = nullptr;
+    g_md_focus_band_on = false;
     g_md_labels.clear();
     g_md_rules.clear();
     g_md_sel_rects.clear();
@@ -1543,6 +1692,8 @@ static void clear_root() {
     g_vt_view = nullptr;
     g_vt_caret = nullptr;
     g_editor_exit_dlg = nullptr;
+    g_quit_dlg = nullptr;
+    g_quit_asking = false;
     g_vt_cols.clear();
     g_vt_marks.clear();
     g_vt_cells.clear();
@@ -1625,10 +1776,82 @@ static void create_ime_bar() {
 static std::string editor_status_text() {
     std::string mode;
     if(g_quick_slot >= 0) mode = "快捷编辑 " + std::to_string(g_quick_slot) + ".txt";
+    else if(!g_file_edit_path.empty()) {
+        size_t slash = g_file_edit_path.find_last_of('/');
+        mode = "文件 " + (slash == std::string::npos ? g_file_edit_path : g_file_edit_path.substr(slash + 1));
+    }
     else if(!g_ol.editPath.empty()) mode = "大纲文件 " + g_ol.project;
     else if(g_edit_file.empty()) mode = g_prompt.empty() ? "自由写作" : "提示写作";
     else mode = "编辑 " + g_edit_file;
     return mode;
+}
+
+static void file_panel_reload(const std::string &prefer = "") {
+    auto &p = g_file_panel_state;
+    p.entries = file_edit_entries();
+    if(p.entries.empty()) {
+        file_edit_ensure_default();
+        p.entries = file_edit_entries();
+    }
+    std::string wanted = prefer;
+    if(wanted.empty() && !g_file_edit_path.empty()) {
+        size_t slash = g_file_edit_path.find_last_of('/');
+        wanted = slash == std::string::npos ? g_file_edit_path : g_file_edit_path.substr(slash + 1);
+    }
+    for(int i = 0; i < (int)p.entries.size(); ++i)
+        if(p.entries[i] == wanted) { p.sel = i; break; }
+    if(p.sel < 0) p.sel = 0;
+    if(p.sel >= (int)p.entries.size()) p.sel = (int)p.entries.size() - 1;
+    if(p.sel < 0) p.sel = 0;
+}
+
+// 文件管理面板的宽度。候选条定位(update_ime_bar)也按它推算,所以放这儿共用一个值。
+static const int kFilePanelW = 420;
+
+static void draw_file_panel() {
+    if(!g_file_panel_state.active) {
+        if(g_file_panel) { lv_obj_delete(g_file_panel); g_file_panel = nullptr; }
+        return;
+    }
+    if(g_file_panel) { lv_obj_delete(g_file_panel); g_file_panel = nullptr; }
+    auto &p = g_file_panel_state;
+    const int panel_w = kFilePanelW;
+    g_file_panel = box(g_root, 0, 0, panel_w, 600, false);
+    lv_obj_set_style_bg_color(g_file_panel, g_theme.bg, 0);
+    lv_obj_set_style_bg_opa(g_file_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(g_file_panel, 2, 0);
+    label(g_file_panel, "文件", 8, 8, panel_w - 16, 34);
+    int visible = 10;
+    if(p.sel < p.scroll) p.scroll = p.sel;
+    if(p.sel >= p.scroll + visible) p.scroll = p.sel - visible + 1;
+    if(p.scroll < 0) p.scroll = 0;
+    for(int i = 0; i < visible && p.scroll + i < (int)p.entries.size(); ++i) {
+        int idx = p.scroll + i;
+        lv_obj_t *r = box(g_file_panel, 8, 54 + i * 42, panel_w - 16, 38, idx == p.sel);
+        lv_obj_set_style_border_width(r, 0, 0);
+        lv_obj_t *l = label(r, p.entries[idx], 6, 5, panel_w - 28, 28);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_CLIP);
+        if(idx == p.sel) lv_obj_set_style_text_color(l, g_theme.bg, 0);
+    }
+    if(p.prompt) {
+        std::string title = p.rename ? "改名: " : "新建: ";
+        lv_obj_t *l = label(g_file_panel, title + p.input, 8, 500, panel_w - 16, 30);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_CLIP);
+    } else if(!p.message.empty()) {
+        label(g_file_panel, p.message, 8, 500, panel_w - 16, 30);
+    }
+    // 组字时候选条占着提示行那一格,这一行就撤掉;a新建/d删除那排键位提示在打字途中
+    // 只会抢地方,也没有用
+    if(!p.prompt) {
+        lv_obj_t *hint = label(g_file_panel,
+                               p.confirmDelete ? "Enter确认删除 Esc取消" : "a新建 d删除 r改名 Enter编辑",
+                               8, 548, panel_w - 16, 28);
+        lv_label_set_long_mode(hint, LV_LABEL_LONG_CLIP);
+    }
+    lv_obj_move_foreground(g_file_panel);
+    // 面板是不透明的整高方块,候选条就摆在它里面(左下提示行下面)。不把候选条再抬一次
+    // 的话,面板盖在候选条上,LVGL 认定候选条被完全遮住就不画它了,组字时看不到候选。
+    if(g_ime_bar && !lv_obj_has_flag(g_ime_bar, LV_OBJ_FLAG_HIDDEN)) lv_obj_move_foreground(g_ime_bar);
 }
 
 static std::string editor_ime_text() {
@@ -1637,9 +1860,10 @@ static std::string editor_ime_text() {
     return std::string("[中]") + (g_linux_ime.fullwidth() ? "●" : "◐") + (g_linux_ime.trad() ? "繁" : "简");
 }
 
-// 状态栏右侧:输入法状态 + 电池,格式与主面板一致
+// 状态栏右侧:时间 + 输入法状态 + WiFi + 电池,顺序与主面板一致
 static std::string editor_right_text() {
-    return editor_ime_text() + "  " + battery_percent_label();
+    return clock_label() + " " + editor_ime_text() + " " + wifi_status_label() + " " +
+           battery_percent_label();
 }
 
 static void refresh_ime_status() {
@@ -1744,6 +1968,19 @@ static void update_ime_bar() {
         return;
     }
     lv_obj_clear_flag(g_ime_bar, LV_OBJ_FLAG_HIDDEN);
+
+    // 文件管理面板的新建/改名:候选条摆在面板左下的提示行下面。不单独判这一支的话会
+    // 走下面的 active_textarea(),拿到背后的编辑器,候选条就飘到编辑器光标那儿去了。
+    // 宽度不受面板限制:面板只占屏幕三分之一,挤在里面一页摆不下几个候选。候选条本身
+    // 在窗口最上层,伸到面板右边盖住编辑区没关系。
+    if(g_file_panel_state.active && g_file_panel_state.prompt) {
+        int y = 534;
+        if(y + ime_bar_h() > 596) y = 596 - ime_bar_h();
+        ime_bar_layout_horizontal(8, y, 656);
+        lv_obj_move_foreground(g_ime_bar);
+        refresh_ime_status();
+        return;
+    }
 
     if(editor_vertical() && g_vt_view && g_vt_caret) {
         ime_bar_layout_vertical();
@@ -1928,8 +2165,11 @@ static bool editor_dirty() {
 
 static void editor_leave() {
     if(g_editor_exit_target == 1) goto_screen(Screen::Outline);
-    else if(g_editor_exit_target == 2) {
-        g_quick_slot = -1;
+    // 快捷/文件编辑模式下 Esc 是进设置调参数。这里保留 g_quick_slot / g_file_edit_path,
+    // 从设置退出时才能回到同一个模式同一个文件(见 settings_leave),所以不能提前清掉。
+    else if(g_editor_exit_target == 2) goto_screen(Screen::Settings);
+    else if(g_editor_exit_target == 3) {
+        g_file_panel_state.active = false;
         goto_screen(Screen::Settings);
     } else goto_screen(Screen::Main);
 }
@@ -1937,6 +2177,7 @@ static void editor_leave() {
 static void editor_exit_target_from_state() {
     if(!g_ol.editPath.empty()) g_editor_exit_target = 1;
     else if(g_quick_slot >= 0) g_editor_exit_target = 2;
+    else if(!g_file_edit_path.empty()) g_editor_exit_target = 3;
     else g_editor_exit_target = 0;
 }
 
@@ -1958,12 +2199,53 @@ static void draw_editor_exit_confirm() {
     g_editor_exit_dlg = dlg;
 }
 
+// Ctrl+Q 退出 app 的确认框。三种工作模式都用它退出——尤其 file/quick 模式下根本到不了
+// 主面板,没有这个键就只能去 kill 进程。
+static void draw_quit_confirm() {
+    lv_obj_t *dlg = box(g_root, 312, 240, 400, 114, false);
+    lv_obj_set_style_bg_color(dlg, g_theme.bg, 0);
+    lv_obj_set_style_border_width(dlg, 2, 0);
+    lv_obj_t *t = label(dlg, "退出 pjournal-lvgl?", 0, 6, 392, 30);
+    lv_obj_set_style_text_align(t, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_t *a = label(dlg, "Enter 退出", 0, 40, 392, 28);
+    lv_obj_set_style_text_align(a, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_t *c = label(dlg, "Esc 取消", 0, 68, 392, 28);
+    lv_obj_set_style_text_color(c, g_theme.muted, 0);
+    lv_obj_set_style_text_align(c, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_move_foreground(dlg);
+    g_quit_dlg = dlg;
+}
+
+static void quit_begin() {
+    if(g_quit_asking) return;
+    g_quit_asking = true;
+    draw_quit_confirm();
+}
+
+// 退出确认框是模态的:所有按键都进这里。Enter 走人(顺手把编辑器的改动落盘,免得丢字),
+// Esc/N 撤掉框子。
+static void quit_confirm_key(int key) {
+    if(key == '\n' || key == '\r') {
+        g_quit_asking = false;
+        if(g_screen == Screen::Editor && g_editor && editor_dirty()) save_editor_text();
+        g_should_quit = true;
+        return;
+    }
+    if(key == 27 || key == 'n' || key == 'N' || key == 'q' || key == 'Q' || key == 0x11) {
+        g_quit_asking = false;
+        if(g_quit_dlg) {
+            lv_obj_delete(g_quit_dlg);
+            g_quit_dlg = nullptr;
+        }
+    }
+}
+
 static void render_editor() {
     clear_root();
     int editor_y = 8;
     int editor_h = 552;
     // 竖排的提示词排在正文右侧的竖列里(见 editor_vt_refresh),不占顶部横条
-    if(!editor_vertical() && g_quick_slot < 0 && g_edit_file.empty() && !g_prompt.empty()) {
+    if(!editor_vertical() && g_quick_slot < 0 && g_file_edit_path.empty() && g_edit_file.empty() && !g_prompt.empty()) {
         lv_obj_t *prompt = label(g_root, "提示: " + g_prompt, 8, 8, 1008, 58);
         lv_label_set_long_mode(prompt, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_color(prompt, g_theme.muted, 0);
@@ -1981,24 +2263,31 @@ static void render_editor() {
     lv_textarea_set_one_line(g_editor, false);
     lv_textarea_set_cursor_click_pos(g_editor, true);
     std::string initial;
+    if(!g_file_edit_path.empty()) initial = read_whole_file(g_file_edit_path);
     if(!g_ol.editPath.empty()) initial = outline_read_file(g_ol.editPath);
     if(g_quick_slot >= 0) {
         ensure_dir_path(quick_dir());
         initial = read_whole_file(quick_file(g_quick_slot));
     }
-    if(initial.empty() && !g_recovery_checked && g_edit_file.empty() && g_quick_slot < 0 && g_ol.editPath.empty()) {
+    if(initial.empty() && !g_recovery_checked && g_edit_file.empty() && g_quick_slot < 0 && g_file_edit_path.empty() && g_ol.editPath.empty()) {
         g_recovery_checked = true;
         if(!g_settings.recovery_draft()) {
             g_journal.clear_recovery_draft();
         } else {
             std::string content, meta;
             if(g_journal.load_recovery_draft(content, meta) && !content.empty()) {
-                initial = content;
-                g_recovery_meta = meta;
+                std::string mode = meta_value(meta, "mode");
+                if(mode.empty() || mode == "journal") {
+                    initial = content;
+                    std::string fn = meta_value(meta, "filename");
+                    g_edit_file = journal_filename_ok(fn) ? fn : "";
+                    g_prompt = meta_value(meta, "prompt");
+                    g_recovery_meta = meta;
+                }
             }
         }
     }
-    if(initial.empty() && !g_edit_file.empty() && g_quick_slot < 0) initial = extract_body(g_journal.read_entry(g_edit_file));
+    if(initial.empty() && !g_edit_file.empty() && g_quick_slot < 0 && g_file_edit_path.empty()) initial = extract_body(g_journal.read_entry(g_edit_file));
     if(!initial.empty()) lv_textarea_set_text(g_editor, initial.c_str());
     lv_obj_add_state(g_editor, LV_STATE_FOCUSED);
     lv_group_focus_obj(g_editor);
@@ -2018,6 +2307,7 @@ static void render_editor() {
     update_ime_bar();
     draw_status_bar(!g_recovery_meta.empty() ? ("已恢复草稿  " + editor_status_text()) : editor_status_text(),
                     false, editor_right_text());
+    draw_file_panel();
     // 重新载入的正文就是"干净"的基准,之后的改动才算未保存
     editor_mark_clean();
     if(g_editor_exit_asking) draw_editor_exit_confirm();
@@ -3219,11 +3509,15 @@ struct SetItem {
 // 枚举型设置的候选值 (存值, 显示名)。空表示非选项字段(文本编辑或跳转)。
 static std::vector<std::pair<std::string, std::string>> setting_options(const std::string &k) {
     if(k == "theme") return {{"dark", "黑底白字"}, {"light", "白底黑字"}};
-    if(k == "app_mode") return {{"journal", "个人日记"}, {"quick", "快捷编辑"}};
+    if(k == "app_mode") return {{"journal", "个人日记"}, {"quick", "快捷编辑"}, {"file", "文件编辑"}};
     if(k == "home_view") return {{"week", "周视图"}, {"month", "月视图"}};
     if(k == "input_mode") return {{"builtin", "内置"}, {"fcitx5_rime", "fcitx5+rime"}};
     if(k == "editor_orientation") return {{"horizontal", "横排"}, {"vertical", "竖排"}};
-    if(k == "editor_mode") return {{"normal", "正常"}, {"typewriter", "打字机"}};
+    if(k == "editor_mode")
+        return {{"normal", "正常"},
+                {"typewriter", "打字机"},
+                {"focus", "聚焦"},
+                {"typewriter_focus", "打字机聚焦"}};
     if(k == "vertical_ref_line_style")
         return {{"solid", "实线"}, {"dash", "虚线"}, {"dot", "点状虚线"}};
     if(k == "md_render" || k == "first_line_indent" || k == "version_history" ||
@@ -3306,11 +3600,14 @@ static std::string vertical_style_label() {
 
 static std::vector<SetItem> settings_items() {
     std::string input = g_settings.input_mode() == "fcitx5_rime" ? "fcitx5+rime" : "内置";
+    std::string appModeLabel = "个人日记";
+    if(g_settings.app_mode() == "quick") appModeLabel = "快捷编辑";
+    else if(g_settings.app_mode() == "file") appModeLabel = "文件编辑";
     IME &ime = IME::getInstance();
     ime.ensureUserDictLoaded();
     std::vector<SetItem> v = {
         {"theme", "主题", g_settings.theme() == "light" ? "白底黑字" : "黑底白字"},
-        {"app_mode", "工作模式", g_settings.app_mode() == "quick" ? "快捷编辑" : "个人日记"},
+        {"app_mode", "工作模式", appModeLabel},
         {"home_view", "主页视图", g_settings.home_view() == "month" ? "月视图" : "周视图"},
         {"font_size", "字号", std::to_string(g_settings.font_size())},
         {"ime_font_size", "输入法字号", std::to_string(g_settings.ime_font_size())},
@@ -3345,7 +3642,7 @@ static std::vector<SetItem> settings_items() {
         if(g_settings.vertical_reference_line())
             v.push_back({"vertical_ref_line_style", "参考线样式", vertical_style_label()});
     }
-    v.push_back({"editor_mode", "编辑模式", g_settings.editor_mode() == "typewriter" ? "打字机" : "正常"});
+    v.push_back({"editor_mode", "编辑模式", editor_mode_label()});
     v.push_back({"dict", "词库管理",
                  "固定 " + std::to_string(ime.userDictSize(IME::FIXED_DICT)) + " / 动态 " +
                      std::to_string(ime.userDictSize(IME::DYNAMIC_DICT))});
@@ -3700,16 +3997,17 @@ static void render_sync() {
 static void render_help() {
     clear_root();
     static const char *help[] = {
-        "主界面: p提示写作 f自由写作 v查看 w同步WebDAV t任务 o大纲 s设置 q退出",
+        "主界面: p提示写作 f自由写作 v查看 w同步WebDAV t任务 o大纲 s设置 Ctrl+Q退出",
         "通用: hjkl/方向键移动 Enter确认 Esc/q返回 Ctrl+I灵感",
         "编辑: Ctrl+S保存 Ctrl+Q退出 Ctrl+A全选 Ctrl+C复制 Ctrl+X剪切 Ctrl+V粘贴",
         "编辑: Ctrl+Z撤销 Ctrl+R重做 Ctrl+Y历史 Ctrl+/查找替换 Ctrl+?帮助",
         "查找: Enter下一处 Ctrl+Enter上一处 Tab切查找/替换 Ctrl+R替换 Ctrl+A全部替换 Esc关闭",
-        "编辑: Ctrl+P生成提示 Ctrl+O润色(有选区只润色选区) Ctrl+F发送Flomo",
+        "编辑: Ctrl+P生成提示(仅日记模式) Ctrl+O润色(有选区只润色选区) Ctrl+F发送Flomo",
         "润色: Shift+方向键/Ctrl+A选文本 Enter应用 R改指令重润色 Esc取消",
         "编辑: Ctrl+T折叠/展开光标所在的标题(Markdown渲染开启时)",
-        "快捷编辑: Ctrl+0-9切换文件 Ctrl+n/p下/上一个 Esc/Ctrl+Q保存并回设置",
-        "输入法: Ctrl+Space开关 候选数字直选 空格首选 方向键/标点翻页",
+        "快捷编辑: F1-F10切换文件 Ctrl+n/p下/上一个 Esc保存并回设置",
+        "文件编辑: Ctrl+E文件面板 a新建 d删除 r改名 Enter编辑",
+        "输入法: Ctrl+Space开关 候选数字直选 空格首选 方向键/无变换/变换/标点翻页",
         "浏览: Enter查看 e编辑 h历史 d删除 Ctrl+F发送Flomo",
         "GTD: 1-5/←→切换视图 a加任务 i子任务 Enter详情 空格切状态 d删除 r重命名",
         "GTD: j/k上移下移 h/l提降层级 z/Z折叠 /筛选 c/t情境标签 s摘要 A归档 E导出 n新项目 ?帮助",
@@ -3744,9 +4042,15 @@ static void render() {
     case Screen::FileMgr: render_filemgr(); break;
     case Screen::Help: render_help(); break;
     }
+    // 退出框不属于任何一屏的渲染函数,clear_root 会把它抹掉,所以在这里补画一次。
+    if(g_quit_asking) draw_quit_confirm();
 }
 
 static void goto_screen(Screen s) {
+    // 只有从「设置外面」进来才更新返回目标;设置自己的子界面退回来时保持不动
+    if(s == Screen::Settings && g_screen != Screen::SettingText && g_screen != Screen::Wifi &&
+       g_screen != Screen::Dict && g_screen != Screen::FileMgr)
+        g_settings_return = g_screen;
     g_prev_screen = g_screen;
     // 离开编辑器时把「大纲正文文件」的路径收回来(进入时保留,供编辑器读取)。
     bool back_from_outline_file = false;
@@ -3815,6 +4119,15 @@ static void save_editor_text() {
     if(!g_editor) return;
     std::string body = lv_textarea_get_text(g_editor);
     if(body.empty()) {
+        if(!g_file_edit_path.empty()) {
+            bool ok = safe_write_file(g_file_edit_path, "");
+            if(ok) {
+                editor_mark_clean();
+                file_edit_set_last(g_file_edit_path.substr(g_file_edit_path.find_last_of('/') + 1));
+            }
+            set_status(ok ? "已保存文件" : "保存文件失败");
+            return;
+        }
         if(!g_ol.editPath.empty()) {
             bool ok = safe_write_file(g_ol.editPath, "");
             if(ok) editor_mark_clean();
@@ -3833,6 +4146,15 @@ static void save_editor_text() {
         bool ok = ensure_dir_path(quick_dir()) && safe_write_file(quick_file(g_quick_slot), body);
         if(ok) editor_mark_clean();
         set_status(ok ? "已保存快捷文件" : "保存快捷文件失败");
+        return;
+    }
+    if(!g_file_edit_path.empty()) {
+        bool ok = safe_write_file(g_file_edit_path, body);
+        if(ok) {
+            editor_mark_clean();
+            file_edit_set_last(g_file_edit_path.substr(g_file_edit_path.find_last_of('/') + 1));
+        }
+        set_status(ok ? "已保存文件" : "保存文件失败");
         return;
     }
     if(!g_ol.editPath.empty()) {
@@ -3858,6 +4180,7 @@ static bool save_editor_text_for_history() {
     if(body.empty()) return false;
     if(!utf8_valid(body)) return false;
     if(g_quick_slot >= 0) return ensure_dir_path(quick_dir()) && safe_write_file(quick_file(g_quick_slot), body);
+    if(!g_file_edit_path.empty()) { safe_write_file(g_file_edit_path, body); return false; }
     if(!g_ol.editPath.empty()) { safe_write_file(g_ol.editPath, body); return false; }
     std::string content = make_journal_text(g_prompt, body);
     if(!g_edit_file.empty()) {
@@ -3897,9 +4220,134 @@ static void open_quick_editor(int slot) {
     if(slot > 9) slot = 9;
     if(g_screen == Screen::Editor && g_quick_slot >= 0) save_editor_text();
     g_quick_slot = slot;
+    g_file_edit_path.clear();
     g_prompt.clear();
     g_edit_file.clear();
     goto_screen(Screen::Editor);
+}
+
+static void open_file_editor(const std::string &name) {
+    if(g_screen == Screen::Editor && !g_file_edit_path.empty()) save_editor_text();
+    file_edit_ensure_default();
+    std::string clean = file_edit_clean_name(name.empty() ? file_edit_last_name() : name);
+    g_file_edit_path = file_edit_path_for(clean);
+    if(!path_is_file(g_file_edit_path)) safe_write_file(g_file_edit_path, "");
+    file_edit_set_last(clean);
+    g_quick_slot = -1;
+    g_prompt.clear();
+    g_edit_file.clear();
+    g_ol.editPath.clear();
+    goto_screen(Screen::Editor);
+}
+
+static void file_panel_begin_prompt(bool rename) {
+    auto &p = g_file_panel_state;
+    p.prompt = true;
+    p.rename = rename;
+    p.confirmDelete = false;
+    p.message.clear();
+    if(rename && !p.entries.empty()) p.input = p.entries[p.sel];
+    else p.input = "untitled.txt";
+    draw_file_panel();
+}
+
+static bool handle_file_panel_key(int key) {
+    auto &p = g_file_panel_state;
+    if(!p.active) return false;
+    if(p.confirmDelete) {
+        if((key == '\n' || key == '\r' || key == 'y' || key == 'Y') && !p.entries.empty()) {
+            std::string name = p.entries[p.sel];
+            std::string path = file_edit_path_for(name);
+            p.message = remove(path.c_str()) == 0 ? "已删除" : "删除失败";
+            file_panel_reload();
+            p.confirmDelete = false;
+        } else if(key == 27 || key == 'n' || key == 'N' || key == 'q' || key == 'Q') {
+            p.confirmDelete = false;
+            p.message = "已取消";
+        }
+        draw_file_panel();
+        return true;
+    }
+    if(p.prompt) {
+        // 文件名也能用中文输入法:面板的输入是一个裸 string(不是 textarea),自己接。
+        // 输入法没开时 handle_key 直接返回 false,下面的 ASCII 分支照旧。
+        if(key == KEY_IME_TOGGLE) {
+            g_linux_ime.toggle();
+            draw_file_panel();
+            update_ime_bar();
+            return true;
+        }
+        std::string ime_out;
+        if(g_linux_ime.handle_key(key, ime_out)) {
+            if(!ime_out.empty()) p.input += ime_out;
+            draw_file_panel();
+            update_ime_bar();
+            return true;
+        }
+        if(key == 27) {
+            p.prompt = false;
+        } else if(key == '\n' || key == '\r') {
+            std::string clean = file_edit_clean_name(p.input);
+            bool ok = false;
+            if(p.rename && !p.entries.empty()) {
+                std::string old = p.entries[p.sel];
+                std::string old_path = file_edit_path_for(old);
+                std::string new_path = file_edit_path_for(clean);
+                if(old != clean && !path_is_file(new_path)) ok = rename(old_path.c_str(), new_path.c_str()) == 0;
+                if(ok && g_file_edit_path == old_path) {
+                    g_file_edit_path = new_path;
+                    file_edit_set_last(clean);
+                }
+            } else {
+                std::string path = file_edit_path_for(clean);
+                if(!path_is_file(path)) ok = safe_write_file(path, "");
+            }
+            p.prompt = false;
+            p.message = ok ? "完成" : "失败";
+            file_panel_reload(clean);
+        } else if(key == 8 || key == 127) {
+            utf8_pop_back(p.input);
+        } else if(key >= 32 && key < 127) {
+            p.input.push_back((char)key);
+        }
+        draw_file_panel();
+        update_ime_bar();
+        return true;
+    }
+    if(key == 0x05 || key == 27 || key == 'q' || key == 'Q') {
+        p.active = false;
+        draw_file_panel();
+        update_ime_bar();
+        return true;
+    }
+    if(key == KEY_UP || key == 'k') {
+        if(p.sel > 0) p.sel--;
+    } else if(key == KEY_DOWN || key == 'j') {
+        if(p.sel < (int)p.entries.size() - 1) p.sel++;
+    } else if(key == 'a' || key == 'A') {
+        file_panel_begin_prompt(false);
+        return true;
+    } else if((key == 'r' || key == 'R') && !p.entries.empty()) {
+        file_panel_begin_prompt(true);
+        return true;
+    } else if((key == 'd' || key == 'D') && !p.entries.empty()) {
+        std::string name = p.entries[p.sel];
+        std::string path = file_edit_path_for(name);
+        if(path == g_file_edit_path) {
+            p.message = "当前文件不可删";
+        } else {
+            p.confirmDelete = true;
+            p.message = "删除 " + name + "?";
+        }
+    } else if((key == '\n' || key == '\r') && !p.entries.empty()) {
+        std::string name = p.entries[p.sel];
+        save_editor_text();
+        p.active = false;
+        open_file_editor(name);
+        return true;
+    }
+    draw_file_panel();
+    return true;
 }
 
 static void insert_utf8(const std::string &s) {
@@ -3929,14 +4377,10 @@ static void handle_main(int key) {
     if(key == '\n' || key == '\r') {
         int idx = (g_journal.total_entries() > 0 || g_main_sel < 2) ? g_main_sel : g_main_sel + 1;
         const Action &a = k_actions[idx];
-        if(a.key == 'p') { g_quick_slot = -1; g_prompt = random_builtin_prompt(); g_edit_file.clear(); goto_screen(Screen::Editor); return; }
-        if(a.key == 'f') { g_quick_slot = -1; g_prompt.clear(); g_edit_file.clear(); goto_screen(Screen::Editor); return; }
+        if(a.key == 'p') { g_quick_slot = -1; g_file_edit_path.clear(); g_prompt = random_builtin_prompt(); g_edit_file.clear(); goto_screen(Screen::Editor); return; }
+        if(a.key == 'f') { g_quick_slot = -1; g_file_edit_path.clear(); g_prompt.clear(); g_edit_file.clear(); goto_screen(Screen::Editor); return; }
         if(a.key == 'v') { g_browser_sel = 0; goto_screen(Screen::Browser); return; }
         goto_screen(a.screen);
-        return;
-    }
-    if(key == 'q' || key == 'Q') {
-        g_should_quit = true;
         return;
     }
     render();
@@ -3950,7 +4394,7 @@ static void handle_browser(int key) {
     if(g_browser_sel >= (int)g_entries.size()) g_browser_sel = (int)g_entries.size() - 1;
     if(g_entries.empty()) { goto_screen(Screen::Main); return; }
     if(key == '\n' || key == '\r') { g_view_file = g_entries[g_browser_sel].filename; g_viewer_scroll = 0; goto_screen(Screen::Viewer); return; }
-    if(key == 'e' || key == 'E') { g_quick_slot = -1; g_edit_file = g_entries[g_browser_sel].filename; g_prompt.clear(); goto_screen(Screen::Editor); return; }
+    if(key == 'e' || key == 'E') { g_quick_slot = -1; g_file_edit_path.clear(); g_edit_file = g_entries[g_browser_sel].filename; g_prompt.clear(); goto_screen(Screen::Editor); return; }
     if(key == 'h' || key == 'H') { open_history(g_entries[g_browser_sel].filename, Screen::Browser); return; }
     if(key == 'd' || key == 'D') { g_journal.delete_entry(g_entries[g_browser_sel].filename); }
     render();
@@ -3965,6 +4409,7 @@ static void handle_history(int key) {
             if(ok) {
                 if(g_history_return == Screen::Editor) {
                     g_quick_slot = -1;
+                    g_file_edit_path.clear();
                     g_edit_file = g_history_file;
                     g_prompt.clear();
                 }
@@ -4032,11 +4477,29 @@ static void handle_history(int key) {
     render();
 }
 
+// 设置界面的退出。回到进来时的那个界面:快捷/文件编辑模式下按 Esc 是进来调参数的,
+// 退出要回到原来那个编辑模式和同一个文件,而不是被丢回个人日记——设备常把工作模式设
+// 成 file、当专用编辑器用,一按 Esc 就跳去个人日记很突兀。工作模式若刚在设置里改过,
+// 以新模式为准。
+static void settings_leave() {
+    if(g_settings_return != Screen::Editor) { goto_screen(g_settings_return); return; }
+    const std::string am = g_settings.app_mode();
+    if(am == "journal") {
+        g_quick_slot = -1;
+        g_file_edit_path.clear();
+        goto_screen(Screen::Main);
+        return;
+    }
+    if(am == "quick" && g_quick_slot < 0) { open_quick_editor(0); return; }
+    if(am == "file" && g_file_edit_path.empty()) { open_file_editor(file_edit_last_name()); return; }
+    goto_screen(Screen::Editor);
+}
+
 static void handle_settings(int key) {
     auto items = settings_items();
     if(g_setting_pick_active) {
         int total = (int)g_setting_pick_opts.size();
-        if(key == 27 || key == 0x11 || key == 'q') {
+        if(key == 27 || key == 'q') {
             g_setting_pick_active = false;
             render();
             return;
@@ -4052,7 +4515,7 @@ static void handle_settings(int key) {
         render();
         return;
     }
-    if(key == 'q' || key == 27) { goto_screen(Screen::Main); return; }
+    if(key == 'q' || key == 27) { settings_leave(); return; }
     if(key == KEY_DOWN || key == 'j') g_settings_sel++;
     if(key == KEY_UP || key == 'k') g_settings_sel--;
     if(g_settings_sel < 0) g_settings_sel = 0;
@@ -4107,7 +4570,7 @@ static void handle_setting_text(int key) {
         update_ime_bar();
         return;
     }
-    if(key == 27 || key == 0x11) {
+    if(key == 27) {
         goto_screen(Screen::Settings);
         return;
     }
@@ -5065,6 +5528,7 @@ static void outline_edit_contents(int idx) {
     g_ol.editPath = outline_ensure_content_file(file);
     g_prompt.clear();
     g_quick_slot = -1;
+    g_file_edit_path.clear();
     g_edit_file.clear();
     goto_screen(Screen::Editor);
 }
@@ -5745,7 +6209,7 @@ static void handle_inspiration(int key) {
             update_ime_bar();
             return;
         }
-        if(key == 27 || key == 0x11) {
+        if(key == 27) {
             g_inspiration_mode = InspirationMode::List;
             g_inspiration_edit_idx = -1;
             render();
@@ -6241,6 +6705,79 @@ static void md_push_deco(const std::string &disp, const std::vector<MdPiece> &pi
     }
 }
 
+// ---------------------------------------------------------------------------
+// 聚焦模式:光标行之外的正文压暗
+//
+// 用的是两块半透明底色罩,和下面那套叠加层排版无关,所以 markdown 视图和纯文本
+// textarea 两条渲染路径共用。底色取主题背景色:深色主题下压暗、浅色主题下洗淡,
+// 两边都成立。罩子插在正文层(叠加层/textarea)的紧后面,既盖得住正文,又不会
+// 盖到状态栏和输入法候选条。
+// ---------------------------------------------------------------------------
+static lv_obj_t *focus_dim_obj(int i) {
+    if(g_focus_dim[i]) return g_focus_dim[i];
+    lv_obj_t *o = lv_obj_create(g_root);
+    lv_obj_set_style_radius(o, 0, 0);
+    lv_obj_set_style_border_width(o, 0, 0);
+    lv_obj_set_style_pad_all(o, 0, 0);
+    lv_obj_set_style_shadow_width(o, 0, 0);
+    lv_obj_set_style_bg_color(o, g_theme.bg, 0);
+    lv_obj_set_style_bg_opa(o, LV_OPA_60, 0);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_t *base = g_md_view ? g_md_view : g_editor;
+    if(base) lv_obj_move_to_index(o, (int)lv_obj_get_index(base) + 1);
+    g_focus_dim[i] = o;
+    return o;
+}
+
+// caret / vp 都取绝对坐标(调用方用 lv_obj_get_coords 拿)
+static void focus_dim_update(bool caret_visible, lv_area_t caret, const lv_area_t &vp) {
+    if(!editor_focus() || !caret_visible) {
+        for(lv_obj_t *o : g_focus_dim)
+            if(o) lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    if(caret.y1 < vp.y1) caret.y1 = vp.y1;
+    if(caret.y2 > vp.y2) caret.y2 = vp.y2;
+    // 夹完如果区间反了,说明光标行整个落在视口外(纯文本路径不居中时会这样),
+    // 这时不该留一块「亮带」——两块罩直接全隐,否则整屏都会被压暗
+    bool band_ok = caret.y1 <= caret.y2;
+    for(int i = 0; i < 2; ++i) {
+        lv_obj_t *o = focus_dim_obj(i);
+        int y1 = i == 0 ? vp.y1 : caret.y2 + 1;
+        int y2 = i == 0 ? caret.y1 - 1 : vp.y2;
+        if(!band_ok || y2 < y1) {
+            lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+        lv_obj_set_pos(o, vp.x1, y1);
+        lv_obj_set_size(o, vp.x2 - vp.x1 + 1, y2 - y1 + 1);
+        lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// 当前行的亮带。画在叠加层内容对象的 DRAW_MAIN 里,也就是文字**下面**,所以只染底色
+// 不糊字。单独挂一个回调(而不是塞进 editor_md_draw_deco)是因为只读阅读视图也用了
+// 那个回调,亮带只该出现在编辑器里。
+static void md_focus_band_draw(lv_event_t *e) {
+    if(!g_md_focus_band_on) return;
+    lv_layer_t *layer = lv_event_get_layer(e);
+    lv_obj_t *o = lv_event_get_current_target_obj(e);
+    if(!layer || !o) return;
+    lv_area_t org;
+    lv_obj_get_coords(o, &org);
+    lv_draw_rect_dsc_t dsc;
+    lv_draw_rect_dsc_init(&dsc);
+    dsc.radius = 0;
+    dsc.border_width = 0;
+    dsc.bg_color = g_theme.accent;
+    dsc.bg_opa = LV_OPA_20;
+    lv_area_t r{g_md_focus_band.x1 + org.x1, g_md_focus_band.y1 + org.y1,
+                g_md_focus_band.x2 + org.x1, g_md_focus_band.y2 + org.y1};
+    lv_draw_rect(layer, &dsc, &r);
+}
+
 static void editor_md_create(int x, int y, int w, int h, int content_w) {
     g_md_max_w = content_w > 0 ? content_w : w;
     g_md_view_h = h;
@@ -6268,6 +6805,7 @@ static void editor_md_create(int x, int y, int w, int h, int content_w) {
     // 1px(伪粗体副本)就会触发 AUTO 滚动条,在文字底部画出一条横贯整屏的灰线。
     lv_obj_remove_flag(g_md_content, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(g_md_content, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_add_event_cb(g_md_content, md_focus_band_draw, LV_EVENT_DRAW_MAIN, nullptr);
     lv_obj_add_event_cb(g_md_content, editor_md_draw_deco, LV_EVENT_DRAW_MAIN, nullptr);
 
     g_md_caret = lv_obj_create(g_md_content);
@@ -6298,6 +6836,7 @@ static void editor_md_refresh() {
     g_md_box_rects.clear();
     g_md_dot_rects.clear();
     g_md_wave_rects.clear();
+    g_md_focus_band_on = false;
     int sel_lo = -1, sel_hi = -1;
     if(g_ed_sel_anchor >= 0 && g_ed_sel_anchor != (int)caret_byte) {
         sel_lo = g_ed_sel_anchor < (int)caret_byte ? g_ed_sel_anchor : (int)caret_byte;
@@ -6443,13 +6982,31 @@ static void editor_md_refresh() {
             md_caret_from_pieces(disp, pieces, md_display_offset(d, ml.caret_rel) + indent_bytes, letter_space,
                                  line_h, caret_x, caret_y);
             caret_y += y;
+            if(editor_focus() && !g_search_panel) {
+                g_md_focus_band = {0, y, g_md_max_w - 1, y + h - 1};
+                g_md_focus_band_on = true;
+            }
         }
         y += h;
     }
 
     for(int k = lbi; k < (int)g_md_labels.size(); ++k) lv_obj_add_flag(g_md_labels[k], LV_OBJ_FLAG_HIDDEN);
     for(int k = rbi; k < (int)g_md_rules.size(); ++k) lv_obj_add_flag(g_md_rules[k], LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_height(g_md_content, y > 0 ? y : letter_h);
+    // 打字机模式:光标行钉在「编辑区正中再往上一行」。中线按**编辑区**算(下边取
+    // chrome_bottom()),不含状态栏,不是屏幕正中。
+    // 内容层整体下移 pad、高度也多出这一截,滚动范围因此上下各多出 pad 的空白,
+    // 首行/末行都能落到 target——不留白的话 lv_obj_scroll_to_y 会把滚动量夹进
+    // [0, 内容高-视口高],文首/文末的居中看着就像没生效。pad 的取值是反推出来的:
+    // 末行需要的滚动量 = 可滚上限时刚好够,所以既不浪费空白也不会被夹。
+    bool tw = editor_typewriter();
+    int view_y = (int)lv_obj_get_y(g_md_view);
+    int view_h = g_md_view_h;
+    int center = (view_y + chrome_bottom()) / 2;
+    int target = center - line_h;
+    int pad = tw ? view_y + view_h - center : 0;
+    if(pad < 0) pad = 0;
+    lv_obj_set_pos(g_md_content, 0, pad);
+    lv_obj_set_height(g_md_content, (y > 0 ? y : letter_h) + pad);
     // 滚动范围是按子对象坐标算的,先把这一层排完版再滚动
     lv_obj_update_layout(g_md_view);
 
@@ -6467,12 +7024,35 @@ static void editor_md_refresh() {
     }
 
     if(caret_y >= 0) {
-        int scroll = (int)lv_obj_get_scroll_y(g_md_view);
-        if(g_settings.editor_mode() == "typewriter") scroll = caret_y - g_md_view_h / 2;
-        else if(caret_y - scroll < 0) scroll = caret_y;
-        else if(caret_y + line_h - scroll > g_md_view_h) scroll = caret_y + line_h - g_md_view_h;
+        int scroll;
+        if(tw) {
+            // 正文已经整体下移了 pad,要让光标行顶落在 target,滚这一点就够了
+            scroll = view_y + pad + caret_y - target;
+        } else {
+            scroll = (int)lv_obj_get_scroll_y(g_md_view);
+            if(caret_y - scroll < 0) scroll = caret_y;
+            else if(caret_y + line_h - scroll > g_md_view_h) scroll = caret_y + line_h - g_md_view_h;
+        }
         lv_obj_scroll_to_y(g_md_view, scroll, LV_ANIM_OFF);
     }
+
+    // 聚焦模式:光标行不动,上下盖两块罩把别处压暗。暗罩的「亮带」直接取上面那块亮带
+    // 的几何,而不是去读光标对象的 coords:光标是在这一步之后才 set_pos 的,它的
+    // coords 要等下一次排版才更新,这里读到的会落后一行(实测),亮带和暗罩就会差一行。
+    // 亮带和内容层用的是同一次算出来的行坐标,两者都在内容层局部坐标里,只差一个
+    // 内容层原点,拿它折算绝对坐标最稳。
+    lv_area_t vp {};
+    lv_obj_get_coords(g_md_view, &vp);
+    lv_area_t org {};
+    lv_obj_get_coords(g_md_content, &org);
+    bool caret_on = g_md_focus_band_on && g_md_caret &&
+                    !lv_obj_has_flag(g_md_caret, LV_OBJ_FLAG_HIDDEN);
+    lv_area_t ca = vp;
+    if(caret_on) {
+        ca.y1 = org.y1 + g_md_focus_band.y1;
+        ca.y2 = org.y1 + g_md_focus_band.y2;
+    }
+    focus_dim_update(caret_on, ca, vp);
 }
 
 // ---------------------------------------------------------------------------
@@ -7046,7 +7626,8 @@ static void editor_vt_refresh() {
     g_vt_doc = ml;
 
     int cursorCol = vertical_find_col(data, ml.caret_line, ml.caret_rel);
-    if(g_settings.editor_mode() == "typewriter") {
+    bool tw = editor_typewriter();
+    if(tw) {
         g_vt_scroll = cursorCol - g_vt_m.cols / 2;
     } else {
         if(cursorCol < g_vt_scroll) g_vt_scroll = cursorCol;
@@ -7054,8 +7635,10 @@ static void editor_vt_refresh() {
     }
     int maxScroll = (int)data.cols.size() - g_vt_m.cols;
     if(maxScroll < 0) maxScroll = 0;
-    if(g_settings.editor_mode() != "typewriter" && g_vt_scroll > maxScroll) g_vt_scroll = maxScroll;
-    if(g_vt_scroll < 0) g_vt_scroll = 0;
+    // 打字机模式下上下都不夹:首列/末列也要能停在正中,越界的列由下面的绘制循环
+    // 跳过,自然变成留白(和横排那条走同一个思路)。
+    if(!tw && g_vt_scroll > maxScroll) g_vt_scroll = maxScroll;
+    if(!tw && g_vt_scroll < 0) g_vt_scroll = 0;
 
     int right = g_vt_m.x + g_vt_m.w - g_vt_m.colAdvance;
     int col_h = g_vt_m.rows * g_vt_m.rowAdvance;
@@ -7534,7 +8117,7 @@ static bool polish_panel_key(int key) {
         return true;
     }
     if(key == 'r' || key == 'R') { open_polish_instr(); return true; }
-    if(key == 27 || key == 0x11 || key == 'q' || key == 'Q') {
+    if(key == 27 || key == 'q' || key == 'Q') {
         close_polish_panel();
         set_status(editor_status_text());
         return true;
@@ -7621,14 +8204,43 @@ static void editor_toggle_fold() {
     else editor_md_refresh();
 }
 
-// 打字机模式:光标钉在可视区中间行,随输入滚动。
+// 打字机模式:光标行钉在「编辑区正中再往上一行」,随输入滚动;聚焦模式则在这儿更新压暗罩。
+// 纯文本视图没有叠加层可用,留白做不出来——textarea 的 padding 同时就是裁剪区,上下各留
+// 一截会把视口压成 0,整屏变黑。所以这里的落点要夹进 [0, 可滚距离]:文档首尾那一屏做不到
+// 居中,但也不像以前那样算出负数目标、把内容顶成负偏移,把光标顶到视口外面去。
 static void editor_follow_cursor() {
-    if(!g_editor || g_settings.editor_mode() != "typewriter") return;
+    if(!g_editor || g_md_view || g_vt_view) return;
+    if((int)lv_obj_get_style_pad_top(g_editor, 0) != 0 ||
+       (int)lv_obj_get_style_pad_bottom(g_editor, 0) != 0) {
+        lv_obj_set_style_pad_top(g_editor, 0, 0);
+        lv_obj_set_style_pad_bottom(g_editor, 0, 0);
+    }
     lv_obj_t *ta_label = lv_textarea_get_label(g_editor);
     if(!ta_label) return;
     lv_point_t p {};
     lv_label_get_letter_pos(ta_label, lv_textarea_get_cursor_pos(g_editor), &p);
-    lv_obj_scroll_to_y(g_editor, p.y - lv_obj_get_height(g_editor) / 2, LV_ANIM_OFF);
+    const lv_font_t *f = lv_obj_get_style_text_font(g_editor, 0);
+    int line_h = (f ? lv_font_get_line_height(f) : 0) + (int)lv_obj_get_style_text_line_space(g_editor, 0);
+
+    // 聚焦模式(和 markdown 路径共用同一套罩子):p 是 label 内坐标,label 的屏幕坐标
+    // 已经把滚动算进去了,两者相加就是光标行的绝对位置。打字机模式下要先滚再取坐标,
+    // 否则暗罩会停在滚动之前的位置、和光标差出滚动的量。
+    if(editor_typewriter()) {
+        int view_y = (int)lv_obj_get_y(g_editor);
+        int center = (view_y + chrome_bottom()) / 2;
+        int target = view_y + (int)p.y - (center - line_h);
+        if(target < 0) target = 0;
+        int maxs = (int)lv_obj_get_scroll_bottom(g_editor);
+        if(target > maxs) target = maxs;
+        int cur = (int)lv_obj_get_scroll_y(g_editor);
+        if(cur != target) lv_obj_scroll_by(g_editor, 0, cur - target, LV_ANIM_OFF);
+    }
+
+    lv_area_t vp {}, la {};
+    lv_obj_get_coords(g_editor, &vp);
+    lv_obj_get_coords(ta_label, &la);
+    lv_area_t ca {vp.x1, la.y1 + (int)p.y, vp.x2, la.y1 + (int)p.y + line_h - 1};
+    focus_dim_update(true, ca, vp);
 }
 
 static void handle_editor_keys(int key);
@@ -7638,6 +8250,7 @@ static void handle_editor(int key) {
     if(g_vt_view) editor_vt_refresh();
     else if(g_md_view) editor_md_refresh();
     else { editor_sel_sync_label(); editor_follow_cursor(); }
+    if(g_file_panel_state.active) draw_file_panel();
 }
 
 // 行尾回车时,若当前行是列表项,续行带上递增后的同款标记(空列表项只换行)。
@@ -7669,6 +8282,7 @@ static std::string editor_list_continue() {
 }
 
 static void handle_editor_keys(int key) {
+    if(handle_file_panel_key(key)) return;
     if(g_editor_exit_asking) {
         if(key == '\n' || key == '\r') {
             g_editor_exit_asking = false;
@@ -7677,7 +8291,7 @@ static void handle_editor_keys(int key) {
         } else if(key == 'n' || key == 'N') {
             g_editor_exit_asking = false;
             editor_leave();
-        } else if(key == 27 || key == 'q' || key == 0x11) {
+        } else if(key == 27 || key == 'q') {
             g_editor_exit_asking = false;
             if(g_editor_exit_dlg) {
                 lv_obj_delete(g_editor_exit_dlg);
@@ -7744,6 +8358,15 @@ static void handle_editor_keys(int key) {
     }
     if(key == KEY_HELP) { goto_screen(Screen::Help); return; }
     if(key == KEY_SEARCH) { open_search_panel(); return; }
+    if(key == 0x05 && !g_file_edit_path.empty()) {
+        g_file_panel_state.active = true;
+        g_file_panel_state.prompt = false;
+        g_file_panel_state.confirmDelete = false;
+        g_file_panel_state.message.clear();
+        file_panel_reload();
+        draw_file_panel();
+        return;
+    }
     if(key == 0x13) { save_editor_text(); return; }
     if(key == 0x06) {
         std::string text = g_editor ? lv_textarea_get_text(g_editor) : "";
@@ -7754,7 +8377,7 @@ static void handle_editor_keys(int key) {
         set_status(ok ? msg : msg);
         return;
     }
-    if(key == 0x11 || key == 27) {
+    if(key == 27) {
         editor_exit_target_from_state();
         // 自动保存开着就不用问,内容迟早会落到文件里
         if(editor_dirty() && !g_settings.auto_save()) {
@@ -7768,7 +8391,7 @@ static void handle_editor_keys(int key) {
     }
     if(g_quick_slot >= 0 && key == 0x0E) { open_quick_editor((g_quick_slot + 1) % 10); return; }
     if(g_quick_slot >= 0 && key == 0x10) { open_quick_editor((g_quick_slot + 9) % 10); return; }
-    if(g_quick_slot < 0 && key == 0x10) {
+    if(g_settings.app_mode() == "journal" && key == 0x10) {
         std::string prompt, err;
         set_status("正在生成提示...");
         lv_timer_handler();
@@ -7778,7 +8401,7 @@ static void handle_editor_keys(int key) {
         set_status(editor_status_text());
         return;
     }
-    if(g_quick_slot < 0 && key == 0x0F) { polish_begin(); return; }
+    if(key == 0x0F) { polish_begin(); return; }
     if(key == 0x01 && g_editor) { g_ed_sel_anchor = 0; lv_textarea_set_cursor_pos(g_editor, LV_TEXTAREA_CURSOR_LAST); return; }
     if(key == 0x03 && g_editor) {
         if(g_ed_sel_anchor >= 0) {
@@ -7835,6 +8458,20 @@ static void handle_editor_keys(int key) {
     else if(key == KEY_DOWN) { g_ed_sel_anchor = -1; lv_textarea_cursor_down(g_editor); }
     else if(key == KEY_HOME) { g_ed_sel_anchor = -1; lv_textarea_set_cursor_pos(g_editor, 0); }
     else if(key == KEY_END) { g_ed_sel_anchor = -1; lv_textarea_set_cursor_pos(g_editor, LV_TEXTAREA_CURSOR_LAST); }
+    else if(key == KEY_PAGE_UP || key == KEY_PAGE_DOWN) {
+        // textarea 有焦点时会自己把视图滚回光标处,所以翻页只能靠移光标:一页 = 当前可见行数。
+        g_ed_sel_anchor = -1;
+        const lv_font_t *pf = lv_obj_get_style_text_font(g_editor, LV_PART_MAIN);
+        int lh = pf ? lv_font_get_line_height(pf) : 0;
+        int ls = (int)lv_obj_get_style_text_line_space(g_editor, LV_PART_MAIN);
+        int chh = (int)lv_obj_get_content_height(g_editor);
+        int page = (lh > 0 && chh > 0) ? (chh + ls) / (lh + ls) : 10;
+        if(page < 1) page = 1;
+        for(int i = 0; i < page; ++i) {
+            if(key == KEY_PAGE_UP) lv_textarea_cursor_up(g_editor);
+            else lv_textarea_cursor_down(g_editor);
+        }
+    }
     else if(key == 8 || key == 127) {
         if(g_ed_sel_anchor >= 0) editor_delete_selection();
         else { editor_record_undo(); lv_textarea_delete_char(g_editor); }
@@ -7855,6 +8492,10 @@ static void handle_editor_keys(int key) {
 }
 
 static void handle_key(int key) {
+    // 退出确认框是模态的:吃掉所有按键。Ctrl+Q 在三种工作模式下都灵,也放在最前面,
+    // 免得被下面的输入法/文件槽位快捷键抢走。
+    if(g_quit_asking) { quit_confirm_key(key); return; }
+    if(key == 0x11) { quit_begin(); return; }
     if(g_linux_ime.active()) {
         if(key == KEY_FULLWIDTH_TOGGLE) {
             g_linux_ime.toggle_fullwidth();
@@ -7872,7 +8513,7 @@ static void handle_key(int key) {
             return;
         }
     }
-    if(key >= KEY_FILE_BASE && key <= KEY_FILE_BASE + 9) {
+    if(g_settings.app_mode() == "quick" && key >= KEY_FILE_BASE && key <= KEY_FILE_BASE + 9) {
         open_quick_editor(key - KEY_FILE_BASE);
         return;
     }
@@ -7885,7 +8526,7 @@ static void handle_key(int key) {
     case Screen::Browser: handle_browser(key); break;
     case Screen::Viewer:
         if(key == 'q' || key == 27) goto_screen(Screen::Browser);
-        else if(key == 'e' || key == 'E') { g_quick_slot = -1; g_edit_file = g_view_file; g_prompt.clear(); goto_screen(Screen::Editor); }
+        else if(key == 'e' || key == 'E') { g_quick_slot = -1; g_file_edit_path.clear(); g_edit_file = g_view_file; g_prompt.clear(); goto_screen(Screen::Editor); }
         else if(key == 'h' || key == 'H') { open_history(g_view_file, Screen::Viewer); }
         else if(key == KEY_DOWN || key == 'j') { g_viewer_scroll++; render(); }
         else if(key == KEY_UP || key == 'k') { g_viewer_scroll--; render(); }
@@ -7935,6 +8576,10 @@ void app_ui_create() {
         open_quick_editor(0);
         return;
     }
+    if(g_settings.app_mode() == "file") {
+        open_file_editor(file_edit_last_name());
+        return;
+    }
     render();
 }
 
@@ -7952,6 +8597,14 @@ void app_ui_tick() {
         }
     }
     if(g_screen != Screen::Editor || !g_editor) return;
+    if(!g_file_edit_path.empty()) {
+        if(g_settings.auto_save() && editor_dirty()) save_editor_text();
+        return;
+    }
+    if(g_quick_slot >= 0) {
+        if(g_settings.auto_save() && editor_dirty()) save_editor_text();
+        return;
+    }
     if(!g_ol.editPath.empty()) return;  // 大纲正文文件不做草稿恢复
     uint32_t now = lv_tick_get();
     if(g_next_recovery_ms != 0 && (int32_t)(now - g_next_recovery_ms) < 0) return;
@@ -7985,6 +8638,7 @@ void app_ui_tick() {
     if(!g_settings.recovery_draft()) return;
 
     std::string meta;
+    meta += "mode=journal\n";
     meta += "filename=" + g_edit_file + "\n";
     meta += "prompt=" + g_prompt + "\n";
     meta += "timestamp=" + std::to_string((long long)time(nullptr)) + "\n";
