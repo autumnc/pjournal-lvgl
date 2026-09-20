@@ -26,18 +26,20 @@ public:
     lv_font_t *current() const { return current_; }
     int current_size() const { return current_size_; }
     std::string current_path() const { return current_path_; }
-    std::string fallback_path() const { return fallback_path_; }
     ~FontManager();
 
 private:
     lv_font_t *create(const std::string &path, int size, FontStyle style);
-    std::string pick_fallback(const std::string &primary);
+    lv_font_t *create_one(const std::string &path, int size, FontStyle style);
+    std::vector<std::string> pick_fallbacks(const std::string &primary) const;
+    std::vector<std::string> pick_wide(const std::string &primary) const;
+    std::string pick_symbol(const std::string &primary) const;
     std::vector<FontInfo> fonts_;
     std::map<std::tuple<std::string, int, int>, lv_font_t *> loaded_;
     lv_font_t *current_ = nullptr;
     int current_size_ = 0;
     std::string current_path_;
-    std::string fallback_path_;
+    std::vector<std::string> fallback_chain_;
     bool fallback_resolved_ = false;
 };
 
