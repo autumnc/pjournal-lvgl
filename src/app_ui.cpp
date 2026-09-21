@@ -26,6 +26,7 @@
 #include <src/misc/lv_text_private.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -89,7 +90,8 @@ static lv_style_t g_style;
 static lv_obj_t *g_root = nullptr;
 static lv_obj_t *g_status = nullptr;
 static lv_obj_t *g_status_right = nullptr;  // 状态栏右侧靠右对齐的那半
-static Screen g_screen = Screen::Main;
+// 输入线程(eveb 那条路)会读它判断「现在是不是主页」,主线程天天在写,用原子量。
+static std::atomic<Screen> g_screen{Screen::Main};
 static Screen g_prev_screen = Screen::Main;
 // 进设置界面之前是哪个界面。设置下面挂着一串子界面(文本编辑框、WiFi、词库、文件管理),
 // 它们退回设置时也走 goto_screen(Settings),不能用 g_prev_screen 记,否则会被顶成那个
@@ -397,7 +399,8 @@ static std::vector<IME::UserEntryView> g_dict_entries;
 static lv_obj_t *g_dict_text = nullptr;
 static std::string g_sync_message;
 static bool g_sync_done = false;
-static bool g_should_quit = false;
+// 输入线程里按 Q 会直接写它,主循环每 5ms 读一次,必须是原子量
+static std::atomic<bool> g_should_quit{false};
 static lv_font_t *g_ui_font = nullptr;
 static lv_font_t *g_icon_font = nullptr;
 static lv_font_t *g_editor_font = nullptr;
@@ -773,7 +776,7 @@ static bool deepseek_chat(const std::string &body, std::string &out, std::string
         "-H", "Authorization: Bearer " + key,
         "--data-binary", "@" + path,
         "https://api.deepseek.com/chat/completions",
-    });
+    }, 60000);
     remove(path.c_str());
     out = extract_deepseek_content(response);
     if(out.empty()) {
@@ -890,7 +893,7 @@ static bool flomo_send_text(const std::string &text, std::string &msg) {
         "-H", "Authorization: Bearer " + token,
         "--data-binary", "@" + path,
         "https://flomoapp.com/api/v1/memo",
-    });
+    }, 60000);
     remove(path.c_str());
     if(response.find("\"code\":0") != std::string::npos) {
         msg = "已发送到Flomo";
@@ -932,7 +935,7 @@ static bool flomo_generate_token(std::string &msg) {
         "-H", "Content-Type: application/json",
         "--data-binary", "@" + path,
         "https://flomoapp.com/api/v1/user/login_by_email",
-    });
+    }, 45000);
     remove(path.c_str());
     // {"code":0,"data":{"access_token":"..."}}
     std::string token;
@@ -8068,6 +8071,12 @@ static void editor_apply_polish(const std::string &text) {
     std::string s = t ? t : "";
     editor_record_undo();
     if(hi > lo) {
+        // hi 来自 editor_sel_range(),它不夹取;文本被截短过而锚点还留着时 hi 会越过
+        // 末尾,s.substr 会抛 std::out_of_range → terminate → 控制台留在 KD_GRAPHICS。
+        // 和 editor_selected_text() 一样先夹一次。
+        if(lo < 0) lo = 0;
+        if(hi > (int)s.size()) hi = (int)s.size();
+        if(hi < lo) hi = lo;
         s = s.substr(0, (size_t)lo) + text + s.substr((size_t)hi);
         g_ed_sel_anchor = -1;
         lv_textarea_set_text(g_editor, s.c_str());

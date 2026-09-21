@@ -118,7 +118,10 @@ bool WifiManager::connect_psk(const std::string &ssid, const std::string &passwo
     save_config(message);
 
     std::string iface = iface_.empty() ? g_settings.wlan_interface() : iface_;
-    process::run_capture({"dhcpcd", "-n", iface});
+    // dhcpcd -n 会一直等到拿到地址(或者它自己那套很长的重试超时用完)。这里必须封顶:
+    // 它是从主线程调过来的,无限等就是界面冻住。到点没拿到就当作「正在连接」,让状态
+    // 栏自己慢慢刷。
+    process::run_capture({"dhcpcd", "-n", iface}, 45000);
 
     WifiStatus st = status();
     message = st.connected ? ("已连接 " + st.ssid + " " + st.ip) : "正在连接";

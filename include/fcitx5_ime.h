@@ -4,6 +4,7 @@
 #include <lvgl.h>
 
 #include <cstdint>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -72,6 +73,7 @@ private:
     static void on_timer_trampoline(lv_timer_t *);
 
     bool send_key(uint32_t sym, uint32_t state);
+    void connect_worker();
     void drain();
     void refresh_current_schema();
     void on_signal(const char *name, GVariant *params);
@@ -80,6 +82,23 @@ private:
     void on_service_lost();
 
     GDBusConnection *_conn = nullptr;
+    // g_bus_get_sync 没有超时参数:session bus 那个 daemon 一卡住它就永远不返回。而
+    // begin() 是跑在 lv_timer_handler 里的(还握着 lv_lock),一卡整个界面就再也回不来
+    // —— 这正是「卡死」那类症状。所以建连接丢给一条 worker 线程,主线程只来取结果,
+    // 取不到就当作「还没有输入法」照常跑。
+    //
+    // _connecting 保证最多只有一条 worker 在飞。真卡死的那条**不会**被反复重启:glib
+    // 自己给 g_bus_get 加了全局锁和缓存,再起一条也只是堵在同一把锁上,只会攒线程。
+    // 代价是 session bus 彻底坏掉时输入法就一直不可用 —— 但那是很明确的降级,比冻屏好。
+    std::atomic<GDBusConnection *> _pending_conn{nullptr};
+    std::atomic<bool> _connecting{false};
+    // 兜底定时器。没连上时按 100ms 跑(pump() 是来收 worker 建好的连接的地方,周期太长
+    // 会让「启动后马上打字」那段时间没有输入法),连上后退回 1000ms 只用来发现掉线。
+    lv_timer_t *_timer = nullptr;
+    // 重连退避:连续失败 1s→2s→4s…最多 30s。失败时那一串同步 D-Bus 往返(每个都压着
+    // lv_lock)不该每秒重来一遍。
+    int _retry_backoff = 0;
+    uint32_t _next_retry_ms = 0;
     guint _sig = 0;
     // NameOwnerChanged 的订阅;一直挂着(服务重启后还要靠它再发现一次),所以不跟着
     // _sig 一起退。

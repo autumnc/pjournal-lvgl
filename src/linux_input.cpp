@@ -1,6 +1,7 @@
 #include "linux_input.h"
 
 #include <lvgl.h>
+#include <src/osal/lv_os.h>
 
 #include <atomic>
 #include <cstdint>
@@ -156,7 +157,15 @@ static void dispatch_key_async(void *p) {
 }
 
 static void dispatch_key(int key) {
-    if(key) lv_async_call(dispatch_key_async, (void *)(intptr_t)key);
+    if(!key) return;
+    // 这里跑在输入线程上,而 lv_async_call → lv_timer_create → lv_ll_ins_head 是往
+    // lv_timer_handler 正在遍历的那条定时器链表里**无锁插节点**(lv_timer_handler 全程
+    // 握着 lv_lock)。控制台模式下最多 18 条输入线程同时按,链表被改坏的几率很高,
+    // 表现为 lv_timer_handler 里遍历走不出来 —— 界面冻死、进程还活着。
+    // 必须和 lv_timer_handler 用同一把锁。
+    lv_lock();
+    lv_async_call(dispatch_key_async, (void *)(intptr_t)key);
+    lv_unlock();
 }
 
 static bool read_byte(int fd, uint8_t &ch) {

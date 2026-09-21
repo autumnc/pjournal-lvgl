@@ -44,6 +44,19 @@ static void append_auth(std::vector<std::string> &args) {
     }
 }
 
+// 每个 curl 都要带超时。不带的话网络一断它就一直挂着,而 run_capture 是在主线程上
+// 调的 —— 界面当场冻住。--connect-timeout 管连不上, --max-time 管整体(含慢速传输)。
+// kCurlTimeoutMs 是给 run_capture 的上限,比 curl 自己的松一点:正常情况该由 curl 先
+// 超时退出,run_capture 那层只是兜住「curl 自己也卡住」的极端情况。
+static constexpr int kCurlTimeoutMs = 70000;
+
+static void append_net_opts(std::vector<std::string> &args) {
+    args.push_back("--connect-timeout");
+    args.push_back("10");
+    args.push_back("--max-time");
+    args.push_back("60");
+}
+
 static std::string remote_url(const std::string &path) {
     return base_url() + "/" + path;
 }
@@ -108,9 +121,10 @@ static std::string tag_value(const std::string &block, const std::string &tag) {
 static std::vector<RemoteFile> list_remote() {
     std::vector<RemoteFile> out;
     std::vector<std::string> args = {"curl", "-sS", "-X", "PROPFIND", "-H", "Depth: 1"};
+    append_net_opts(args);
     append_auth(args);
     args.push_back(remote_url("journal/"));
-    std::string xml = process::run_capture(args);
+    std::string xml = process::run_capture(args, kCurlTimeoutMs);
     size_t pos = 0;
     while(true) {
         size_t a = xml.find("<", pos);
@@ -142,33 +156,37 @@ static std::vector<RemoteFile> list_remote() {
 
 static bool curl_mkcol() {
     std::vector<std::string> args = {"curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "-X", "MKCOL"};
+    append_net_opts(args);
     append_auth(args);
     args.push_back(remote_url("journal/"));
-    std::string code = trim(process::run_capture(args));
+    std::string code = trim(process::run_capture(args, kCurlTimeoutMs));
     return code == "201" || code == "405" || code == "301" || code == "302";
 }
 
 static bool curl_upload(const std::string &filename, const std::string &local_path) {
     std::vector<std::string> args = {"curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "-X", "PUT", "-T", local_path};
+    append_net_opts(args);
     append_auth(args);
     args.push_back(remote_url("journal/" + filename));
-    std::string code = trim(process::run_capture(args));
+    std::string code = trim(process::run_capture(args, kCurlTimeoutMs));
     return code == "200" || code == "201" || code == "204";
 }
 
 static bool curl_download(const std::string &filename, const std::string &out_path) {
     std::vector<std::string> args = {"curl", "-sS", "-L", "-o", out_path, "-w", "%{http_code}"};
+    append_net_opts(args);
     append_auth(args);
     args.push_back(remote_url("journal/" + filename));
-    std::string code = trim(process::run_capture(args));
+    std::string code = trim(process::run_capture(args, kCurlTimeoutMs));
     return code == "200" || code == "203";
 }
 
 static bool curl_delete(const std::string &filename) {
     std::vector<std::string> args = {"curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "-X", "DELETE"};
+    append_net_opts(args);
     append_auth(args);
     args.push_back(remote_url("journal/" + filename));
-    std::string code = trim(process::run_capture(args));
+    std::string code = trim(process::run_capture(args, kCurlTimeoutMs));
     return code == "200" || code == "202" || code == "204" || code == "404";
 }
 

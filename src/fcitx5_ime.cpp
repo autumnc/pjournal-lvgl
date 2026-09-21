@@ -6,6 +6,7 @@
 #include <dirent.h>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -166,15 +167,21 @@ std::vector<std::string> read_candidates(GVariant *arr) {
 }
 
 GVariant *bus_call(GDBusConnection *conn, const char *path, const char *iface,
-                   const char *method, GVariant *params, const GVariantType *reply) {
+                   const char *method, GVariant *params, const GVariantType *reply,
+                   int timeout_ms = 3000) {
     if(!conn) return nullptr;
     GError *err = nullptr;
     GVariant *r = g_dbus_connection_call_sync(conn, kService, path, iface, method, params,
-                                              reply, G_DBUS_CALL_FLAGS_NONE, 3000, nullptr,
-                                              &err);
+                                              reply, G_DBUS_CALL_FLAGS_NONE, timeout_ms,
+                                              nullptr, &err);
     if(!r && err) g_error_free(err);
     return r;
 }
+
+// begin() 那串调用的超时。它们跑在 lv_timer_handler 里、压着 lv_lock,fcitx5 活着但
+// 不吭声时每一个都要等满超时 —— 默认 3s × 5 个就是十几秒的冻屏。连接阶段的调用全部
+// 按这个短超时走,失败的交给 pump() 的退避去重试。
+constexpr int kConnectTimeoutMs = 1200;
 
 // 发一次键。返回值是 fcitx5 说的「这个键我吃了没有」——没吃的话我们交回给 app 自己
 // 插字符,所以英文直通、光标键、退格这些不用前端再判一遍。
@@ -262,8 +269,7 @@ bool Fcitx5Ime::begin() {
     if(connected()) return true;
     // 兜底定时器要先建:begin() 失败(fcitx5 比 app 起得晚)时后面每个 return false 都会
     // 直接跳出去,把定时器留在最后建就永远没人重试了。
-    static lv_timer_t *timer = nullptr;
-    if(!timer) timer = lv_timer_create(&Fcitx5Ime::on_timer_trampoline, 1000, nullptr);
+    if(!_timer) _timer = lv_timer_create(&Fcitx5Ime::on_timer_trampoline, 100, nullptr);
     // 会话 bus 本身断了(session 挂了)连订阅全废,得整个重来;只是 fcitx5 重启的话
     // 连接还活着,走下面 NameOwnerChanged 那条路清 IC 就够了。
     if(_conn && g_dbus_connection_is_closed(_conn)) {
@@ -281,10 +287,14 @@ bool Fcitx5Ime::begin() {
     const char *addr = g_getenv("DBUS_SESSION_BUS_ADDRESS");
     if(!addr || !*addr) return false;
 
-    GError *err = nullptr;
-    if(!_conn) _conn = g_bus_get_sync(G_BUS_TYPE_SESSION, nullptr, &err);
+    // worker 线程建好的连接在这里取走。取走之后这条连接的引用只归主线程管。
     if(!_conn) {
-        if(err) g_error_free(err);
+        GDBusConnection *ready = _pending_conn.exchange(nullptr);
+        if(ready) _conn = ready;
+    }
+    // 还没取到就把活派出去,begin() 自己这一步不阻塞。下次 pump() 再来收。
+    if(!_conn) {
+        if(!_connecting.exchange(true)) std::thread(&Fcitx5Ime::connect_worker, this).detach();
         return false;
     }
 
@@ -292,7 +302,8 @@ bool Fcitx5Ime::begin() {
     g_variant_builder_init(&b, G_VARIANT_TYPE("a(ss)"));
     g_variant_builder_add(&b, "(ss)", "program", "pjournal-lvgl");
     GVariant *r = bus_call(_conn, kImPath, kImIface, "CreateInputContext",
-                           g_variant_new("(a(ss))", &b), G_VARIANT_TYPE("(oay)"));
+                           g_variant_new("(a(ss))", &b), G_VARIANT_TYPE("(oay)"),
+                           kConnectTimeoutMs);
     if(!r) return false;
     const gchar *path = nullptr;
     GVariant *uuid = nullptr;
@@ -319,11 +330,13 @@ bool Fcitx5Ime::begin() {
     // 不报 ClientSideInputPanel 能力,fcix5 就自己画候选框(这台机器上没有能画的 UI),
     // UpdateClientSideUI 也不会发过来。
     bus_call(_conn, _ic_path.c_str(), kIcIface, "SetCapability",
-             g_variant_new("(t)", (guint64)kCapClientSideInputPanel), nullptr);
+             g_variant_new("(t)", (guint64)kCapClientSideInputPanel), nullptr,
+             kConnectTimeoutMs);
     // IC 默认可能落在 keyboard-us 上,显式指到 rime。
     bus_call(_conn, kControllerPath, kControllerIface, "SetCurrentIM",
-             g_variant_new("(s)", "rime"), nullptr);
-    bus_call(_conn, _ic_path.c_str(), kIcIface, "FocusIn", nullptr, nullptr);
+             g_variant_new("(s)", "rime"), nullptr, kConnectTimeoutMs);
+    bus_call(_conn, _ic_path.c_str(), kIcIface, "FocusIn", nullptr, nullptr,
+             kConnectTimeoutMs);
     drain();
     refresh_current_schema();
     return true;
@@ -333,7 +346,7 @@ bool Fcitx5Ime::begin() {
 // 它会被 update_ime_bar() → refresh_ime_status() 每个按键调一次。
 void Fcitx5Ime::refresh_current_schema() {
     GVariant *c = bus_call(_conn, kRimePath, kRimeIface, "GetCurrentSchema", nullptr,
-                           G_VARIANT_TYPE("(s)"));
+                           G_VARIANT_TYPE("(s)"), kConnectTimeoutMs);
     const gchar *name = nullptr;
     if(c) {
         g_variant_get(c, "(&s)", &name);
@@ -342,14 +355,46 @@ void Fcitx5Ime::refresh_current_schema() {
     }
 }
 
+// 只在 worker 线程上跑。g_bus_get_sync 是这里唯一一个没有超时的调用,把整条 UI 线程
+// 压在它上面风险太大 —— 见头文件里 _pending_conn 那段说明。
+void Fcitx5Ime::connect_worker() {
+    GError *err = nullptr;
+    GDBusConnection *c = g_bus_get_sync(G_BUS_TYPE_SESSION, nullptr, &err);
+    if(err) g_error_free(err);
+    // 极端情况下可能已经有别的连接躺在那儿(理论上不会,留着防漏)。
+    GDBusConnection *old = _pending_conn.exchange(c);
+    if(old) g_object_unref(old);
+    _connecting.store(false);
+}
+
 void Fcitx5Ime::on_timer_trampoline(lv_timer_t *) {
     fcitx5_ime().pump();
 }
 
 // 兜底:主循环之外的事件(掉线、fcitx5 比 app 起得晚)靠这个一秒钟一次的定时器收。
+// 连不上就退避,别每秒都去敲一遍 bus:begin() 那串同步调用是压着 lv_lock 跑的,
+// fcitx5 一直不在时会变成周期性卡顿。
 void Fcitx5Ime::pump() {
     drain();
-    if(!connected()) begin();
+    if(connected()) {
+        _retry_backoff = 0;
+        _next_retry_ms = 0;
+        // 连上之后定时器退回 1 秒:它的活只剩「发现掉线」了。(这版 LVGL 没有
+        // lv_timer_get_period,set_period 也只是个赋值,直接写就行。)
+        if(_timer) lv_timer_set_period(_timer, 1000);
+        return;
+    }
+    uint32_t now = lv_tick_get();
+    if(_next_retry_ms != 0 && (int32_t)(now - _next_retry_ms) < 0) return;
+    if(begin()) {
+        _retry_backoff = 0;
+        _next_retry_ms = 0;
+        return;
+    }
+    int ms = _retry_backoff > 0 ? _retry_backoff * 2 : 1000;
+    if(ms > 30000) ms = 30000;
+    _retry_backoff = ms;
+    _next_retry_ms = now + (uint32_t)ms;
 }
 
 void Fcitx5Ime::on_signal_trampoline(GDBusConnection *, const char *, const char *,

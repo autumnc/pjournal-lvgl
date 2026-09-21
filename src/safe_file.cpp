@@ -55,7 +55,7 @@ std::string read_whole_file(const std::string &path) {
 static bool flush_close(FILE *f) {
     bool ok = fflush(f) == 0;
     int fd = fileno(f);
-    if(fd >= 0 && fsync(fd) != 0) {
+    if(ok && fd >= 0 && fsync(fd) != 0) {
         /* Some flash-backed filesystems report fsync oddly; fflush success is
          * enough to proceed, mirroring the ESP version's recovery behavior. */
     }
@@ -74,8 +74,11 @@ bool safe_write_file(const std::string &path, const std::string &content) {
 
     FILE *f = fopen(tmp.c_str(), "wb");
     if(!f) return false;
+    // 不能写成 `if(!wrote || !flush_close(f))`:短路求值会让 fwrite 失败时跳过
+    // flush_close,fclose 永远不执行 —— 每失败一次就漏一个 fd(闪存写满时会累积到耗尽)。
     const bool wrote = fwrite(content.data(), 1, content.size(), f) == content.size();
-    if(!wrote || !flush_close(f)) {
+    const bool flushed = flush_close(f);
+    if(!wrote || !flushed) {
         remove(tmp.c_str());
         return false;
     }

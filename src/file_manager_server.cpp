@@ -23,6 +23,7 @@
 #include <map>
 #include <string>
 #include <sys/time.h>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -30,10 +31,18 @@ namespace {
 
 std::atomic<bool> g_running{false};
 std::atomic<int> g_listen_fd{-1};
+std::atomic<int> g_active_conns{0};
 std::thread g_accept_thread;
 uint16_t g_port = 8080;
 std::string g_root;  // 服务根目录:日记目录,请求路径必须落在它下面
 std::string g_root_real;
+
+// 同时处理的连接数上限。每个连接一条 detached 线程,而客户端连上之后什么都不发
+// (或者慢慢读)时线程会一直占着 —— 没有上限的话线程数、fd 数会一路涨到把整台机器
+// 耗干。到顶就直接拒绝新连接。
+constexpr int kMaxConns = 16;
+// 一个连接最多等多久收数据。不加这个,一条不发字的连接能把线程永远占住。
+constexpr int kRecvTimeoutSec = 10;
 
 // ── 基础工具 ─────────────────────────────────────────────────────────────
 
@@ -390,8 +399,14 @@ void put_u32(uint8_t *buf, uint32_t v) {
     buf[3] = (uint8_t)(v >> 24);
 }
 
+// 目录树的递归深度上限。目录里放一个指回自己的符号链接(loop -> .)就能让
+// collect_files 无限递归 —— 每层都算「目录」不计进 MAX_ZIP_FILES,所以那两道
+// 数量上限拦不住,最后是爆栈 SIGSEGV。划一个深度就断掉了。
+constexpr int kMaxZipDepth = 24;
+
 void collect_files(const std::string &dir_path, const std::string &base_path,
-                   std::vector<ZipEntry> &entries, uint64_t &total_size) {
+                   std::vector<ZipEntry> &entries, uint64_t &total_size, int depth = 0) {
+    if(depth > kMaxZipDepth) return;
     DIR *dir = opendir(dir_path.c_str());
     if(!dir) return;
     struct dirent *ent;
@@ -405,7 +420,7 @@ void collect_files(const std::string &dir_path, const std::string &base_path,
         std::string real;
         if(!real_path(full, real) || !path_within_root(real)) continue;
         if(S_ISDIR(st.st_mode)) {
-            collect_files(full, rel, entries, total_size);
+            collect_files(full, rel, entries, total_size, depth + 1);
         } else if(rel.size() <= 0xFFFF) {
             if(total_size + (uint64_t)st.st_size > MAX_ZIP_TOTAL_SIZE) continue;
             ZipEntry e;
@@ -778,6 +793,31 @@ void serve_connection(Conn &conn) {
     else respond(fd, "404 Not Found", "text/plain; charset=utf-8", "not found");
 }
 
+// 一条连接的全部工作,跑在它自己的 detached 线程里。**不能往外抛异常** ——
+// detached 线程的顶层漏出异常会直接 std::terminate → abort,控制台就留在
+// KD_GRAPHICS 上:屏幕冻在最后一帧、键盘全进看不见的 shell。
+void serve_conn_thread(int fd) {
+    Conn conn;
+    conn.fd = fd;
+    // 客户端连上却不发数据是很常见的(扫描器、被中断的浏览器),没有超时的话
+    // recv 会永远阻塞,这条线程连同 fd 就一直挂着。
+    struct timeval tv {kRecvTimeoutSec, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    try {
+        serve_connection(conn);
+    } catch(...) {
+        // 只丢这一个连接,别让整个 app 陪葬。
+    }
+    // 客户端只发了部分正文(如上传被拒)时,直接 close 会发 RST 丢掉响应;
+    // 先把半关闭并读干净残留数据再关闭。
+    shutdown(fd, SHUT_WR);
+    struct timeval drain {2, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &drain, sizeof(drain));
+    char tmp[4096];
+    while(recv(fd, tmp, sizeof(tmp), 0) > 0) {}
+    close(fd);
+}
+
 void accept_loop() {
     while(g_running.load()) {
         int listen_fd = g_listen_fd.load();
@@ -785,21 +825,26 @@ void accept_loop() {
         int fd = accept(listen_fd, nullptr, nullptr);
         if(fd < 0) {
             if(!g_running.load()) break;
+            // fd 耗尽(EMFILE/ENFILE)时立刻重试会变成死循环,把 CPU 烧满。
+            usleep(20000);
             continue;
         }
-        std::thread([fd]() {
-            Conn conn;
-            conn.fd = fd;
-            serve_connection(conn);
-            // 客户端只发了部分正文(如上传被拒)时,直接 close 会发 RST 丢掉响应;
-            // 先把半关闭并读干净残留数据再关闭。
-            shutdown(fd, SHUT_WR);
-            struct timeval tv {2, 0};
-            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            char tmp[4096];
-            while(recv(fd, tmp, sizeof(tmp), 0) > 0) {}
+        if(g_active_conns.load() >= kMaxConns) {
             close(fd);
-        }).detach();
+            continue;
+        }
+        g_active_conns.fetch_add(1);
+        try {
+            std::thread([fd]() {
+                serve_conn_thread(fd);
+                g_active_conns.fetch_sub(1);
+            }).detach();
+        } catch(const std::system_error &) {
+            // 线程起不来(资源耗尽)。异常从这里冲出去就是 terminate,把连接关掉、
+            // 计数还回去,继续服务别的请求。
+            g_active_conns.fetch_sub(1);
+            close(fd);
+        }
     }
 }
 
