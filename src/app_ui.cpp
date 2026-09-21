@@ -2037,6 +2037,28 @@ static void ime_bar_layout_vertical() {
     lv_obj_set_size(g_ime_bar, box_w, box_h);
 }
 
+// LVGL 的 textarea 把「把光标滚进可视区」整个做成了 LV_ANIM_ON(见 lv_textarea.c 的
+// lv_textarea_set_cursor_pos,纵向那两条 lv_obj_scroll_to_y(..., LV_ANIM_ON)),要一百多
+// 毫秒才走完。而候选条的位置是紧接着按键处理算的,这时读到的 label 坐标还是**滚动之前**
+// 的 —— 「下面还放不放得下」就是在旧位置上判断的:框会挑错边,还会咬进光标行里。
+// 这里照 LVGL 那两条纵向判断把滚动一次性钉到终点(LV_ANIM_OFF 会顺手删掉在飞的那条滚动
+// 动画),量出来的才是光标行的最终位置。只做纵向,横向不影响候选条。
+static void textarea_snap_cursor_scroll(lv_obj_t *ta) {
+    lv_obj_t *label = lv_textarea_get_label(ta);
+    if(!label) return;
+    lv_point_t p {};
+    lv_label_get_letter_pos(label, lv_textarea_get_cursor_pos(ta), &p);
+    const lv_font_t *f = lv_obj_get_style_text_font(ta, LV_PART_MAIN);
+    int fh = f ? lv_font_get_line_height(f) : 0;
+    int content_h = (int)lv_obj_get_content_height(ta);
+    if(p.y < (int)lv_obj_get_scroll_top(ta)) {
+        lv_obj_scroll_to_y(ta, p.y, LV_ANIM_OFF);
+    }
+    if(p.y + fh - (int)lv_obj_get_scroll_top(ta) > content_h) {
+        lv_obj_scroll_to_y(ta, p.y - content_h + fh, LV_ANIM_OFF);
+    }
+}
+
 static void update_ime_bar() {
     create_ime_bar();
     if(!g_ime_bar) return;
@@ -2070,29 +2092,56 @@ static void update_ime_bar() {
 
     int x = 12;
     int y = 500;
+    // 光标那一行的行顶/行底(屏幕坐标)和行距。候选条只按这几个数定位。
+    int line_top = -1;
+    int line_pitch = 0;
     lv_obj_t *ta = active_textarea();
+    // 打字机模式下编辑器的滚动由 editor_follow_cursor() 用 LV_ANIM_OFF 自己管,而且它
+    // 是在 update_ime_bar() 之后才跑的 —— 这里别去动它。
+    if(ta && !(ta == g_editor && editor_typewriter())) textarea_snap_cursor_scroll(ta);
     if(ta) {
         lv_obj_t *ta_label = lv_textarea_get_label(ta);
         if(ta_label) {
+            // 必须用 lv_obj_get_coords() 的**绝对**坐标,不能用 lv_obj_get_y()。
+            // lv_obj_get_y() 会把自己父对象的滚动量加回去(见 lv_obj_pos.c),把滚动
+            // 抵消掉,量出来的是「文档坐标」——正文滚到第 40 行时光标那一行算出 1368,
+            // 早跑到屏幕外面去了。lv_obj_get_coords() 拿到的是加上滚动之后的屏幕坐标
+            // (滚到底时 label 的 y1 是负的),和 editor_follow_cursor() 用的是同一套。
+            lv_area_t ta_area {}, la_area {};
+            lv_obj_get_coords(ta, &ta_area);
+            lv_obj_get_coords(ta_label, &la_area);
             lv_point_t p {};
             lv_label_get_letter_pos(ta_label, lv_textarea_get_cursor_pos(ta), &p);
-            x = lv_obj_get_x(ta) + lv_obj_get_x(ta_label) + p.x;
+            x = la_area.x1 + p.x;
+            line_top = la_area.y1 + p.y;
             const lv_font_t *af = active_text_font(ta);
             int fh = af ? lv_font_get_line_height(af) : g_settings.font_size();
-            y = lv_obj_get_y(ta) + lv_obj_get_y(ta_label) + p.y + fh + 14;
-            lv_obj_t *parent = lv_obj_get_parent(ta);
-            while(parent && parent != g_root) {
-                x += lv_obj_get_x(parent);
-                y += lv_obj_get_y(parent);
-                parent = lv_obj_get_parent(parent);
-            }
+            line_pitch = fh + (int)lv_obj_get_style_text_line_space(ta, 0);
         }
     }
     if(x < 8) x = 8;
     if(x > 360) x = 360;
-    int bh = ime_bar_h();
-    if(y + bh > chrome_bottom()) y -= 58;  // 光标太靠下就挪到上一行
-    if(y < 8) y = 8;
+
+    const int bh = ime_bar_h();
+    const int cb = chrome_bottom();
+    if(line_top >= 0 && line_pitch > 0) {
+        // 按整行摆,不按像素微调:下方放得下就让框顶对齐**下一行的行顶**,放不下
+        // (光标已经压到正文可视区底边)就整条翻上去,让框底对齐**光标行的行顶**。
+        // 两种情况都不许咬进光标行 —— 差几像素的 gap 在不同字号下就会变成「压掉
+        // 四分之一行」,所以这里用行距而不是常数。
+        int below = line_top + line_pitch;
+        if(below + bh <= cb) {
+            y = below;
+        } else {
+            y = line_top - bh;
+            if(y < 8) y = 8;  // 可视区窄到两头都放不下时的兜底,正常轮不到
+        }
+    } else {
+        // 没有光标可跟(面板、非编辑器界面),维持老位置,别越过 chrome_bottom
+        // —— 越过去就被状态栏盖住,等于没有。
+        if(y + bh > cb) y = cb - bh;
+        if(y < 8) y = 8;
+    }
 
     // 框宽不预设上限,由 ime_bar_layout_horizontal 按内容算完再把 x 往左挪到屏内
     ime_bar_layout_horizontal(x, y, 1016 - 16);
