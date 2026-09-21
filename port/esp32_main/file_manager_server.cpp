@@ -39,18 +39,68 @@ static std::string urlDecode(const char *src) {
 static bool safeUploadName(const std::string &name) {
     if (name.empty() || name == "." || name == "..") return false;
     for (unsigned char c : name) {
-        if (c == '/' || c == '\\' || c < 0x20 || c == 0x7f) return false;
+        if (c == '/' || c == '\\' || c == '"' || c == '\'' || c < 0x20 || c == 0x7f) return false;
     }
     return true;
 }
 
 static bool isSafePath(const std::string &path) {
-    if (path.find("..") != std::string::npos) return false;
-    // /sdcard must be the mount root itself or followed by '/', otherwise
-    // "/sdcard2/..." would bypass the check.
-    if (path.compare(0, 7, "/sdcard") != 0) return false;
-    if (path.size() > 7 && path[7] != '/') return false;
+    if (path.empty() || path[0] != '/') return false;
+    std::vector<std::string> parts;
+    size_t pos = 0;
+    while (pos < path.size()) {
+        size_t slash = path.find('/', pos);
+        if (slash == std::string::npos) slash = path.size();
+        std::string seg = path.substr(pos, slash - pos);
+        if (seg == "..") return false;
+        if (!seg.empty() && seg != ".") parts.push_back(seg);
+        pos = slash + 1;
+    }
+    if (parts.empty() || parts[0] != "sdcard") return false;
     return true;
+}
+
+static bool splitChildPath(const std::string &path, std::string &parent, std::string &name) {
+    std::string p = path;
+    while (p.size() > 1 && p.back() == '/') p.pop_back();
+    size_t slash = p.rfind('/');
+    if (slash == std::string::npos || slash == 0) {
+        parent = slash == 0 ? "/" : "";
+        name = slash == 0 ? p.substr(1) : p;
+    } else {
+        parent = p.substr(0, slash);
+        name = p.substr(slash + 1);
+    }
+    return isSafePath(parent) && safeUploadName(name);
+}
+
+static std::string jsonEscape(const std::string &s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        if (c == '"' || c == '\\') {
+            out += '\\';
+            out += (char)c;
+        } else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else if (c == '\t') out += "\\t";
+        else if (c < 0x20) {
+            char buf[8];
+            snprintf(buf, sizeof(buf), "\\u%04x", c);
+            out += buf;
+        } else {
+            out += (char)c;
+        }
+    }
+    return out;
+}
+
+static std::string headerFilename(std::string s) {
+    for (char &c : s) {
+        unsigned char uc = (unsigned char)c;
+        if (c == '"' || c == '\\' || c == '/' || c == '\r' || c == '\n' || uc < 0x20 || uc == 0x7f) c = '_';
+    }
+    return s.empty() ? "download" : s;
 }
 
 static std::string formatSize(off_t size) {
@@ -69,7 +119,7 @@ static void sendJsonOK(httpd_req_t *req) {
 static void sendJsonError(httpd_req_t *req, const char *msg) {
     httpd_resp_set_type(req, "application/json");
     char buf[256];
-    snprintf(buf, sizeof(buf), "{\"ok\":false,\"error\":\"%s\"}", msg);
+    snprintf(buf, sizeof(buf), "{\"ok\":false,\"error\":\"%s\"}", jsonEscape(msg).c_str());
     httpd_resp_sendstr(req, buf);
 }
 
@@ -221,17 +271,23 @@ function loadDir(p){
   curPath=p;
   fetch('/api/list?path='+encodeURIComponent(p),{headers:hd()}).then(r=>r.json()).then(d=>{
     document.getElementById('breadcrumb').textContent=d.path;
-    var h='';
-    if(d.path!=='/sdcard') h+='<tr><td class="dir" onclick="loadDir(\''+esc(p.replace(/\/[^/]+$/,''))+'\')">..</td><td></td><td></td></tr>';
+    var body=document.getElementById('list');body.textContent='';
+    function cell(tr,t,c){var td=document.createElement('td');td.textContent=t||'';if(c)td.className=c;tr.appendChild(td);return td}
+    function btn(td,t,fn){var b=document.createElement('button');b.textContent=t;b.addEventListener('click',fn);td.appendChild(b)}
+    if(d.path!=='/sdcard'){var tr=document.createElement('tr');var td=cell(tr,'..','dir');td.addEventListener('click',()=>loadDir(p.replace(/\/[^/]+$/,'')));cell(tr,'');cell(tr,'');body.appendChild(tr)}
     d.entries.forEach(e=>{
-      var fp=esc((d.path==='/'?'':d.path)+'/'+e.name);
-      if(e.type==='dir') h+='<tr><td class="dir" onclick="loadDir(\''+fp+'\')">'+esc(e.name)+'/</td><td></td><td class="act"><button onclick="dlDir(\''+fp+'\')">下载</button><button onclick="del(\''+fp+'\',true)">删除</button></td></tr>';
-      else h+='<tr><td>'+esc(e.name)+'</td><td>'+e.size+'</td><td class="act"><button onclick="dl(\''+fp+'\')">下载</button><button onclick="del(\''+fp+'\',false)">删除</button></td></tr>';
+      var fp=(d.path==='/'?'':d.path)+'/'+e.name;
+      var tr=document.createElement('tr');
+      var name=cell(tr,e.name+(e.type==='dir'?'/':''),e.type==='dir'?'dir':'');
+      if(e.type==='dir') name.addEventListener('click',()=>loadDir(fp));
+      cell(tr,e.type==='dir'?'':e.size);
+      var act=cell(tr,'','act');
+      if(e.type==='dir') btn(act,'下载',()=>dlDir(fp)); else btn(act,'下载',()=>dl(fp));
+      btn(act,'删除',()=>del(fp,e.type==='dir'));
+      body.appendChild(tr);
     });
-    document.getElementById('list').innerHTML=h;
   }).catch(e=>showMsg('加载失败',false));
 }
-function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/'/g,'&#39;')}
 function upload(){
   var f=document.getElementById('fileInput').files[0];if(!f)return;
   var fd=new FormData();fd.append('file',f);
@@ -284,7 +340,7 @@ static esp_err_t __attribute__((unused)) handler_list(httpd_req_t *req) {
     }
 
     std::string json = "{\"path\":\"";
-    json += path;
+    json += jsonEscape(path);
     json += "\",\"entries\":[";
 
     struct dirent *ent;
@@ -302,11 +358,7 @@ static esp_err_t __attribute__((unused)) handler_list(httpd_req_t *req) {
         if (!first) json += ",";
         first = false;
         json += "{\"name\":\"";
-        // escape JSON string
-        for (const char *p = ent->d_name; *p; p++) {
-            if (*p == '"' || *p == '\\') json += '\\';
-            json += *p;
-        }
+        json += jsonEscape(ent->d_name);
         json += "\",\"type\":\"";
         json += isDir ? "dir" : "file";
         json += "\",\"size\":\"";
@@ -349,6 +401,7 @@ static esp_err_t __attribute__((unused)) handler_download(httpd_req_t *req) {
     std::string filename = path;
     auto slash = filename.rfind('/');
     if (slash != std::string::npos) filename = filename.substr(slash + 1);
+    filename = headerFilename(filename);
 
     httpd_resp_set_type(req, "application/octet-stream");
     char hdr[128];
@@ -394,6 +447,7 @@ static esp_err_t __attribute__((unused)) handler_download_dir(httpd_req_t *req) 
     std::string dirName = path;
     auto slash = dirName.rfind('/');
     if (slash != std::string::npos) dirName = dirName.substr(slash + 1);
+    dirName = headerFilename(dirName);
     uint64_t totalSize = 0;
     auto mtx = JournalStorage::sdMutex();
     if (mtx) xSemaphoreTakeRecursive(mtx, portMAX_DELAY);
@@ -645,21 +699,13 @@ static esp_err_t __attribute__((unused)) handler_upload(httpd_req_t *req) {
             window.erase(0, writeNow);
         }
     }
-    // Body ended without the closing boundary — flush whatever is buffered.
-    if (ok && !inHeader && !done && !window.empty()) {
-        if (mtx) xSemaphoreTakeRecursive(mtx, portMAX_DELAY);
-        if (fwrite(window.data(), 1, window.size(), f) != window.size()) ok = false;
-        if (mtx) xSemaphoreGiveRecursive(mtx);
-        written += window.size();
-        window.clear();
-    }
     if (mtx) xSemaphoreTakeRecursive(mtx, portMAX_DELAY);
     fflush(f);
     fsync(fileno(f));
     fclose(f);
     if (mtx) xSemaphoreGiveRecursive(mtx);
 
-    if (!ok) {
+    if (!ok || !done) {
         remove(tmpPath.c_str());   // discard the partial file
         sendJsonError(req, "upload failed");
         return ESP_OK;
@@ -682,7 +728,7 @@ static esp_err_t __attribute__((unused)) handler_delete(httpd_req_t *req) {
     if (!authOk(req)) return sendAuthError(req);
     std::string path = getQueryParam(req, "path");
     std::string dirFlag = getQueryParam(req, "dir");
-    if (!isSafePath(path)) {
+    if (!isSafePath(path) || path == "/sdcard") {
         sendJsonError(req, "invalid path");
         return ESP_OK;
     }
@@ -710,7 +756,8 @@ static esp_err_t __attribute__((unused)) handler_delete(httpd_req_t *req) {
 static esp_err_t __attribute__((unused)) handler_mkdir(httpd_req_t *req) {
     if (!authOk(req)) return sendAuthError(req);
     std::string path = getQueryParam(req, "path");
-    if (!isSafePath(path)) {
+    std::string parent, name;
+    if (!splitChildPath(path, parent, name)) {
         sendJsonError(req, "invalid path");
         return ESP_OK;
     }

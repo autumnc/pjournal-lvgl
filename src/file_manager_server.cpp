@@ -1,10 +1,12 @@
 #include "file_manager_server.h"
 
+#include "safe_file.h"
 #include "settings.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <limits.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -31,6 +33,7 @@ std::atomic<int> g_listen_fd{-1};
 std::thread g_accept_thread;
 uint16_t g_port = 8080;
 std::string g_root;  // 服务根目录:日记目录,请求路径必须落在它下面
+std::string g_root_real;
 
 // ── 基础工具 ─────────────────────────────────────────────────────────────
 
@@ -67,7 +70,7 @@ std::string url_decode(const std::string &src) {
 bool safe_upload_name(const std::string &name) {
     if(name.empty() || name == "." || name == "..") return false;
     for(unsigned char c : name) {
-        if(c == '/' || c == '\\' || c < 0x20 || c == 0x7f) return false;
+        if(c == '/' || c == '\\' || c == '"' || c == '\'' || c < 0x20 || c == 0x7f) return false;
     }
     return true;
 }
@@ -91,6 +94,14 @@ std::string json_escape(const std::string &s) {
     return out;
 }
 
+std::string header_filename(std::string s) {
+    for(char &c : s) {
+        unsigned char uc = (unsigned char)c;
+        if(c == '"' || c == '\\' || c == '/' || c == '\r' || c == '\n' || uc < 0x20 || uc == 0x7f) c = '_';
+    }
+    return s.empty() ? "download" : s;
+}
+
 std::string format_size(off_t size) {
     char buf[32];
     if(size < 1024) snprintf(buf, sizeof(buf), "%lld B", (long long)size);
@@ -99,27 +110,39 @@ std::string format_size(off_t size) {
     return buf;
 }
 
-// 只允许访问根目录内的路径;先归一化再比较前缀,避免 "/root/pjournal2" 混入。
+bool path_within_root(const std::string &real) {
+    if(g_root_real.empty()) return false;
+    if(real == g_root_real) return true;
+    return real.size() > g_root_real.size() && real.compare(0, g_root_real.size(), g_root_real) == 0 &&
+           real[g_root_real.size()] == '/';
+}
+
+bool real_path(const std::string &path, std::string &out) {
+    char buf[PATH_MAX];
+    if(realpath(path.c_str(), buf) == nullptr) return false;
+    out = buf;
+    return true;
+}
+
+// 只允许访问根目录内的真实路径,避免 symlink 把下载/删除带到根目录外。
 bool is_safe_path(const std::string &path) {
-    if(path.empty() || path[0] != '/') return false;
-    if(g_root.empty()) return false;
-    std::vector<std::string> parts;
-    size_t i = 0;
-    while(i < path.size()) {
-        size_t j = path.find('/', i);
-        if(j == std::string::npos) j = path.size();
-        std::string seg = path.substr(i, j - i);
-        if(seg == "..") return false;
-        if(!seg.empty() && seg != ".") parts.push_back(seg);
-        i = j + 1;
+    if(path.empty() || path[0] != '/' || path.find('\0') != std::string::npos) return false;
+    std::string real;
+    return real_path(path, real) && path_within_root(real);
+}
+
+bool split_child_path(const std::string &path, std::string &parent, std::string &name) {
+    std::string p = path;
+    while(p.size() > 1 && p.back() == '/') p.pop_back();
+    size_t slash = p.rfind('/');
+    if(slash == std::string::npos || slash == 0) {
+        parent = slash == 0 ? "/" : "";
+        name = slash == 0 ? p.substr(1) : p;
+    } else {
+        parent = p.substr(0, slash);
+        name = p.substr(slash + 1);
     }
-    std::string norm = "/";
-    for(size_t k = 0; k < parts.size(); ++k) {
-        if(k) norm += '/';
-        norm += parts[k];
-    }
-    if(norm == g_root) return true;
-    return norm.size() > g_root.size() && norm.compare(0, g_root.size(), g_root) == 0 && norm[g_root.size()] == '/';
+    return is_safe_path(parent) && safe_upload_name(name);
 }
 
 // ── 内嵌页面 ─────────────────────────────────────────────────────────────
@@ -159,7 +182,7 @@ th{background:#f5f5f5;font-weight:600}
 <table><thead><tr><th>名称</th><th>大小</th><th>操作</th></tr></thead>
 <tbody id="list"></tbody></table>
 <script>
-var ROOT='__ROOT__';
+var ROOT=__ROOT_JSON__;
 var curPath=ROOT;
 var token='';try{token=localStorage.getItem('pjournal_token')||''}catch(e){}
 function hd(){return token?{'X-Auth-Token':token}:{}}
@@ -169,17 +192,23 @@ function loadDir(p){
   curPath=p;
   fetch('/api/list?path='+encodeURIComponent(p),{headers:hd()}).then(r=>r.json()).then(d=>{
     document.getElementById('breadcrumb').textContent=d.path;
-    var h='';
-    if(d.path!==ROOT) h+='<tr><td class="dir" onclick="loadDir(\''+esc(p.replace(/\/[^/]*$/,''))+'\')">..</td><td></td><td></td></tr>';
+    var body=document.getElementById('list');body.textContent='';
+    function cell(tr,t,c){var td=document.createElement('td');td.textContent=t||'';if(c)td.className=c;tr.appendChild(td);return td}
+    function btn(td,t,fn){var b=document.createElement('button');b.textContent=t;b.addEventListener('click',fn);td.appendChild(b)}
+    if(d.path!==ROOT){var tr=document.createElement('tr');var td=cell(tr,'..','dir');td.addEventListener('click',()=>loadDir(p.replace(/\/[^/]*$/,'')));cell(tr,'');cell(tr,'');body.appendChild(tr)}
     d.entries.forEach(e=>{
-      var fp=esc((d.path==='/'?'':d.path)+'/'+e.name);
-      if(e.type==='dir') h+='<tr><td class="dir" onclick="loadDir(\''+fp+'\')">'+esc(e.name)+'/</td><td></td><td class="act"><button onclick="dlDir(\''+fp+'\')">下载</button><button onclick="del(\''+fp+'\',true)">删除</button></td></tr>';
-      else h+='<tr><td>'+esc(e.name)+'</td><td>'+e.size+'</td><td class="act"><button onclick="dl(\''+fp+'\')">下载</button><button onclick="del(\''+fp+'\',false)">删除</button></td></tr>';
+      var fp=(d.path==='/'?'':d.path)+'/'+e.name;
+      var tr=document.createElement('tr');
+      var name=cell(tr,e.name+(e.type==='dir'?'/':''),e.type==='dir'?'dir':'');
+      if(e.type==='dir') name.addEventListener('click',()=>loadDir(fp));
+      cell(tr,e.type==='dir'?'':e.size);
+      var act=cell(tr,'','act');
+      if(e.type==='dir') btn(act,'下载',()=>dlDir(fp)); else btn(act,'下载',()=>dl(fp));
+      btn(act,'删除',()=>del(fp,e.type==='dir'));
+      body.appendChild(tr);
     });
-    document.getElementById('list').innerHTML=h;
   }).catch(e=>showMsg('加载失败',false));
 }
-function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/'/g,'&#39;')}
 function upload(){
   var f=document.getElementById('fileInput').files[0];if(!f)return;
   var fd=new FormData();fd.append('file',f);
@@ -373,9 +402,12 @@ void collect_files(const std::string &dir_path, const std::string &base_path,
         std::string rel = base_path.empty() ? ent->d_name : base_path + "/" + ent->d_name;
         struct stat st;
         if(stat(full.c_str(), &st) != 0) continue;
+        std::string real;
+        if(!real_path(full, real) || !path_within_root(real)) continue;
         if(S_ISDIR(st.st_mode)) {
             collect_files(full, rel, entries, total_size);
         } else if(rel.size() <= 0xFFFF) {
+            if(total_size + (uint64_t)st.st_size > MAX_ZIP_TOTAL_SIZE) continue;
             ZipEntry e;
             e.rel_path = rel;
             e.size = (uint32_t)st.st_size;
@@ -397,8 +429,9 @@ uint64_t zip_out_size(const std::vector<ZipEntry> &entries) {
 void handle_index(int fd) {
     std::string page = HTML_PAGE;
     size_t pos;
-    while((pos = page.find("__ROOT__")) != std::string::npos)
-        page.replace(pos, 8, g_root);
+    std::string root_json = "\"" + json_escape(g_root) + "\"";
+    while((pos = page.find("__ROOT_JSON__")) != std::string::npos)
+        page.replace(pos, 13, root_json);
     respond(fd, "200 OK", "text/html; charset=utf-8", page);
 }
 
@@ -453,7 +486,7 @@ void handle_download(int fd, const Request &req) {
         respond(fd, "500 Internal Server Error", "text/plain", "cannot open file");
         return;
     }
-    std::string filename = path.substr(path.rfind('/') + 1);
+    std::string filename = header_filename(path.substr(path.rfind('/') + 1));
     std::string head = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n";
     head += "Content-Length: " + std::to_string((long long)st.st_size) + "\r\n";
     head += "Content-Disposition: attachment; filename=\"" + filename + "\"\r\n";
@@ -481,7 +514,7 @@ void handle_download_dir(int fd, const Request &req) {
         respond(fd, "404 Not Found", "text/plain", "not found");
         return;
     }
-    std::string dir_name = path.substr(path.rfind('/') + 1);
+    std::string dir_name = header_filename(path.substr(path.rfind('/') + 1));
     std::vector<ZipEntry> entries;
     uint64_t total_size = 0;
     collect_files(path, "", entries, total_size);
@@ -661,7 +694,7 @@ bool save_upload_body(Conn &conn, const Request &req, const std::string &tmp_pat
     fflush(f);
     fsync(fileno(f));
     fclose(f);
-    return ok;
+    return ok && done;
 }
 
 void handle_upload(int fd, Conn &conn, const Request &req) {
@@ -716,7 +749,8 @@ void handle_delete(int fd, const Request &req) {
 
 void handle_mkdir(int fd, const Request &req) {
     std::string path = get_query_param(req, "path");
-    if(!is_safe_path(path)) {
+    std::string parent, name;
+    if(!split_child_path(path, parent, name)) {
         respond_json_error(fd, "invalid path");
         return;
     }
@@ -775,6 +809,9 @@ bool file_manager_server_start(uint16_t port) {
     if(g_running.load()) return true;
     g_root = g_settings.journal_dir();
     while(g_root.size() > 1 && g_root.back() == '/') g_root.pop_back();
+    if(!ensure_dir_path(g_root)) return false;
+    if(!real_path(g_root, g_root_real)) return false;
+    g_root = g_root_real;
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if(fd < 0) return false;
