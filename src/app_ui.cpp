@@ -244,6 +244,15 @@ static std::vector<lv_area_t> g_md_dot_rects;  // 着重号小方点(==高亮==)
 static lv_obj_t *g_focus_dim[2] = {nullptr, nullptr};  // 聚焦模式:光标行上下的压暗罩
 static lv_area_t g_md_focus_band {};                   // 聚焦模式:当前行的亮带(内容层坐标)
 static bool g_md_focus_band_on = false;
+// 叠加层光标那一行的屏幕几何,给候选条定位用。叠加层的光标是自己画的一个小方块,位置
+// 要等下一次排版才反映到 coords 上(见下面暗罩那段注释),事后再去量会差一次排版;更要命
+// 的是打字机模式:叠加层把光标行钉在正中,底下那个 textarea 只做「滚进可视区」,两者滚动量
+// 完全不是一回事 —— 按 textarea 量出来的行在屏幕上方老远,候选条就跟着飘上去了。所以在
+// editor_md_refresh() 排版的时候顺手记下来(那时行坐标和滚动量都是现成的)。
+// top < 0 表示这一帧没有可跟的光标,调用方回退到原来的 textarea 那条路。
+static int g_md_caret_line_x = 0;      // 光标行的行首(屏幕 x)
+static int g_md_caret_line_top = -1;   // 光标行的行顶(屏幕 y)
+static int g_md_caret_line_pitch = 0;  // 行距 = 行高 + line_space
 
 static std::string meta_value(const std::string &meta, const char *key) {
     std::string prefix = std::string(key) + "=";
@@ -1710,6 +1719,8 @@ static void clear_root() {
     g_focus_dim[0] = nullptr;
     g_focus_dim[1] = nullptr;
     g_md_focus_band_on = false;
+    g_md_caret_line_top = -1;
+    g_md_caret_line_pitch = 0;
     g_md_labels.clear();
     g_md_rules.clear();
     g_md_sel_rects.clear();
@@ -2096,27 +2107,37 @@ static void update_ime_bar() {
     int line_top = -1;
     int line_pitch = 0;
     lv_obj_t *ta = active_textarea();
-    // 打字机模式下编辑器的滚动由 editor_follow_cursor() 用 LV_ANIM_OFF 自己管,而且它
-    // 是在 update_ime_bar() 之后才跑的 —— 这里别去动它。
-    if(ta && !(ta == g_editor && editor_typewriter())) textarea_snap_cursor_scroll(ta);
-    if(ta) {
-        lv_obj_t *ta_label = lv_textarea_get_label(ta);
-        if(ta_label) {
-            // 必须用 lv_obj_get_coords() 的**绝对**坐标,不能用 lv_obj_get_y()。
-            // lv_obj_get_y() 会把自己父对象的滚动量加回去(见 lv_obj_pos.c),把滚动
-            // 抵消掉,量出来的是「文档坐标」——正文滚到第 40 行时光标那一行算出 1368,
-            // 早跑到屏幕外面去了。lv_obj_get_coords() 拿到的是加上滚动之后的屏幕坐标
-            // (滚到底时 label 的 y1 是负的),和 editor_follow_cursor() 用的是同一套。
-            lv_area_t ta_area {}, la_area {};
-            lv_obj_get_coords(ta, &ta_area);
-            lv_obj_get_coords(ta_label, &la_area);
-            lv_point_t p {};
-            lv_label_get_letter_pos(ta_label, lv_textarea_get_cursor_pos(ta), &p);
-            x = la_area.x1 + p.x;
-            line_top = la_area.y1 + p.y;
-            const lv_font_t *af = active_text_font(ta);
-            int fh = af ? lv_font_get_line_height(af) : g_settings.font_size();
-            line_pitch = fh + (int)lv_obj_get_style_text_line_space(ta, 0);
+    if(ta == g_editor && g_md_view && !g_search_panel && g_md_caret_line_top >= 0) {
+        // Markdown 叠加层:可见的正文是叠加层自己排的,底下那个 textarea 是盖住的,只
+        // 用来存文本。打字机模式把光标行钉在正中,textarea 那边只做「滚进可视区」,两者
+        // 的滚动量根本不是一回事 —— 按 textarea 量出来的行在屏幕上方老远,候选条就飘上
+        // 去了。这里直接用 editor_md_refresh() 排版时记下的光标行几何(见它的注释)。
+        x = g_md_caret_line_x;
+        line_top = g_md_caret_line_top;
+        line_pitch = g_md_caret_line_pitch;
+    } else {
+        // 打字机模式下编辑器的滚动由 editor_follow_cursor() 用 LV_ANIM_OFF 自己管,而且它
+        // 是在 update_ime_bar() 之后才跑的 —— 这里别去动它。
+        if(ta && !(ta == g_editor && editor_typewriter())) textarea_snap_cursor_scroll(ta);
+        if(ta) {
+            lv_obj_t *ta_label = lv_textarea_get_label(ta);
+            if(ta_label) {
+                // 必须用 lv_obj_get_coords() 的**绝对**坐标,不能用 lv_obj_get_y()。
+                // lv_obj_get_y() 会把自己父对象的滚动量加回去(见 lv_obj_pos.c),把滚动
+                // 抵消掉,量出来的是「文档坐标」——正文滚到第 40 行时光标那一行算出 1368,
+                // 早跑到屏幕外面去了。lv_obj_get_coords() 拿到的是加上滚动之后的屏幕坐标
+                // (滚到底时 label 的 y1 是负的),和 editor_follow_cursor() 用的是同一套。
+                lv_area_t ta_area {}, la_area {};
+                lv_obj_get_coords(ta, &ta_area);
+                lv_obj_get_coords(ta_label, &la_area);
+                lv_point_t p {};
+                lv_label_get_letter_pos(ta_label, lv_textarea_get_cursor_pos(ta), &p);
+                x = la_area.x1 + p.x;
+                line_top = la_area.y1 + p.y;
+                const lv_font_t *af = active_text_font(ta);
+                int fh = af ? lv_font_get_line_height(af) : g_settings.font_size();
+                line_pitch = fh + (int)lv_obj_get_style_text_line_space(ta, 0);
+            }
         }
     }
     if(x < 8) x = 8;
@@ -7045,6 +7066,7 @@ static void editor_md_refresh() {
 
     int lbi = 0, rbi = 0, y = 0;
     int caret_x = -1, caret_y = -1;
+    int caret_line_y = -1;  // 光标那一行的行顶(内容层局部坐标),给候选条定位用
     for(size_t i = 0; i < nlines; ++i) {
         if(hidden[i]) continue;
         MdRender d = md_build_line(lines[i], in_code[i] != 0, ((int)i == ml.caret_line) ? ml.caret_rel : -1);
@@ -7129,6 +7151,7 @@ static void editor_md_refresh() {
             md_caret_from_pieces(disp, pieces, md_display_offset(d, ml.caret_rel) + indent_bytes, letter_space,
                                  line_h, caret_x, caret_y);
             caret_y += y;
+            caret_line_y = y;
             if(editor_focus() && !g_search_panel) {
                 g_md_focus_band = {0, y, g_md_max_w - 1, y + h - 1};
                 g_md_focus_band_on = true;
@@ -7146,6 +7169,8 @@ static void editor_md_refresh() {
     // [0, 内容高-视口高],文首/文末的居中看着就像没生效。pad 的取值是反推出来的:
     // 末行需要的滚动量 = 可滚上限时刚好够,所以既不浪费空白也不会被夹。
     bool tw = editor_typewriter();
+    // 光标画不画得出来只看这两条,和聚焦模式的亮带是两回事(亮带只在聚焦模式下有)
+    bool caret_shown = caret_y >= 0 && !g_search_panel;
     int view_y = (int)lv_obj_get_y(g_md_view);
     int view_h = g_md_view_h;
     int center = (view_y + chrome_bottom()) / 2;
@@ -7158,7 +7183,7 @@ static void editor_md_refresh() {
     lv_obj_update_layout(g_md_view);
 
     if(g_md_caret) {
-        if(caret_y >= 0 && !g_search_panel) {
+        if(caret_shown) {
             if(caret_x > g_md_max_w - 2) caret_x = g_md_max_w - 2;
             if(caret_x < 0) caret_x = 0;
             lv_obj_remove_flag(g_md_caret, LV_OBJ_FLAG_HIDDEN);
@@ -7200,6 +7225,17 @@ static void editor_md_refresh() {
         ca.y2 = org.y1 + g_md_focus_band.y2;
     }
     focus_dim_update(caret_on, ca, vp);
+
+    // 光标行的屏幕几何,给候选条定位用。行坐标和上面那块亮带是同一份(都在内容层局部
+    // 坐标里),内容层的原点已经把重排的 pad 和这次的滚动都算进去了,加一下就成绝对坐标。
+    if(caret_shown) {
+        g_md_caret_line_x = org.x1 + caret_x;
+        g_md_caret_line_top = org.y1 + caret_line_y;
+        g_md_caret_line_pitch = line_h;
+    } else {
+        g_md_caret_line_top = -1;
+        g_md_caret_line_pitch = 0;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -8403,6 +8439,10 @@ static void handle_editor(int key) {
     if(g_vt_view) editor_vt_refresh();
     else if(g_md_view) editor_md_refresh();
     else { editor_sel_sync_label(); editor_follow_cursor(); }
+    // 候选条得按「这一键之后」的光标行摆:编辑器是在上面这几步才滚到新位置的(叠加层
+    // 还趁排版顺手记下光标行的屏幕坐标),而 handle_editor_keys() 里那次 update_ime_bar()
+    // 跑在前面,读到的还是滚之前的位置。没组字就没什么可摆的,省下这一次调用。
+    if(g_linux_ime.composing()) update_ime_bar();
     if(g_file_panel_state.active) draw_file_panel();
 }
 
