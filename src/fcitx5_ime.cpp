@@ -544,6 +544,15 @@ bool Fcitx5Ime::send_key(uint32_t sym, uint32_t state) {
 bool Fcitx5Ime::handle_key(int key, std::string &out) {
     out.clear();
     if(!active()) return false;
+    // 没组字时的退格交回编辑器自己删,别发给 rime。万象拼音的 super_processor 里有一层
+    // 「退格限制」(handle_backspace):它记着「上一次退格把编码从 1 个字符删到 0」这个状态,
+    // 之后**连续**再按退格就直接 return true(吃掉这个键)。它靠**抬起**事件复位,而这条
+    // 控制台通路只有按下没有抬起(见 translate_app_key 上面的注释),状态一旦置上就再也下不来
+    // —— 于是每个退格都被 rime 收下当「已处理」,编辑器根本轮不到删除。纯英文模式没有编码,
+    // 那条守卫走不到(cur_len 一直是 0),所以那边看着正常。
+    // 没组字本来也不该麻烦 rime:编辑器正文的内容 rime 一无所知。内置输入法和 yong 后端
+    // 也是这么做的(没编码时退格还给编辑器)。
+    if(key == 8 && !composing()) return false;
     // 组字时 Home/End 翻页(和内置输入法一致)。翻页键由 rime 那边定,不硬编在这里。
     // 没组字时返回 false,Home/End 还是编辑器的「光标到行首/行尾」。
     if(composing()) {
