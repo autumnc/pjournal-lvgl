@@ -7066,7 +7066,6 @@ static void editor_md_refresh() {
 
     int lbi = 0, rbi = 0, y = 0;
     int caret_x = -1, caret_y = -1;
-    int caret_line_y = -1;  // 光标那一行的行顶(内容层局部坐标),给候选条定位用
     for(size_t i = 0; i < nlines; ++i) {
         if(hidden[i]) continue;
         MdRender d = md_build_line(lines[i], in_code[i] != 0, ((int)i == ml.caret_line) ? ml.caret_rel : -1);
@@ -7151,7 +7150,6 @@ static void editor_md_refresh() {
             md_caret_from_pieces(disp, pieces, md_display_offset(d, ml.caret_rel) + indent_bytes, letter_space,
                                  line_h, caret_x, caret_y);
             caret_y += y;
-            caret_line_y = y;
             if(editor_focus() && !g_search_panel) {
                 g_md_focus_band = {0, y, g_md_max_w - 1, y + h - 1};
                 g_md_focus_band_on = true;
@@ -7230,7 +7228,9 @@ static void editor_md_refresh() {
     // 坐标里),内容层的原点已经把重排的 pad 和这次的滚动都算进去了,加一下就成绝对坐标。
     if(caret_shown) {
         g_md_caret_line_x = org.x1 + caret_x;
-        g_md_caret_line_top = org.y1 + caret_line_y;
+        // 要用 caret_y(已经带上自动折行的行号),不是逻辑行的行顶:一行折成多行时
+        // 光标停在第几行,候选条就得跟着摆在第几行下面。
+        g_md_caret_line_top = org.y1 + caret_y;
         g_md_caret_line_pitch = line_h;
     } else {
         g_md_caret_line_top = -1;
