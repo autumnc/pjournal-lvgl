@@ -65,9 +65,39 @@ struct Theme {
     lv_color_t bg;
     lv_color_t fg;
     lv_color_t muted;
-    lv_color_t accent;
-    lv_color_t panel;
+    lv_color_t accent;   // 光标、选区高亮、着重号底色
+    lv_color_t heading;  // markdown 标题
 };
+
+// 主题表。bg/fg 是底色与正文,muted 是次要文字(行号、提示、被压暗的行),
+// accent 是光标与选区,heading 是 markdown 标题。
+//
+// id 会被写进设置文件,已经发布出去的 dark/light 不能改名;认不出的 id 一律退回
+// 黑底白字,免得用户存了个已删主题后界面没配色。
+struct ThemeDef {
+    const char *id;
+    const char *label;
+    uint32_t bg, fg, muted, accent, heading;
+};
+
+static const ThemeDef k_themes[] = {
+    {"dark", "黑底白字", 0x000000, 0xffffff, 0xaaaaaa, 0xffffff, 0x7fb4ff},
+    {"light", "白底黑字", 0xffffff, 0x000000, 0x555555, 0x111111, 0x1f4e79},
+    {"contrast", "高对比", 0x000000, 0xffffff, 0xc8c8c8, 0xffffff, 0xffffff},
+    {"sepia", "纸质 Sepia", 0xf4ecd8, 0x4a3f35, 0x9c8b70, 0x8a6b3f, 0x6b4a24},
+    {"solarized_dark", "Solarized 暗", 0x002b36, 0x839496, 0x586e75, 0x268bd2, 0x2aa198},
+    {"solarized_light", "Solarized 亮", 0xfdf6e3, 0x657b83, 0x93a1a1, 0x268bd2, 0x268bd2},
+    {"gruvbox_dark", "Gruvbox 暗", 0x282828, 0xebdbb2, 0x928374, 0xfe8019, 0x83a598},
+    {"gruvbox_light", "Gruvbox 亮", 0xfbf1c7, 0x3c3836, 0x928374, 0xaf3a03, 0x076678},
+    {"nord", "Nord", 0x2e3440, 0xd8dee9, 0x6c7a96, 0x88c0d0, 0x81a1c1},
+    {"dracula", "Dracula", 0x282a36, 0xf8f8f2, 0x6272a4, 0xbd93f9, 0xff79c6},
+};
+
+static const ThemeDef *theme_def(const std::string &id) {
+    for(const ThemeDef &t : k_themes)
+        if(id == t.id) return &t;
+    return &k_themes[0];
+}
 
 struct Action {
     char key;
@@ -1560,11 +1590,9 @@ static void outline_remove_file(const std::string &project, const std::string &f
 }
 
 static void apply_theme_values() {
-    if(g_settings.theme() == "light") {
-        g_theme = {lv_color_white(), lv_color_black(), lv_color_hex(0x555555), lv_color_hex(0x111111), lv_color_hex(0xf4f4f4)};
-    } else {
-        g_theme = {lv_color_black(), lv_color_white(), lv_color_hex(0xaaaaaa), lv_color_white(), lv_color_hex(0x111111)};
-    }
+    const ThemeDef &t = *theme_def(g_settings.theme());
+    g_theme = {lv_color_hex(t.bg), lv_color_hex(t.fg), lv_color_hex(t.muted),
+               lv_color_hex(t.accent), lv_color_hex(t.heading)};
 }
 
 static void base_style(lv_obj_t *obj) {
@@ -3680,7 +3708,11 @@ static int backlight_display_percent() {
 
 // 枚举型设置的候选值 (存值, 显示名)。空表示非选项字段(文本编辑或跳转)。
 static std::vector<std::pair<std::string, std::string>> setting_options(const std::string &k) {
-    if(k == "theme") return {{"dark", "黑底白字"}, {"light", "白底黑字"}};
+    if(k == "theme") {
+        std::vector<std::pair<std::string, std::string>> o;
+        for(const ThemeDef &t : k_themes) o.push_back({t.id, t.label});
+        return o;
+    }
     if(k == "backlight") {
         std::vector<std::pair<std::string, std::string>> o;
         for(int n : kBacklightLevels) o.push_back({std::to_string(n), std::to_string(n) + "%"});
@@ -3794,7 +3826,7 @@ static std::vector<SetItem> settings_items() {
     IME &ime = IME::getInstance();
     ime.ensureUserDictLoaded();
     std::vector<SetItem> v = {
-        {"theme", "主题", g_settings.theme() == "light" ? "白底黑字" : "黑底白字"},
+        {"theme", "主题", theme_def(g_settings.theme())->label},
         {"app_mode", "工作模式", appModeLabel},
         {"home_view", "主页视图", g_settings.home_view() == "month" ? "月视图" : "周视图"},
         {"font_size", "字号", std::to_string(g_settings.font_size())},
@@ -6690,9 +6722,7 @@ static bool editor_redo() {
 // ---------------------------------------------------------------------------
 
 // 标题颜色单独给一套,主题里的 accent 在黑白主题下和正文同色,分不出来。
-static lv_color_t md_heading_color() {
-    return g_settings.theme() == "light" ? lv_color_hex(0x1f4e79) : lv_color_hex(0x7fb4ff);
-}
+static lv_color_t md_heading_color() { return g_theme.heading; }
 
 // 行内样式 → 实际字体。faux_bold 表示这一片要靠"再描一遍、偏移 1px"补粗:
 // FreeType 位图模式不支持 FT_Outline_Embolden,伪粗体只能自己画两遍;伪斜体则免费
