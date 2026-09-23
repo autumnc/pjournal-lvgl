@@ -78,3 +78,10 @@ std::string Settings::wlan_interface() const {
     const char *env = getenv("PJOURNAL_WLAN");
     return env && *env ? env : get("wlan_interface", "wlan0");
 }
+int Settings::backlight_percent() const {
+    // 0 等于「没设过」。最低档位是 5%,所以 0 不会跟真实档位撞上。
+    int n = atoi(get("backlight", "0").c_str());
+    if(n < 0) n = 0;
+    if(n > 100) n = 100;
+    return n;
+}

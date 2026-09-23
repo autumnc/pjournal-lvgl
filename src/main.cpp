@@ -1,4 +1,5 @@
 #include "app_ui.h"
+#include "backlight.h"
 #include "font_manager.h"
 #include "journal_storage.h"
 #include "linux_console.h"
@@ -55,6 +56,9 @@ static void prepare_framebuffer(const char *path) {
 int main() {
     linux_console_enter_graphics();
     g_settings.begin();
+    // 存过档位才去动硬件;没设过就保留系统开机时给的那个亮度
+    int backlight = g_settings.backlight_percent();
+    if(backlight > 0) backlight_set_percent(backlight);
     g_journal.begin();
     g_fonts.scan("/root/.fonts");
 

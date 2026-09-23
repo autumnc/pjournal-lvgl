@@ -28,6 +28,7 @@ public:
     bool vertical_reference_line() const;
     std::string vertical_reference_line_style() const;
     std::string wlan_interface() const;
+    int backlight_percent() const;
 
 private:
     std::string settings_dir() const;

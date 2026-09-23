@@ -1,5 +1,6 @@
 #include "app_ui.h"
 
+#include "backlight.h"
 #include "file_manager_server.h"
 #include "font_manager.h"
 #include "hash_utils.h"
@@ -3651,9 +3652,40 @@ struct SetItem {
     std::string value;
 };
 
+// 背光档位。最低 5%:这台机器的背光是 raw PWM,dm250 上又没有独立亮度键,
+// 调到全黑就再也摸不回来了,所以不留 0% 这一档。
+static const int kBacklightLevels[] = {5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+
+// 把任意百分比对齐到最近的档位,免得打开列表时光标停在一个跟屏幕对不上的档上
+static int backlight_nearest_level(int percent) {
+    int best = kBacklightLevels[0];
+    int best_dist = -1;
+    for(int lv : kBacklightLevels) {
+        int d = lv > percent ? lv - percent : percent - lv;
+        if(best_dist < 0 || d < best_dist) {
+            best_dist = d;
+            best = lv;
+        }
+    }
+    return best;
+}
+
+// 列表里显示的当前亮度:设过就用设置里的,没设过就现读硬件
+static int backlight_display_percent() {
+    int pct = g_settings.backlight_percent();
+    if(pct > 0) return pct;
+    int cur = backlight_current_percent();
+    return cur > 0 ? cur : 100;
+}
+
 // 枚举型设置的候选值 (存值, 显示名)。空表示非选项字段(文本编辑或跳转)。
 static std::vector<std::pair<std::string, std::string>> setting_options(const std::string &k) {
     if(k == "theme") return {{"dark", "黑底白字"}, {"light", "白底黑字"}};
+    if(k == "backlight") {
+        std::vector<std::pair<std::string, std::string>> o;
+        for(int n : kBacklightLevels) o.push_back({std::to_string(n), std::to_string(n) + "%"});
+        return o;
+    }
     if(k == "app_mode") return {{"journal", "个人日记"}, {"quick", "快捷编辑"}, {"file", "文件编辑"}};
     if(k == "home_view") return {{"week", "周视图"}, {"month", "月视图"}};
     if(k == "input_mode") {
@@ -3698,6 +3730,7 @@ static std::vector<std::pair<std::string, std::string>> setting_options(const st
 
 static std::string setting_current_value(const std::string &k) {
     if(k == "theme") return g_settings.theme();
+    if(k == "backlight") return std::to_string(backlight_nearest_level(backlight_display_percent()));
     if(k == "app_mode") return g_settings.app_mode();
     if(k == "home_view") return g_settings.home_view();
     if(k == "font_size") return std::to_string(g_settings.font_size());
@@ -3721,12 +3754,13 @@ static std::string setting_current_value(const std::string &k) {
 static void setting_apply(const std::string &k, const std::string &v) {
     g_settings.set(k, v);
     if(k == "font_file" || k == "font_bold_file" || k == "font_italic_file") app_ui_reload_font();
+    if(k == "backlight") backlight_set_percent(atoi(v.c_str()));
     app_ui_reload_theme();
 }
 
 static bool g_setting_pick_active = false;
 static int g_setting_pick_sel = 0;
-static std::string g_setting_pick_key, g_setting_pick_label;
+static std::string g_setting_pick_key, g_setting_pick_label, g_setting_pick_orig;
 static std::vector<std::pair<std::string, std::string>> g_setting_pick_opts;
 
 static void open_setting_pick(const SetItem &it) {
@@ -3738,6 +3772,7 @@ static void open_setting_pick(const SetItem &it) {
     g_setting_pick_opts = std::move(opts);
     g_setting_pick_sel = 0;
     std::string cur = setting_current_value(it.key);
+    g_setting_pick_orig = cur;
     for(size_t i = 0; i < g_setting_pick_opts.size(); ++i)
         if(g_setting_pick_opts[i].first == cur) { g_setting_pick_sel = (int)i; break; }
     render();
@@ -3789,6 +3824,9 @@ static std::vector<SetItem> settings_items() {
         {"personal_hob", "个人爱好", g_settings.get("personal_hob", "").empty() ? "(未设置)" : "(已设置)"},
         {"editor_orientation", "文字方向", editor_vertical() ? "竖排" : "横排"},
     };
+    // 机器上没有背光设备就没有这一项(x86 上跑时整项消失,不留一个按了没反应的死项)
+    if(backlight_available())
+        v.insert(v.begin() + 1, {"backlight", "背光亮度", std::to_string(backlight_display_percent()) + "%"});
     // 竖排专属两项只在竖排时出现,与 ESP32 版一致
     if(editor_vertical()) {
         v.push_back({"vertical_ref_line", "竖排参考线", g_settings.vertical_reference_line() ? "开" : "关"});
@@ -4653,14 +4691,20 @@ static void handle_settings(int key) {
     if(g_setting_pick_active) {
         int total = (int)g_setting_pick_opts.size();
         if(key == 27 || key == 'q') {
+            // 背光是边移边生效的,退出得把进列表前那一档写回去
+            if(g_setting_pick_key == "backlight") backlight_set_percent(atoi(g_setting_pick_orig.c_str()));
             g_setting_pick_active = false;
             render();
             return;
         }
-        if(key == KEY_DOWN || key == 'j') g_setting_pick_sel++;
-        if(key == KEY_UP || key == 'k') g_setting_pick_sel--;
+        bool moved = false;
+        if(key == KEY_DOWN || key == 'j') { g_setting_pick_sel++; moved = true; }
+        if(key == KEY_UP || key == 'k') { g_setting_pick_sel--; moved = true; }
         if(g_setting_pick_sel < 0) g_setting_pick_sel = 0;
         if(g_setting_pick_sel >= total) g_setting_pick_sel = total - 1;
+        // 背光每挪一格就立刻写硬件,这样看着屏幕就能挑,不用靠猜
+        if(moved && g_setting_pick_key == "backlight" && total > 0)
+            backlight_set_percent(atoi(g_setting_pick_opts[g_setting_pick_sel].first.c_str()));
         if((key == '\n' || key == '\r' || key == KEY_RIGHT) && total > 0) {
             setting_apply(g_setting_pick_key, g_setting_pick_opts[g_setting_pick_sel].first);
             g_setting_pick_active = false;

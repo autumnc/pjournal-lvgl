@@ -142,6 +142,7 @@ add_executable(pjournal-lvgl
     src/hash_utils.cpp
     src/esp32_compat.cpp
     src/settings.cpp
+    src/backlight.cpp
     src/journal_storage.cpp
     src/markdown.cpp
     src/vertical_layout.cpp
