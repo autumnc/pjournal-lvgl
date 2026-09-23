@@ -209,7 +209,9 @@ MdRender md_build_line(const std::string &raw, bool in_code, int caret_rel) {
         } else if(!t.empty() && t[0] == '>') {
             b = 1;
             while(b < t.size() && t[b] == ' ') b++;
-            prefix = "\xe2\x96\x8d ";
+            // 引用整块比正文右移一格。用两个半角空格而不是全角空格:横排宽度一样,
+            // 竖排也是 2 格,与缩进两级列表(两个空格)对齐,两种排版看着一致。
+            prefix = "  \xe2\x96\x8d ";
             l.muted = true;
             l.body_off = (int)(lead + b);
         } else if(t.size() >= 2 && (t[0] == '-' || t[0] == '*' || t[0] == '+') && t[1] == ' ') {
@@ -221,7 +223,7 @@ MdRender md_build_line(const std::string &raw, bool in_code, int caret_rel) {
             }
             while(k < t.size() && t[k] == ' ') k++;
             if(task) prefix = done ? "[\xe2\x9c\x93] " : "[ ] ";
-            else prefix = "\xe2\x80\xa2 ";
+            else prefix = lead > 0 ? "\xe2\x97\x8b " : "\xe2\x80\xa2 ";  // 次级列表用空心圆
             l.muted = task;
             l.body_off = (int)(lead + k);
         } else {
@@ -246,6 +248,10 @@ MdRender md_build_line(const std::string &raw, bool in_code, int caret_rel) {
                 }
             }
         }
+
+        // 嵌套块的缩进(前导空格)跟着前缀一起显示:横排靠它右移,竖排照旧把这些
+        // 字节排成空白格。前缀为空的行(普通段落)不动,竖排仍自己补缩进格。
+        if(!prefix.empty() && lead > 0) prefix = raw.substr(0, lead) + prefix;
 
         // 光标落在块标记(#、-、1.、一、、>)的字节范围里时,标记原样平文显示;
         // 离开这一小段才换成图标/子弹并套上标题样式,与行内标记的显隐规则一致。
