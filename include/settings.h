@@ -2,6 +2,8 @@
 
 #include <string>
 
+std::string home_dir();
+
 class Settings {
 public:
     bool begin();
@@ -15,6 +17,7 @@ public:
     std::string font_italic_file() const;
     int font_size() const;
     int ime_font_size() const;
+    int ui_font_size() const;
     bool markdown_render() const;
     bool version_history() const;
     bool first_line_indent() const;

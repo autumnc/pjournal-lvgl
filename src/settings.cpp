@@ -5,15 +5,19 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <pwd.h>
+#include <unistd.h>
 
 Settings g_settings;
 
 static std::mutex g_mutex;
 static std::map<std::string, std::string> g_cache;
 
-static std::string home_dir() {
+std::string home_dir() {
     const char *home = getenv("HOME");
-    return home && *home ? home : "/root";
+    if(home && *home) return home;
+    if(struct passwd *pw = getpwuid(getuid())) return pw->pw_dir;
+    return "/";
 }
 
 std::string Settings::settings_dir() const {
@@ -56,6 +60,12 @@ int Settings::ime_font_size() const {
     int n = atoi(get("ime_font_size", "27").c_str());
     if(n < 12) n = 12;
     if(n > 72) n = 72;
+    return n;
+}
+int Settings::ui_font_size() const {
+    int n = atoi(get("ui_font_size", "34").c_str());
+    if(n < 24) n = 24;
+    if(n > 60) n = 60;
     return n;
 }
 bool Settings::markdown_render() const { return get("md_render", "1") != "0"; }

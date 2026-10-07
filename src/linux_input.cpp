@@ -1,5 +1,7 @@
 #include "linux_input.h"
 
+#include "linux_console.h"
+
 #include <lvgl.h>
 #include <src/osal/lv_os.h>
 
@@ -11,6 +13,7 @@
 #include <linux/kd.h>
 #include <string>
 #include <sys/ioctl.h>
+#include <termios.h>
 #include <thread>
 #include <unistd.h>
 
@@ -59,6 +62,7 @@ static std::atomic<bool> g_ctrl_held{false};
 static std::atomic<bool> g_modifier_tap_live{false};
 
 static bool console_byte_swallowed(uint8_t ch) {
+    if(g_ctrl_held.load() && ch == '\r') return true;
     if(!g_modifier_tap_live.load() || !g_shift_held.load()) return false;
     if(ch == ' ') return true;
     return g_ctrl_held.load() && (ch == 0x06 || ch == 0x1A || ch == 0x1F);
@@ -205,7 +209,7 @@ static int open_console_input_fd() {
         if(ioctl(fd, KDGETMODE, &mode) == 0) return fd;
         close(fd);
     }
-    fd = open("/dev/tty1", O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    fd = open(linux_console_active_tty().c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
     if(fd >= 0) {
         int mode = 0;
         if(ioctl(fd, KDGETMODE, &mode) == 0) return fd;
@@ -217,6 +221,7 @@ static int open_console_input_fd() {
 static void console_input_thread() {
     int fd = open_console_input_fd();
     if(fd < 0) return;
+    tcflush(fd, TCIFLUSH);
 
     while(true) {
         uint8_t ch = 0;

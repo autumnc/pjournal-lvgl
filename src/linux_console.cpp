@@ -31,7 +31,7 @@ static bool is_linux_console(int fd) {
     return ioctl(fd, KDGETMODE, &mode) == 0;
 }
 
-static std::string active_vt_path() {
+std::string linux_console_active_tty() {
     const char *env = getenv("PJOURNAL_TTY");
     if(env && *env) return env;
 
@@ -183,7 +183,7 @@ static void install_signal_handlers() {
 bool linux_console_enter_graphics() {
     if(s_tty_fd >= 0) return true;
 
-    std::string tty = active_vt_path();
+    std::string tty = linux_console_active_tty();
     s_tty_fd = open(tty.c_str(), O_RDWR | O_CLOEXEC);
     if(s_tty_fd < 0) s_tty_fd = open("/dev/tty0", O_RDWR | O_CLOEXEC);
     if(s_tty_fd < 0) s_tty_fd = open("/dev/console", O_RDWR | O_CLOEXEC);

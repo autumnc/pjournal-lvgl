@@ -17,12 +17,15 @@ enum class FontStyle { Normal, Bold, Italic };
 
 class FontManager {
 public:
-    void scan(const std::string &dir = "/root/.fonts");
+    void scan(const std::string &dir);
     const std::vector<FontInfo> &fonts() const { return fonts_; }
     std::string default_font_path() const;
     bool supports_cjk(const std::string &path) const;
     bool supports_symbols(const std::string &path) const;
     lv_font_t *load(const std::string &path, int size, FontStyle style = FontStyle::Normal);
+    lv_font_t *load_styled(const std::string &path, int size, FontStyle style);
+    void clear();
+    void reset_fallbacks();
     lv_font_t *current() const { return current_; }
     int current_size() const { return current_size_; }
     std::string current_path() const { return current_path_; }

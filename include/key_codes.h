@@ -25,4 +25,6 @@ enum AppKey {
     KEY_HELP = 0xA3,
     KEY_REDO = 0xA4,
     KEY_IM_SWITCH = 0xA5,
+    KEY_BACKLIGHT_UP = 0xA7,
+    KEY_BACKLIGHT_DOWN = 0xA8,
 };

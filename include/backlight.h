@@ -13,3 +13,5 @@ bool backlight_available();
 int backlight_max();             // max_brightness,不可用时 0
 bool backlight_set_percent(int percent);  // 1..100,夹到 [1,max] 后写入
 int backlight_current_percent();          // 当前亮度折成百分比,不可用时 0
+bool backlight_toggle_power();
+bool backlight_is_off();

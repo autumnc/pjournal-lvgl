@@ -141,6 +141,12 @@ std::vector<std::string> FontManager::pick_wide(const std::string &primary) cons
 }
 
 std::string FontManager::pick_symbol(const std::string &primary) const {
+    static const char *k_icon_font_name = "NF-Propo.ttf";
+    for(const auto &f : fonts_) {
+        if(f.path == primary) continue;
+        if(f.name == k_icon_font_name && supports_symbols(f.path)) return f.path;
+    }
+
     std::string best;
     long best_size = 0;
     bool best_nerd = false;
@@ -221,8 +227,25 @@ lv_font_t *FontManager::load(const std::string &path, int size, FontStyle style)
     return current_;
 }
 
-FontManager::~FontManager() {
+lv_font_t *FontManager::load_styled(const std::string &path, int size, FontStyle style) {
+    return create(path, size, style);
+}
+
+void FontManager::clear() {
     for(auto &p : loaded_) {
         if(p.second) lv_freetype_font_delete(p.second);
     }
+    loaded_.clear();
+    current_ = nullptr;
+    current_path_.clear();
+    current_size_ = 0;
+}
+
+void FontManager::reset_fallbacks() {
+    fallback_resolved_ = false;
+    fallback_chain_.clear();
+}
+
+FontManager::~FontManager() {
+    clear();
 }

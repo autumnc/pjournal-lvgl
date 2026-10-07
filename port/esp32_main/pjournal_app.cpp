@@ -8,6 +8,7 @@
 #include "main_menu_icons.h"
 #include "screen_editor.h"
 #include "vertical_layout.h"
+#include <algorithm>
 #include <cstdlib>
 #include <cstdio>
 #include <ctime>
@@ -84,6 +85,40 @@ static const std::vector<MdLineInfo>& getViewerMdInfo(bool mdOn) {
 }
 
 static void refreshBrowserCache() { g_browser.entries = g_journal.listEntries(); }
+
+static int utf8CharLenAt(const std::string &s, size_t pos) {
+    if (pos >= s.size()) return 0;
+    unsigned char c = (unsigned char)s[pos];
+    if (c < 0x80) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+static std::string ellipsizeToWidth(const std::string &text, int maxWidth) {
+    if (maxWidth <= 0) return "";
+    if (g_font.textWidth(text.c_str()) <= maxWidth) return text;
+
+    const char *ellipsis = "...";
+    int ellipsisWidth = g_font.textWidth(ellipsis);
+    if (ellipsisWidth > maxWidth) return "";
+
+    std::string out;
+    int width = 0;
+    for (size_t pos = 0; pos < text.size(); ) {
+        int len = utf8CharLenAt(text, pos);
+        if (len <= 0 || pos + (size_t)len > text.size()) break;
+        std::string next = text.substr(pos, len);
+        int nextWidth = g_font.textWidth(next.c_str());
+        if (width + nextWidth + ellipsisWidth > maxWidth) break;
+        out += next;
+        width += nextWidth;
+        pos += len;
+    }
+    out += ellipsis;
+    return out;
+}
 
 static const std::vector<VRow>& getHistoryVrows() {
     bool firstLineIndent = g_settings.firstLineIndent();
@@ -468,7 +503,7 @@ AppState screen_browser_handle(int key, ScreenContext &ctx) {
     ui_draw_text(4, y, "过往日记", false, true);
     u8g2_DrawHLine(g_u8g2, 0, y + 7, SCREEN_W);
     y = y + 7 + LINE_SPACING - 4;
-    int visible = (SCREEN_H - y + LINE_SPACING - 1) / LINE_SPACING;
+    int visible = (SCREEN_H - y) / LINE_SPACING;
     if (g_browser.selection < g_browser.scroll) g_browser.scroll = g_browser.selection;
     if (g_browser.selection >= g_browser.scroll + visible)
         g_browser.scroll = g_browser.selection - visible + 1;
@@ -479,9 +514,19 @@ AppState screen_browser_handle(int key, ScreenContext &ctx) {
         if (e.filename.length() >= 10) dateDisplay = e.filename.substr(0, 10);
         else dateDisplay = e.date;
         std::string preview = e.preview.empty() ? e.title : e.preview;
-        char buf[80];
-        snprintf(buf, sizeof(buf), "%s %s", dateDisplay.c_str(), preview.c_str());
-        ui_draw_text(8, y + i * LINE_SPACING, buf, sel);
+        int rowY = y + i * LINE_SPACING;
+        int rowTop = rowY - g_font.ascent();
+        int rowH = std::min(LINE_SPACING, SCREEN_H - rowTop);
+        if (rowH <= 0) continue;
+        u8g2_SetDrawColor(g_u8g2, sel ? 0 : 1);
+        u8g2_DrawBox(g_u8g2, 0, rowTop, SCREEN_W, rowH);
+        u8g2_SetDrawColor(g_u8g2, sel ? 1 : 0);
+
+        std::string prefix = dateDisplay + " ";
+        int maxPreviewW = SCREEN_W - 16 - g_font.textWidth(prefix.c_str());
+        std::string line = prefix + ellipsizeToWidth(preview, maxPreviewW);
+        g_font.drawText(8, rowY, line.c_str(), false);
+        u8g2_SetDrawColor(g_u8g2, 0);
     }
     ui_commit();
     return APP_BROWSER;

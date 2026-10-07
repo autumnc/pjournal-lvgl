@@ -8,3 +8,6 @@ struct WebdavSyncResult {
 };
 
 WebdavSyncResult webdav_sync_journal();
+
+// Remote root (URL + directory, unencoded) for UI display.
+std::string webdav_remote_base();

@@ -118,10 +118,9 @@ VerticalData build_vertical_data(const std::vector<std::string> &lines, int rows
                 // 水平线/围栏行:原样字符竖排,样式弱化
                 vt_append_raw(line, 0, VerticalCellKind::Rule, cs);
             } else {
-                // 前缀为空的行(普通段落)照旧自己补前导空白格,保住缩进;
-                // 前缀里已经带上缩进的(列表/引用/标题)不再另排,免得缩进翻倍;
-                // 光标停在标记里时前缀就是原文(含缩进),同样不用另排。
-                if(!r.plain_marker && r.prefix_bytes == 0)
+                // 列表层级与引用右移的那格已经折算进前缀时,别再按原始前导
+                // 空格补一遍;普通段落仍保留前导空白格。
+                if(!r.plain_marker && !r.prefix_indent)
                     for(int p = 0; p < lead; ++p) cs.push_back({p, p + 1, " ", kind, false, MdStyle {}});
                 // 替换型块标记:尾部空格丢掉,所有格共享同一段原始字节
                 int pend = r.prefix_bytes;

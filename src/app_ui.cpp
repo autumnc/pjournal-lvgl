@@ -111,7 +111,7 @@ static const Action k_actions[] = {
     {'f', "自由写作", LV_SYMBOL_KEYBOARD, Screen::Editor},
     {'v', "查看过往日记", LV_SYMBOL_LIST, Screen::Browser},
     {'w', "同步WebDAV", LV_SYMBOL_UPLOAD, Screen::Sync},
-    {'t', "GTD任务管理", LV_SYMBOL_OK, Screen::Gtd},
+    {'t', "写作计划", LV_SYMBOL_OK, Screen::Gtd},
     {'o', "大纲写作", LV_SYMBOL_DIRECTORY, Screen::Outline},
     {'s', "设置", LV_SYMBOL_SETTINGS, Screen::Settings},
 };
@@ -350,6 +350,12 @@ static int g_editor_exit_target = 0;        // 0=主面板 1=大纲 2=快捷编�
 static lv_obj_t *g_editor_exit_dlg = nullptr;
 static bool g_quit_asking = false;          // Ctrl+Q 退出 app 的确认框是否显示
 static lv_obj_t *g_quit_dlg = nullptr;
+static uint32_t g_bl_osd_until = 0;
+static lv_obj_t *g_bl_osd = nullptr;
+static lv_obj_t *g_bl_osd_fill = nullptr;
+static lv_obj_t *g_bl_osd_pct = nullptr;
+static int g_bl_osd_track_w = 0;
+static int g_bl_osd_bar_h = 0;
 static Screen g_history_return = Screen::Browser;
 static bool g_history_preview = false;
 static bool g_history_confirm_restore = false;
@@ -443,6 +449,7 @@ static bool g_sync_done = false;
 static std::atomic<bool> g_should_quit{false};
 static lv_font_t *g_ui_font = nullptr;
 static lv_font_t *g_icon_font = nullptr;
+static lv_font_t *g_cal_font = nullptr;
 static lv_font_t *g_editor_font = nullptr;
 static lv_font_t *g_editor_bold_font = nullptr;    // 真粗体字体;未配置为 nullptr(改用描两遍)
 static lv_font_t *g_editor_italic_font = nullptr;  // 真斜体字体;未配置为 nullptr
@@ -586,11 +593,6 @@ static std::string history_filename_label(const std::string &fn) {
         return s;
     }
     return fn;
-}
-
-static std::string home_dir() {
-    const char *home = getenv("HOME");
-    return home && *home ? home : "/root";
 }
 
 static std::string gtd_dir() {
@@ -1313,7 +1315,7 @@ static void gtd_load_archive_month(const std::string &month) {
 }
 
 static std::string gtd_export_md() {
-    std::string md = "# GTD 任务列表\n\n";
+    std::string md = "# 写作计划\n\n";
     auto &tasks = g_gtd.data["tasks"];
     if(!tasks.isArray()) return md;
     for(int i = 0; i < (int)tasks.size(); ++i) {
@@ -1603,11 +1605,30 @@ static void base_style(lv_obj_t *obj) {
     lv_obj_set_style_outline_width(obj, 0, 0);
 }
 
-static lv_obj_t *label(lv_obj_t *parent, const std::string &text, int x, int y, int w = LV_SIZE_CONTENT, int h = LV_SIZE_CONTENT) {
+static constexpr int k_ui_ref_font = 27;
+
+static int ui_px(int v) {
+    if(v == 0 || v == LV_SIZE_CONTENT) return v;
+    int n = v * g_settings.ui_font_size();
+    return v > 0 ? (n + k_ui_ref_font / 2) / k_ui_ref_font
+                 : (n - k_ui_ref_font / 2) / k_ui_ref_font;
+}
+
+static int ui_line_h() {
+    int lh = lv_font_get_line_height(g_ui_font ? g_ui_font : LV_FONT_DEFAULT);
+    return lh < 12 ? 12 : lh;
+}
+
+static lv_obj_t *label_raw(lv_obj_t *parent, const std::string &text, int x, int y,
+                           int w = LV_SIZE_CONTENT, int h = LV_SIZE_CONTENT) {
     lv_obj_t *obj = lv_label_create(parent);
     lv_label_set_text(obj, text.c_str());
     lv_label_set_long_mode(obj, LV_LABEL_LONG_WRAP);
     lv_obj_set_pos(obj, x, y);
+    if(h != LV_SIZE_CONTENT) {
+        int min_h = ui_line_h() + 2;
+        if(h < min_h) h = min_h;
+    }
     lv_obj_set_size(obj, w, h);
     lv_obj_set_style_text_color(obj, g_theme.fg, 0);
     // 内容比框略高时 LVGL 默认会在右/下画滚动条,这里一律不要
@@ -1615,7 +1636,23 @@ static lv_obj_t *label(lv_obj_t *parent, const std::string &text, int x, int y, 
     return obj;
 }
 
-static lv_obj_t *box(lv_obj_t *parent, int x, int y, int w, int h, bool selected = false) {
+static lv_obj_t *label(lv_obj_t *parent, const std::string &text, int x, int y,
+                       int w = LV_SIZE_CONTENT, int h = LV_SIZE_CONTENT) {
+    if(h != LV_SIZE_CONTENT) h = ui_px(h);
+    return label_raw(parent, text, x, ui_px(y), w, h);
+}
+
+static int screen_w() {
+    lv_display_t *disp = lv_display_get_default();
+    return disp ? lv_display_get_horizontal_resolution(disp) : 1024;
+}
+
+static int screen_h() {
+    lv_display_t *disp = lv_display_get_default();
+    return disp ? lv_display_get_vertical_resolution(disp) : 600;
+}
+
+static lv_obj_t *box_raw(lv_obj_t *parent, int x, int y, int w, int h, bool selected = false) {
     lv_obj_t *obj = lv_obj_create(parent);
     lv_obj_set_pos(obj, x, y);
     lv_obj_set_size(obj, w, h);
@@ -1628,6 +1665,10 @@ static lv_obj_t *box(lv_obj_t *parent, int x, int y, int w, int h, bool selected
     // 子控件比内容区略大是常态,不要让 LVGL 画出右/下滚动条
     lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
     return obj;
+}
+
+static lv_obj_t *box(lv_obj_t *parent, int x, int y, int w, int h, bool selected = false) {
+    return box_raw(parent, x, ui_px(y), w, ui_px(h), selected);
 }
 
 // 图标字体(Nerd Font)的 PUA 字形在字宽里基本靠左,照字宽居中会让墨迹整体偏右;
@@ -1659,19 +1700,106 @@ static int status_bar_h() {
     if(lh < 16) lh = 16;
     return lh + 8;
 }
-static int status_bar_y() { return 596 - status_bar_h(); }
+static int status_bar_y() { return screen_h() - 4 - status_bar_h(); }
 // 正文能占到的最下边(状态栏上方再留一点空白)
 static int chrome_bottom() { return status_bar_y() - 4; }
 
+static int visible_rows_from(int top_y, int row_h, int min_rows = 1) {
+    int rows = (chrome_bottom() - ui_px(top_y)) / ui_px(row_h);
+    return rows < min_rows ? min_rows : rows;
+}
+
+struct DlgLine {
+    std::string text;
+    bool muted;
+};
+
+static lv_obj_t *dialog_box(const std::vector<DlgLine> &lines) {
+    int w = ui_px(400);
+    if(w < 400) w = 400;
+    if(w > screen_w() - ui_px(40)) w = screen_w() - ui_px(40);
+    int lh = ui_line_h();
+    int gap = ui_px(6);
+    int pad = ui_px(10);
+    int h = pad * 2 + (int)lines.size() * (lh + gap);
+    lv_obj_t *dlg = box_raw(g_root, (screen_w() - w) / 2, (chrome_bottom() - h) / 2, w, h, false);
+    lv_obj_set_style_bg_color(dlg, g_theme.bg, 0);
+    lv_obj_set_style_border_width(dlg, 2, 0);
+    for(size_t i = 0; i < lines.size(); ++i) {
+        lv_obj_t *t = label_raw(dlg, lines[i].text, ui_px(8), pad + (int)i * (lh + gap),
+                                w - ui_px(16), lh + 2);
+        lv_obj_set_style_text_align(t, LV_TEXT_ALIGN_CENTER, 0);
+        if(lines[i].muted) lv_obj_set_style_text_color(t, g_theme.muted, 0);
+    }
+    lv_obj_move_foreground(dlg);
+    return dlg;
+}
+
 // The UI chrome keeps one fixed face so menus, status bar and calendar stay
 // visually stable; the 字体 setting only swaps the editor's text font.
-static const char *k_ui_font_path = "/root/.fonts/Go-LavaPropo-NF-R.ttf";
+static const char *k_ui_font_name = "Go-LavaPropo-NF-R.ttf";
+
+static std::string ui_font_path() {
+    std::string p = home_dir() + "/.fonts/" + k_ui_font_name;
+    if(g_fonts.supports_cjk(p)) return p;
+    for(const auto &f : g_fonts.fonts()) {
+        if(f.name == k_ui_font_name) return f.path;
+    }
+    return std::string();
+}
+
+struct MainChrome {
+    int stats_y;
+    int sep_y;
+    int icon_y;
+    int icon_h;
+    int hint_y;
+};
+
+static int main_icon_h() {
+    int h = ui_px(76);
+    int cap = screen_h() / 8;
+    return h > cap ? cap : h;
+}
+
+static int main_icon_font_size() {
+    int n = main_icon_h() - ui_px(16);
+    return n < 20 ? 20 : n;
+}
+
+static MainChrome main_chrome() {
+    MainChrome c {};
+    c.icon_h = main_icon_h();
+    int hint_h = ui_px(34);
+    int stats_h = ui_px(32);
+    c.hint_y = chrome_bottom() - hint_h;
+    c.icon_y = c.hint_y - ui_px(10) - c.icon_h;
+    c.sep_y = c.icon_y - ui_px(10);
+    c.stats_y = c.sep_y - ui_px(8) - stats_h;
+    return c;
+}
+
+static void main_cal_band(int &top, int &bot) {
+    top = ui_px(62);
+    bot = main_chrome().stats_y - ui_px(12);
+}
+
+static int calendar_font_size() {
+    int top = 0, bot = 0;
+    main_cal_band(top, bot);
+    int size = (bot - top) / 7 - 3;
+    int cap = g_settings.ui_font_size();
+    if(size > cap) size = cap;
+    if(size < 12) size = 12;
+    return size;
+}
 
 void app_ui_reload_font() {
-    std::string ui_path = k_ui_font_path;
+    std::string ui_path = ui_font_path();
     if(!g_fonts.supports_cjk(ui_path)) ui_path = g_fonts.default_font_path();
-    g_ui_font = g_fonts.load(ui_path, 27);
-    g_icon_font = g_fonts.load(ui_path, 60);
+    g_ui_font = g_fonts.load(ui_path, g_settings.ui_font_size());
+    g_icon_font = g_fonts.load(ui_path, main_icon_font_size());
+    g_cal_font = g_fonts.load(ui_path, calendar_font_size());
     g_ime_font = g_fonts.load(ui_path, g_settings.ime_font_size());
     // 候选分页是按字形宽度算好的,字号一换就得作废重排
     g_linux_ime.set_display_width(0);
@@ -1683,9 +1811,9 @@ void app_ui_reload_font() {
     // 粗体/斜体各自可指一个真字体;留空就用伪粗体/伪斜体。
     std::string bold_path = g_settings.font_bold_file();
     std::string italic_path = g_settings.font_italic_file();
-    g_editor_bold_font = bold_path.empty() ? nullptr : g_fonts.load(bold_path, esize);
-    g_editor_italic_font = italic_path.empty() ? nullptr : g_fonts.load(italic_path, esize);
-    g_editor_faux_italic = g_fonts.load(editor_path, esize, FontStyle::Italic);
+    g_editor_bold_font = bold_path.empty() ? nullptr : g_fonts.load_styled(bold_path, esize, FontStyle::Bold);
+    g_editor_italic_font = italic_path.empty() ? nullptr : g_fonts.load_styled(italic_path, esize, FontStyle::Italic);
+    g_editor_faux_italic = g_fonts.load_styled(editor_path, esize, FontStyle::Italic);
     // 粗体/斜体多半是拉丁字体,不含中日韩,缺字得往下回退,否则混排里的中文变成豆腐块。
     // 斜体回退到伪斜体(正文路径 + 斜切)而不是正文字体,这样中文照样是斜的;
     // 伪粗体没有对应的字体对象(靠描两遍实现),粗体只能退回正文字体,中文不加粗。
@@ -1766,6 +1894,9 @@ static void clear_root() {
     g_editor_exit_dlg = nullptr;
     g_quit_dlg = nullptr;
     g_quit_asking = false;
+    g_bl_osd = nullptr;
+    g_bl_osd_fill = nullptr;
+    g_bl_osd_pct = nullptr;
     g_vt_cols.clear();
     g_vt_marks.clear();
     g_vt_cells.clear();
@@ -1781,14 +1912,14 @@ static void draw_status_bar(const std::string &left = "", bool align_right = fal
                             const std::string &right = "") {
     int y = status_bar_y();
     int h = status_bar_h();
-    g_status = label(g_root, left, 8, y, 1000, h);
+    g_status = label_raw(g_root, left, 8, y, screen_w() - 16, h);
     lv_obj_set_style_text_align(g_status, align_right ? LV_TEXT_ALIGN_RIGHT : LV_TEXT_ALIGN_LEFT, 0);
     lv_obj_set_style_border_width(g_status, 1, LV_PART_MAIN);
     lv_obj_set_style_border_side(g_status, LV_BORDER_SIDE_TOP, LV_PART_MAIN);
     lv_obj_set_style_pad_top(g_status, 4, 0);
     g_status_right = nullptr;
     if(!right.empty()) {
-        g_status_right = label(g_root, right, 8, y, 1000, h);
+        g_status_right = label_raw(g_root, right, 8, y, screen_w() - 16, h);
         lv_obj_set_style_text_align(g_status_right, LV_TEXT_ALIGN_RIGHT, 0);
         lv_obj_set_style_pad_top(g_status_right, 4, 0);
     }
@@ -1849,7 +1980,7 @@ static int ime_bar_h(int cand_h = 0) {
 static void create_ime_bar() {
     if(g_ime_bar) return;
     int h = ime_bar_h();
-    g_ime_bar = box(g_root, 8, chrome_bottom() - h, 120, h);
+    g_ime_bar = box_raw(g_root, 8, chrome_bottom() - h, 120, h);
     lv_obj_set_style_pad_all(g_ime_bar, kImePad, 0);
 
     g_ime_head = lv_label_create(g_ime_bar);
@@ -1930,7 +2061,7 @@ static void draw_file_panel() {
     if(g_file_panel) { lv_obj_delete(g_file_panel); g_file_panel = nullptr; }
     auto &p = g_file_panel_state;
     const int panel_w = kFilePanelW;
-    g_file_panel = box(g_root, 0, 0, panel_w, 600, false);
+    g_file_panel = box_raw(g_root, 0, 0, panel_w, screen_h(), false);
     lv_obj_set_style_bg_color(g_file_panel, g_theme.bg, 0);
     lv_obj_set_style_bg_opa(g_file_panel, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(g_file_panel, 2, 0);
@@ -1949,17 +2080,17 @@ static void draw_file_panel() {
     }
     if(p.prompt) {
         std::string title = p.rename ? "改名: " : "新建: ";
-        lv_obj_t *l = label(g_file_panel, title + p.input, 8, 500, panel_w - 16, 30);
+        lv_obj_t *l = label_raw(g_file_panel, title + p.input, 8, screen_h() - 100, panel_w - 16, 30);
         lv_label_set_long_mode(l, LV_LABEL_LONG_CLIP);
     } else if(!p.message.empty()) {
-        label(g_file_panel, p.message, 8, 500, panel_w - 16, 30);
+        label_raw(g_file_panel, p.message, 8, screen_h() - 100, panel_w - 16, 30);
     }
     // 组字时候选条占着提示行那一格,这一行就撤掉;a新建/d删除那排键位提示在打字途中
     // 只会抢地方,也没有用
     if(!p.prompt) {
-        lv_obj_t *hint = label(g_file_panel,
+        lv_obj_t *hint = label_raw(g_file_panel,
                                p.confirmDelete ? "Enter确认删除 Esc取消" : "a新建 d删除 r改名 Enter编辑",
-                               8, 548, panel_w - 16, 28);
+                               8, screen_h() - 52, panel_w - 16, 28);
         lv_label_set_long_mode(hint, LV_LABEL_LONG_CLIP);
     }
     lv_obj_move_foreground(g_file_panel);
@@ -2015,7 +2146,8 @@ static void ime_bar_layout_horizontal(int x, int y, int max_w) {
     if(box_w < 120) box_w = 120;
     if(box_w > max_w) box_w = max_w;
     if(box_w < 120) box_w = 120;
-    if(x + box_w > 1016) x = 1016 - box_w;   // 往左挪,别顶出屏幕
+    int right_edge = screen_w() - 8;
+    if(x + box_w > right_edge) x = right_edge - box_w;   // 往左挪,别顶出屏幕
     if(x < 8) x = 8;
 
     lv_label_set_text(g_ime_head, head.c_str());
@@ -2064,7 +2196,8 @@ static void ime_bar_layout_vertical() {
     int box_h = ime_bar_h(kRows * row_h);
     int x = caret_on ? cc.x1 - box_w - 6 : va.x1 + 6;  // 左右仍贴着光标那一列
     if(x < 8) x = (caret_on ? cc.x2 + 6 : va.x1 + 6);
-    if(x + box_w > 1016) x = 1016 - box_w;
+    int right_edge = screen_w() - 8;
+    if(x + box_w > right_edge) x = right_edge - box_w;
     if(x < 8) x = 8;
     int y = va.y1 + (va.y2 - va.y1 + 1 - box_h) / 2;
     if(y + box_h > chrome_bottom()) y = chrome_bottom() - box_h;
@@ -2115,9 +2248,9 @@ static void update_ime_bar() {
     // 宽度不受面板限制:面板只占屏幕三分之一,挤在里面一页摆不下几个候选。候选条本身
     // 在窗口最上层,伸到面板右边盖住编辑区没关系。
     if(g_file_panel_state.active && g_file_panel_state.prompt) {
-        int y = 534;
-        if(y + ime_bar_h() > 596) y = 596 - ime_bar_h();
-        ime_bar_layout_horizontal(8, y, 1016 - 16);
+        int y = screen_h() - 66;
+        if(y + ime_bar_h() > chrome_bottom()) y = chrome_bottom() - ime_bar_h();
+        ime_bar_layout_horizontal(8, y, screen_w() - 24);
         lv_obj_move_foreground(g_ime_bar);
         refresh_ime_status();
         return;
@@ -2194,9 +2327,18 @@ static void update_ime_bar() {
     }
 
     // 框宽不预设上限,由 ime_bar_layout_horizontal 按内容算完再把 x 往左挪到屏内
-    ime_bar_layout_horizontal(x, y, 1016 - 16);
+    ime_bar_layout_horizontal(x, y, screen_w() - 24);
     lv_obj_move_foreground(g_ime_bar);
     refresh_ime_status();
+}
+
+static int g_main_ymd = 0;
+
+static int local_ymd() {
+    time_t now = time(nullptr);
+    tm local {};
+    localtime_r(&now, &local);
+    return (local.tm_year + 1900) * 10000 + (local.tm_mon + 1) * 100 + local.tm_mday;
 }
 
 static void render_main() {
@@ -2204,22 +2346,31 @@ static void render_main() {
     time_t now = time(nullptr);
     tm local {};
     localtime_r(&now, &local);
+    g_main_ymd = local_ymd();
     char ym[64];
     strftime(ym, sizeof(ym), "%Y年%m月", &local);
-    lv_obj_t *title = label(g_root, ym, 0, 12, 1024, 34);
+    lv_obj_t *title = label(g_root, ym, 0, 12, screen_w(), 34);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_t *line = box(g_root, 390, 54, 244, 2);
     lv_obj_set_style_border_width(line, 0, 0);
 
     const char *days[7] = {"一", "二", "三", "四", "五", "六", "日"};
-    int col_w = 1024 / 7;
+    int col_w = screen_w() / 7;
     bool month_view = g_settings.home_view() == "month";
+    int band_top = 0, band_bot = 0;
+    main_cal_band(band_top, band_bot);
+    const lv_font_t *calf = g_cal_font ? g_cal_font : g_ui_font;
+    int cal_lh = lv_font_get_line_height(calf ? calf : LV_FONT_DEFAULT);
+    auto cal_label = [&](const std::string &s, int x, int y, int w) {
+        lv_obj_t *o = label_raw(g_root, s, x, y, w, cal_lh);
+        lv_obj_set_style_text_font(o, calf, 0);
+        lv_obj_set_style_text_align(o, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_height(o, cal_lh);
+        return o;
+    };
 
     if(month_view) {
-        for(int i = 0; i < 7; ++i) {
-            lv_obj_t *d = label(g_root, days[i], i * col_w, 70, col_w, 28);
-            lv_obj_set_style_text_align(d, LV_TEXT_ALIGN_CENTER, 0);
-        }
+        for(int i = 0; i < 7; ++i) cal_label(days[i], i * col_w, band_top, col_w);
 
         tm first = local;
         first.tm_mday = 1;
@@ -2232,6 +2383,9 @@ static void render_main() {
         next.tm_mon += 1;
         time_t next_t = mktime(&next);
         int dim = (int)((next_t - first_t) / 86400);
+        int grid_top = band_top + cal_lh + ui_px(2);
+        int row_h = (band_bot - grid_top) / 6;
+        if(row_h < cal_lh) row_h = cal_lh;
         for(int day = 1; day <= dim; ++day) {
             int idx = lead + day - 1;
             int row = idx / 7;
@@ -2246,22 +2400,23 @@ static void render_main() {
             std::string cell = std::to_string(day);
             // 标记位始终占一个字符,否则居中时无标记的日期会比有标记的偏右
             cell += has ? "✓" : (day_t <= now ? "·" : " ");
-            lv_obj_t *txt = nullptr;
+            int cy = grid_top + row * row_h;
+            lv_obj_t *txt = cal_label(cell, col * col_w, cy, col_w);
             if(today) {
-                int fx = col * col_w + col_w / 2 - 34;
-                int fy = 104 + row * 42;
-                lv_obj_t *frame = box(g_root, fx, fy, 68, 32, false);
+                int fw = col_w - ui_px(8);
+                lv_obj_t *frame = box_raw(g_root, col * col_w + (col_w - fw) / 2, cy - ui_px(2),
+                                          fw, cal_lh + ui_px(4), false);
                 lv_obj_set_style_bg_opa(frame, LV_OPA_TRANSP, 0);
                 lv_obj_set_style_pad_all(frame, 0, 0);
-                txt = label(g_root, cell, fx, fy + 2, 68, 30);
                 lv_obj_move_foreground(txt);
-            } else {
-                txt = label(g_root, cell, col * col_w, 104 + row * 42, col_w, 32);
             }
-            lv_obj_set_style_text_align(txt, LV_TEXT_ALIGN_CENTER, 0);
         }
     } else {
-        // 周视图:本周七天各占一列,名称 / 日期 / 打卡标记
+        int gap = (band_bot - band_top - 3 * cal_lh) / 4;
+        if(gap < 0) gap = 0;
+        int y1 = band_top + gap;
+        int y2 = y1 + cal_lh + gap;
+        int y3 = y2 + cal_lh + gap;
         int since_mon = local.tm_wday == 0 ? 6 : local.tm_wday - 1;
         time_t monday = now - (time_t)since_mon * 86400;
         for(int i = 0; i < 7; ++i) {
@@ -2276,49 +2431,51 @@ static void render_main() {
             const char *mark = has ? "✓" : (d <= now ? "·" : "");
             int cx = i * col_w;
             if(is_today) {
-                lv_obj_t *frame = box(g_root, cx + col_w / 2 - 44, 108, 88, 150, false);
+                int fw = col_w - ui_px(8);
+                lv_obj_t *frame = box_raw(g_root, cx + (col_w - fw) / 2, band_top, fw,
+                                          y3 + cal_lh - band_top, false);
                 lv_obj_set_style_bg_opa(frame, LV_OPA_TRANSP, 0);
                 lv_obj_set_style_pad_all(frame, 0, 0);
             }
-            lv_obj_t *dn = label(g_root, days[i], cx, 116, col_w, 40);
-            lv_obj_t *dd = label(g_root, md, cx, 166, col_w, 30);
-            lv_obj_t *mk = label(g_root, mark, cx, 206, col_w, 36);
-            for(lv_obj_t *o : {dn, dd, mk}) {
-                lv_obj_set_style_text_align(o, LV_TEXT_ALIGN_CENTER, 0);
-                lv_obj_move_foreground(o);
-            }
+            lv_obj_t *dn = cal_label(days[i], cx, y1, col_w);
+            lv_obj_t *dd = cal_label(md, cx, y2, col_w);
+            lv_obj_t *mk = cal_label(mark, cx, y3, col_w);
+            for(lv_obj_t *o : {dn, dd, mk}) lv_obj_move_foreground(o);
             lv_obj_set_style_text_color(dd, g_theme.muted, 0);
         }
     }
 
+    MainChrome mc = main_chrome();
     int total = g_journal.total_entries();
     int today_count = g_journal.count_today();
-    lv_obj_t *stats = label(g_root, "连续:" + std::to_string(g_journal.streak()) + "天 总计:" + std::to_string(total) + "篇 今日:" + std::to_string(today_count) + "篇",
-                            0, 372, 1024, 32);
+    lv_obj_t *stats = label_raw(g_root, "连续:" + std::to_string(g_journal.streak()) + "天 总计:" + std::to_string(total) + "篇 今日:" + std::to_string(today_count) + "篇",
+                                0, mc.stats_y, screen_w(), ui_px(32));
     lv_obj_set_style_text_align(stats, LV_TEXT_ALIGN_CENTER, 0);
 
-    lv_obj_t *sep = box(g_root, 40, 414, 944, 2);
+    lv_obj_t *sep = box_raw(g_root, 40, mc.sep_y, screen_w() - 80, 2);
     lv_obj_set_style_border_width(sep, 0, 0);
     int visible = total > 0 ? 7 : 6;
     if(g_main_sel >= visible) g_main_sel = visible - 1;
-    int slot = 1024 / visible;
+    int slot = screen_w() / visible;
+    int icon_w = ui_px(84);
+    if(icon_w > slot - ui_px(4)) icon_w = slot - ui_px(4);
     for(int i = 0; i < visible; ++i) {
         int action_idx = (total > 0 || i < 2) ? i : i + 1;
         const Action &a = k_actions[action_idx];
         int cx = i * slot + slot / 2;
-        lv_obj_t *icon = box(g_root, cx - 42, 416, 84, 76, i == g_main_sel);
+        lv_obj_t *icon = box_raw(g_root, cx - icon_w / 2, mc.icon_y, icon_w, mc.icon_h, i == g_main_sel);
         lv_obj_set_style_border_width(icon, 0, 0);
         lv_obj_set_style_pad_all(icon, 0, 0);
         // 图标字号大,PUA 字形在字宽里靠左、墨迹还可能比字宽宽,得铺满框再按墨迹居中
-        lv_obj_t *sym = label(icon, a.symbol, 0, 0, 84);
+        lv_obj_t *sym = label_raw(icon, a.symbol, 0, 0, icon_w);
         if(g_icon_font) lv_obj_set_style_text_font(sym, g_icon_font, 0);
         lv_obj_set_style_text_align(sym, LV_TEXT_ALIGN_CENTER, 0);
         center_ink(sym, a.symbol);
         if(i == g_main_sel) lv_obj_set_style_text_color(sym, g_theme.bg, 0);
     }
     int sel_idx = (total > 0 || g_main_sel < 2) ? g_main_sel : g_main_sel + 1;
-    lv_obj_t *hint = label(g_root, std::string("[") + k_actions[sel_idx].key + "] " + k_actions[sel_idx].title,
-                           0, 502, 1024, 34);
+    lv_obj_t *hint = label_raw(g_root, std::string("[") + k_actions[sel_idx].key + "] " + k_actions[sel_idx].title,
+                               0, mc.hint_y, screen_w(), ui_px(34));
     lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
     draw_status_bar(main_status_text(), true);
 }
@@ -2357,37 +2514,18 @@ static void editor_exit_target_from_state() {
 
 // 有未保存改动时按返回弹出的询问框
 static void draw_editor_exit_confirm() {
-    lv_obj_t *dlg = box(g_root, 312, 218, 400, 142, false);
-    lv_obj_set_style_bg_color(dlg, g_theme.bg, 0);
-    lv_obj_set_style_border_width(dlg, 2, 0);
-    lv_obj_t *t = label(dlg, "有未保存的修改", 0, 6, 392, 30);
-    lv_obj_set_style_text_align(t, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_t *a = label(dlg, "Enter 保存并返回", 0, 40, 392, 28);
-    lv_obj_set_style_text_align(a, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_t *b = label(dlg, "N 不保存返回", 0, 68, 392, 28);
-    lv_obj_set_style_text_align(b, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_t *c = label(dlg, "Esc 取消", 0, 96, 392, 28);
-    lv_obj_set_style_text_color(c, g_theme.muted, 0);
-    lv_obj_set_style_text_align(c, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_move_foreground(dlg);
-    g_editor_exit_dlg = dlg;
+    g_editor_exit_dlg = dialog_box({{"有未保存的修改", false},
+                                    {"Enter 保存并返回", false},
+                                    {"N 不保存返回", false},
+                                    {"Esc 取消", true}});
 }
 
 // Ctrl+Q 退出 app 的确认框。三种工作模式都用它退出——尤其 file/quick 模式下根本到不了
 // 主面板,没有这个键就只能去 kill 进程。
 static void draw_quit_confirm() {
-    lv_obj_t *dlg = box(g_root, 312, 240, 400, 114, false);
-    lv_obj_set_style_bg_color(dlg, g_theme.bg, 0);
-    lv_obj_set_style_border_width(dlg, 2, 0);
-    lv_obj_t *t = label(dlg, "退出 pjournal-lvgl?", 0, 6, 392, 30);
-    lv_obj_set_style_text_align(t, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_t *a = label(dlg, "Enter 退出", 0, 40, 392, 28);
-    lv_obj_set_style_text_align(a, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_t *c = label(dlg, "Esc 取消", 0, 68, 392, 28);
-    lv_obj_set_style_text_color(c, g_theme.muted, 0);
-    lv_obj_set_style_text_align(c, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_move_foreground(dlg);
-    g_quit_dlg = dlg;
+    g_quit_dlg = dialog_box({{"退出日记?", false},
+                             {"Enter 退出", false},
+                             {"Esc 取消", true}});
 }
 
 static void quit_begin() {
@@ -2416,15 +2554,15 @@ static void quit_confirm_key(int key) {
 
 static void render_editor() {
     clear_root();
-    int editor_y = 8;
-    int editor_h = 552;
+    int editor_y = ui_px(8);
+    int editor_h = chrome_bottom() - editor_y;
     // 竖排的提示词排在正文右侧的竖列里(见 editor_vt_refresh),不占顶部横条
     if(!editor_vertical() && g_quick_slot < 0 && g_file_edit_path.empty() && g_edit_file.empty() && !g_prompt.empty()) {
-        lv_obj_t *prompt = label(g_root, "提示: " + g_prompt, 8, 8, 1008, 58);
-        lv_label_set_long_mode(prompt, LV_LABEL_LONG_WRAP);
+        lv_obj_t *prompt = label(g_root, "提示: " + g_prompt, 8, 8, 1008);
         lv_obj_set_style_text_color(prompt, g_theme.muted, 0);
-        editor_y = 72;
-        editor_h = 488;
+        lv_obj_update_layout(prompt);
+        editor_y = lv_obj_get_y(prompt) + lv_obj_get_height(prompt) + ui_px(6);
+        editor_h = chrome_bottom() - editor_y;
     }
     g_editor = lv_textarea_create(g_root);
     lv_obj_set_pos(g_editor, 8, editor_y);
@@ -2623,20 +2761,22 @@ static void open_search_panel() {
     g_search_cur = -1;
     g_search_last_term.clear();
     g_search_last_text.clear();
-    g_search_panel = box(g_root, 180, 428, 664, 132, false);
+    int panel_h = ui_px(132);
+    int panel_y = (ui_px(8) + chrome_bottom()) / 2 - panel_h / 2;
+    g_search_panel = box_raw(g_root, 180, panel_y, 664, panel_h, false);
     lv_obj_set_style_bg_color(g_search_panel, g_theme.bg, 0);
     lv_obj_set_style_border_width(g_search_panel, 2, 0);
     label(g_search_panel, "查找", 8, 14, 70, 32);
     g_search_input = lv_textarea_create(g_search_panel);
-    lv_obj_set_pos(g_search_input, 82, 8);
-    lv_obj_set_size(g_search_input, 568, 48);
+    lv_obj_set_pos(g_search_input, 82, ui_px(8));
+    lv_obj_set_size(g_search_input, 568, ui_px(48));
     base_style(g_search_input);
     lv_textarea_set_one_line(g_search_input, true);
     lv_textarea_set_placeholder_text(g_search_input, "输入后 Enter 下一处");
     label(g_search_panel, "替换", 8, 78, 70, 32);
     g_search_replace = lv_textarea_create(g_search_panel);
-    lv_obj_set_pos(g_search_replace, 82, 72);
-    lv_obj_set_size(g_search_replace, 568, 48);
+    lv_obj_set_pos(g_search_replace, 82, ui_px(72));
+    lv_obj_set_size(g_search_replace, 568, ui_px(48));
     base_style(g_search_replace);
     lv_textarea_set_one_line(g_search_replace, true);
     lv_textarea_set_placeholder_text(g_search_replace, "替换为");
@@ -2656,11 +2796,13 @@ static void render_browser() {
     label(g_root, "过往日记", 8, 8, 1008, 32);
     int y = 52;
     int row_h = 52;
-    int start = std::max(0, g_browser_sel - 8);
-    for(int i = 0; i < 9 && start + i < (int)g_entries.size(); ++i) {
+    int visible = visible_rows_from(y, row_h);
+    int start = std::max(0, g_browser_sel - visible + 1);
+    for(int i = 0; i < visible && start + i < (int)g_entries.size(); ++i) {
         const auto &e = g_entries[start + i];
         lv_obj_t *r = box(g_root, 8, y + i * row_h, 1008, row_h - 4, start + i == g_browser_sel);
         lv_obj_t *t = label(r, e.date + "  " + e.title + "  " + e.preview, 4, 8, 990, 32);
+        lv_label_set_long_mode(t, LV_LABEL_LONG_CLIP);
         if(start + i == g_browser_sel) lv_obj_set_style_text_color(t, g_theme.bg, 0);
     }
     draw_status_bar("过往日记  " + std::to_string(g_entries.size()) + "篇");
@@ -2669,7 +2811,7 @@ static void render_browser() {
 static void render_viewer() {
     clear_root();
     label(g_root, g_view_file, 8, 8, 1008, 32);
-    md_readonly_create(8, 48, 1008, 516);
+    md_readonly_create(8, ui_px(48), 1008, chrome_bottom() - ui_px(48));
     md_render_readonly(g_journal.read_entry(g_view_file), 1008, k_md_line_space, &g_viewer_line_y);
     if(g_viewer_scroll >= (int)g_viewer_line_y.size()) g_viewer_scroll = (int)g_viewer_line_y.size() - 1;
     if(g_viewer_scroll < 0) g_viewer_scroll = 0;
@@ -2679,16 +2821,7 @@ static void render_viewer() {
 }
 
 static void draw_confirm_overlay(const std::string &title, const std::string &action) {
-    lv_obj_t *dlg = box(g_root, 312, 218, 400, 142, false);
-    lv_obj_set_style_bg_color(dlg, g_theme.bg, 0);
-    lv_obj_set_style_border_width(dlg, 2, 0);
-    lv_obj_t *t = label(dlg, title, 0, 24, 392, 34);
-    lv_obj_set_style_text_align(t, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_t *a = label(dlg, action, 0, 64, 392, 30);
-    lv_obj_set_style_text_align(a, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_t *c = label(dlg, "Esc/q取消", 0, 96, 392, 28);
-    lv_obj_set_style_text_align(c, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_move_foreground(dlg);
+    dialog_box({{title, false}, {action, false}, {"Esc/q取消", true}});
 }
 
 static void render_history() {
@@ -2702,7 +2835,7 @@ static void render_history() {
     if(g_history_preview && !g_history_versions.empty()) {
         const auto &v = g_history_versions[g_history_sel];
         label(g_root, "历史 " + history_filename_label(v.filename), 8, 8, 1008, 32);
-        md_readonly_create(8, 48, 1008, 516);
+        md_readonly_create(8, ui_px(48), 1008, chrome_bottom() - ui_px(48));
         md_render_readonly(g_journal.read_history_version(g_history_file, v.filename), 1008,
                            k_md_line_space, &g_viewer_line_y);
         int idx = g_history_preview_scroll;
@@ -2714,12 +2847,12 @@ static void render_history() {
     } else {
         label(g_root, "历史版本  " + g_history_file, 8, 8, 1008, 32);
         int total = (int)g_history_versions.size();
-        int visible = 9;
+        int visible = visible_rows_from(54, 54);
         if(g_history_sel < g_history_scroll) g_history_scroll = g_history_sel;
         if(g_history_sel >= g_history_scroll + visible) g_history_scroll = g_history_sel - visible + 1;
         if(g_history_scroll < 0) g_history_scroll = 0;
         if(total == 0) {
-            lv_obj_t *empty = label(g_root, "暂无历史版本。保存同一篇日记的修改后会自动生成历史。", 0, 250, 1024, 40);
+            lv_obj_t *empty = label_raw(g_root, "暂无历史版本。保存同一篇日记的修改后会自动生成历史。", 0, screen_h() / 2 - 20, screen_w(), 40);
             lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
         }
         for(int i = 0; i < visible && g_history_scroll + i < total; ++i) {
@@ -2728,6 +2861,7 @@ static void render_history() {
             lv_obj_t *r = box(g_root, 8, 54 + i * 54, 1008, 48, idx == g_history_sel);
             std::string row = history_filename_label(v.filename) + "  " + std::to_string((unsigned)v.size) + "B  " + time_label(v.mtime);
             lv_obj_t *l = label(r, row, 6, 8, 988, 30);
+            lv_label_set_long_mode(l, LV_LABEL_LONG_CLIP);
             if(idx == g_history_sel) lv_obj_set_style_text_color(l, g_theme.bg, 0);
         }
         draw_status_bar("历史版本");
@@ -2800,15 +2934,15 @@ static int gtd_visible_rows() {
 }
 
 static void gtd_center_panel(int w, int h, int &x, int &y) {
-    x = (1024 - w) / 2;
-    y = (560 - h) / 2;
+    x = (screen_w() - w) / 2;
+    y = (chrome_bottom() - h) / 2;
     if(y < 8) y = 8;
 }
 
 static lv_obj_t *gtd_dialog(const std::string &title, int w, int h) {
     int x = 0, y = 0;
     gtd_center_panel(w, h, x, y);
-    lv_obj_t *dlg = box(g_root, x, y, w, h, false);
+    lv_obj_t *dlg = box_raw(g_root, x, y, w, h, false);
     lv_obj_set_style_bg_color(dlg, g_theme.bg, 0);
     lv_obj_set_style_border_width(dlg, 2, 0);
     lv_obj_t *t = label(dlg, title, 0, 10, w - 16, 32);
@@ -2821,7 +2955,7 @@ static lv_obj_t *gtd_dialog(const std::string &title, int w, int h) {
 static void gtd_text_input(int y, int h, const std::string &hint, const std::string &initial, bool multiline = false) {
     g_gtd.input = lv_textarea_create(g_root);
     lv_obj_set_pos(g_gtd.input, 8, y);
-    lv_obj_set_size(g_gtd.input, 1008, h);
+    lv_obj_set_size(g_gtd.input, screen_w() - 16, h);
     base_style(g_gtd.input);
     if(!multiline) lv_textarea_set_one_line(g_gtd.input, true);
     if(!hint.empty()) lv_textarea_set_placeholder_text(g_gtd.input, hint.c_str());
@@ -2881,7 +3015,7 @@ static void render_gtd_tabs() {
 static void render_gtd_project_list() {
     label(g_root, "项目", 8, 8, 1008, 32);
     if(g_gtd.projectList.empty()) {
-        lv_obj_t *empty = label(g_root, "暂无项目。按 n 新建。", 0, 244, 1024, 40);
+        lv_obj_t *empty = label_raw(g_root, "暂无项目。按 n 新建。", 0, screen_h() / 2 - 20, screen_w(), 40);
         lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
         return;
     }
@@ -2917,7 +3051,7 @@ static void render_gtd_list() {
     if(g_gtd.scroll < 0) g_gtd.scroll = 0;
     bool drilled = gtd_in_project_drill();
     if(g_gtd.filtered.empty()) {
-        lv_obj_t *empty = label(g_root, "暂无任务。按 a 添加。", 0, 244, 1024, 40);
+        lv_obj_t *empty = label_raw(g_root, "暂无任务。按 a 添加。", 0, screen_h() / 2 - 20, screen_w(), 40);
         lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
     }
     for(int i = 0; i < visible && g_gtd.scroll + i < (int)g_gtd.filtered.size(); ++i) {
@@ -3052,7 +3186,8 @@ static void render_gtd_context_mgr(bool is_ctx) {
     std::string title = is_ctx ? "情境管理" : "标签管理";
     label(g_root, title + "  " + std::to_string(list.size()) + "项", 8, 8, 1008, 32);
     if(list.empty()) {
-        lv_obj_t *empty = label(g_root, is_ctx ? "暂无情境。按 a 添加。" : "暂无标签。按 a 添加。", 0, 244, 1024, 40);
+        lv_obj_t *empty = label_raw(g_root, is_ctx ? "暂无情境。按 a 添加。" : "暂无标签。按 a 添加。",
+                                0, screen_h() / 2 - 20, screen_w(), 40);
         lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
         return;
     }
@@ -3145,7 +3280,8 @@ static void render_gtd_archive() {
     }
     label(g_root, "归档管理  " + std::to_string((int)g_gtd.archiveMonths.size()) + "个月", 8, 8, 1008, 32);
     if(g_gtd.archiveMonths.empty()) {
-        lv_obj_t *empty = label(g_root, "暂无归档。完成的任务会在次月自动归档。", 0, 244, 1024, 40);
+        lv_obj_t *empty = label_raw(g_root, "暂无归档。完成的任务会在次月自动归档。",
+                                0, screen_h() / 2 - 20, screen_w(), 40);
         lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
         return;
     }
@@ -3165,7 +3301,7 @@ static void render_gtd_help() {
     lv_obj_set_style_bg_color(dlg, g_theme.bg, 0);
     lv_obj_set_style_border_width(dlg, 2, 0);
     lv_obj_move_foreground(dlg);
-    label(dlg, "GTD 快捷键", 0, 10, 608, 32);
+    label(dlg, "写作计划快捷键", 0, 10, 608, 32);
     int n = (int)(sizeof(k_gtd_help) / sizeof(k_gtd_help[0]));
     int visible = 14;
     if(g_gtd.helpScroll > n - visible) g_gtd.helpScroll = std::max(0, n - visible);
@@ -3196,25 +3332,25 @@ static void render_gtd() {
     if(g_gtd.mode == GtdMode::Picker) {
         render_gtd_underlay(GtdMode::Detail);
         render_gtd_picker();
-        draw_status_bar("GTD 选择  空格切换 Enter确定 Esc取消");
+        draw_status_bar("写作计划选择  空格切换 Enter确定 Esc取消");
         return;
     }
     if(g_gtd.mode == GtdMode::Calendar) {
         render_gtd_underlay(GtdMode::Detail);
         render_gtd_calendar();
-        draw_status_bar("GTD 日期选择");
+        draw_status_bar("写作计划日期选择");
         return;
     }
     if(g_gtd.mode == GtdMode::Summary) {
         render_gtd_underlay(g_gtd.summaryPrev);
         render_gtd_summary();
-        draw_status_bar("GTD 摘要  ↑↓滚动 Esc关闭");
+        draw_status_bar("写作计划摘要  ↑↓滚动 Esc关闭");
         return;
     }
     if(g_gtd.mode == GtdMode::Help) {
         render_gtd_underlay(g_gtd.helpPrev);
         render_gtd_help();
-        draw_status_bar("GTD 帮助  ↑↓滚动 Esc关闭");
+        draw_status_bar("写作计划帮助  ↑↓滚动 Esc关闭");
         return;
     }
     if(g_gtd.mode == GtdMode::Detail || g_gtd.mode == GtdMode::Note) {
@@ -3225,22 +3361,22 @@ static void render_gtd() {
                                    ? g_gtd.data["tasks"][g_gtd.detailIdx]["note"].asString()
                                    : "";
             gtd_text_input(48, 480, "备注内容,可多行", note, true);
-            draw_status_bar("GTD 备注  Ctrl+Enter保存 Esc取消");
+            draw_status_bar("写作计划备注  Ctrl+Enter保存 Esc取消");
         } else {
-            draw_status_bar("GTD 详情  ↑↓字段 Enter编辑 空格切换 Esc返回 ?帮助");
+            draw_status_bar("写作计划详情  ↑↓字段 Enter编辑 空格切换 Esc返回 ?帮助");
         }
         return;
     }
     if(g_gtd.mode == GtdMode::ContextMgr || g_gtd.mode == GtdMode::TagMgr) {
         render_gtd_context_mgr(g_gtd.mode == GtdMode::ContextMgr);
-        draw_status_bar(g_gtd.mode == GtdMode::ContextMgr ? "GTD 情境  a添加 r重命名 d删除 Esc返回"
-                                                          : "GTD 标签  a添加 r重命名 d删除 Esc返回");
+        draw_status_bar(g_gtd.mode == GtdMode::ContextMgr ? "写作计划情境  a添加 r重命名 d删除 Esc返回"
+                                                          : "写作计划标签  a添加 r重命名 d删除 Esc返回");
         return;
     }
     if(g_gtd.mode == GtdMode::Archive) {
         render_gtd_archive();
-        draw_status_bar(g_gtd.archiveBrowsing ? "GTD 归档浏览  ↑↓选择 Esc返回"
-                                              : "GTD 归档  ↑↓选择 Enter浏览 d删除 Esc返回");
+        draw_status_bar(g_gtd.archiveBrowsing ? "写作计划归档浏览  ↑↓选择 Esc返回"
+                                              : "写作计划归档  ↑↓选择 Enter浏览 d删除 Esc返回");
         return;
     }
     if(g_gtd.mode == GtdMode::Add || g_gtd.mode == GtdMode::AddProject ||
@@ -3255,7 +3391,7 @@ static void render_gtd() {
         label(g_root, hint + (g_gtd.pendingProject.empty() ? "" : "  (@" + g_gtd.pendingProject + ")"),
               8, 440, 1008, 26);
         gtd_text_input(470, 58, hint, "", false);
-        draw_status_bar("GTD 输入  Enter确认 Esc取消 Ctrl+Space输入法");
+        draw_status_bar("写作计划输入  Enter确认 Esc取消 Ctrl+Space输入法");
         return;
     }
     if(g_gtd.mode == GtdMode::Filter) {
@@ -3265,7 +3401,7 @@ static void render_gtd() {
         for(auto &t : g_gtd.filterTags) cur += " #" + t;
         label(g_root, "筛选: " + (cur.empty() ? "(无)" : cur), 8, 440, 1008, 26);
         gtd_text_input(470, 58, "关键词(匹配标题/备注),Enter确认", g_gtd.filterText, false);
-        draw_status_bar("GTD 筛选  Enter确认 Esc清除并返回");
+        draw_status_bar("写作计划筛选  Enter确认 Esc清除并返回");
         return;
     }
     if(g_gtd.mode == GtdMode::Rename || g_gtd.mode == GtdMode::RenameProject ||
@@ -3273,19 +3409,19 @@ static void render_gtd() {
         render_gtd_underlay(g_gtd.mode);
         label(g_root, "重命名: " + g_gtd.renameTarget, 8, 440, 1008, 26);
         gtd_text_input(470, 58, "新名称", g_gtd.renameTarget, false);
-        draw_status_bar("GTD 重命名  Enter确认 Esc取消");
+        draw_status_bar("写作计划重命名  Enter确认 Esc取消");
         return;
     }
     if(g_gtd.mode == GtdMode::Confirm) {
         render_gtd_underlay(g_gtd.confirmReturn);
         draw_confirm_overlay(g_gtd.confirmTitle, g_gtd.confirmAction);
-        draw_status_bar("GTD 确认  Enter执行 Esc取消");
+        draw_status_bar("写作计划确认  Enter执行 Esc取消");
         return;
     }
 
     if(g_gtd.view == 3 && g_gtd.projectDrill < 0) {
         render_gtd_project_list();
-        draw_status_bar("GTD 项目  " + std::to_string((int)g_gtd.projectList.size()) +
+        draw_status_bar("写作计划项目  " + std::to_string((int)g_gtd.projectList.size()) +
                         "个  Enter打开 n新建 r重命名 d删除 Esc返回");
         return;
     }
@@ -3295,7 +3431,7 @@ static void render_gtd() {
         g_gtd.notice.clear();
         return;
     }
-    std::string left = std::string("GTD ") + k_gtd_views[g_gtd.view];
+    std::string left = std::string("写作计划") + k_gtd_views[g_gtd.view];
     if(gtd_in_project_drill()) left += " @" + g_gtd.projectList[g_gtd.projectDrill];
     left += "  " + std::to_string((int)g_gtd.filtered.size()) + "项";
     if(!g_gtd.multiSel.empty()) left += "  已选" + std::to_string((int)g_gtd.multiSel.size());
@@ -3323,7 +3459,7 @@ static void outline_row_colors(lv_obj_t *obj, bool selected) {
 }
 
 static lv_obj_t *outline_hint(const std::string &text) {
-    lv_obj_t *e = label(g_root, text, 0, 260, 1024, 40);
+    lv_obj_t *e = label_raw(g_root, text, 0, screen_h() / 2 - 20, screen_w(), 40);
     lv_obj_set_style_text_align(e, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(e, g_theme.muted, 0);
     return e;
@@ -3620,7 +3756,7 @@ static void render_outline_picker() {
     const int maxVis = 6;
     int vis = total > maxVis ? maxVis : total;
     int boxH = vis * 40 + 20;
-    lv_obj_t *p = outline_panel((1024 - 520) / 2, (600 - boxH) / 2, 520, boxH);
+    lv_obj_t *p = outline_panel((screen_w() - 520) / 2, (chrome_bottom() - boxH) / 2, 520, boxH);
     int scroll = 0;
     if(total > maxVis) {
         scroll = g_ol.pickerSel - maxVis / 2;
@@ -3706,6 +3842,79 @@ static int backlight_display_percent() {
     return cur > 0 ? cur : 100;
 }
 
+static int backlight_level_index() {
+    int cur = backlight_display_percent();
+    int best = 0;
+    int best_dist = 101;
+    for(int i = 0; i < (int)(sizeof(kBacklightLevels) / sizeof(kBacklightLevels[0])); ++i) {
+        int d = std::abs(kBacklightLevels[i] - cur);
+        if(d < best_dist) { best = i; best_dist = d; }
+    }
+    return best;
+}
+
+static void backlight_osd_apply(int idx) {
+    int n = (int)(sizeof(kBacklightLevels) / sizeof(kBacklightLevels[0]));
+    if(idx < 0) idx = 0;
+    if(idx >= n) idx = n - 1;
+    if(g_settings.backlight_percent() == kBacklightLevels[idx]) return;
+    g_settings.set("backlight", std::to_string(kBacklightLevels[idx]));
+    backlight_set_percent(kBacklightLevels[idx]);
+}
+
+static void backlight_osd_hide() {
+    g_bl_osd_until = 0;
+    if(g_bl_osd) {
+        lv_obj_delete(g_bl_osd);
+        g_bl_osd = nullptr;
+        g_bl_osd_fill = nullptr;
+        g_bl_osd_pct = nullptr;
+    }
+}
+
+static void draw_backlight_osd() {
+    if(!backlight_available()) return;
+    g_bl_osd_until = lv_tick_get() + 1500;
+    if(!g_bl_osd) {
+        int w = ui_px(420);
+        if(w < 320) w = 320;
+        if(w > screen_w() - ui_px(40)) w = screen_w() - ui_px(40);
+        int h = ui_px(86);
+        int x = (screen_w() - w) / 2;
+        int y = ui_px(24);
+        g_bl_osd = box_raw(g_root, x, y, w, h, false);
+        lv_obj_set_style_bg_color(g_bl_osd, g_theme.bg, 0);
+        lv_obj_set_style_bg_opa(g_bl_osd, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(g_bl_osd, 2, 0);
+        lv_obj_move_foreground(g_bl_osd);
+        label_raw(g_bl_osd, "背光", ui_px(12), ui_px(10), w - ui_px(24), ui_line_h() + 2);
+        int track_x = ui_px(12);
+        int track_y = ui_px(48);
+        g_bl_osd_track_w = w - ui_px(112);
+        g_bl_osd_bar_h = ui_px(12);
+        lv_obj_t *track = box_raw(g_bl_osd, track_x, track_y, g_bl_osd_track_w, g_bl_osd_bar_h, false);
+        lv_obj_set_style_border_width(track, 1, 0);
+        lv_obj_set_style_pad_all(track, 0, 0);
+        g_bl_osd_fill = box_raw(g_bl_osd, track_x, track_y, 1, g_bl_osd_bar_h, false);
+        lv_obj_set_style_border_width(g_bl_osd_fill, 0, 0);
+        lv_obj_set_style_bg_color(g_bl_osd_fill, g_theme.fg, 0);
+        g_bl_osd_pct = label_raw(g_bl_osd, "", w - ui_px(88), ui_px(42), ui_px(76), ui_line_h() + 2);
+        lv_obj_set_style_text_align(g_bl_osd_pct, LV_TEXT_ALIGN_RIGHT, 0);
+    }
+    int pct = backlight_display_percent();
+    int fill = g_bl_osd_track_w * pct / 100;
+    if(fill < 1) fill = 1;
+    lv_obj_set_width(g_bl_osd_fill, fill);
+    if(g_bl_osd_pct) lv_label_set_text(g_bl_osd_pct, (std::to_string(pct) + "%").c_str());
+    lv_obj_move_foreground(g_bl_osd);
+}
+
+static void backlight_osd_step(int dir) {
+    int idx = backlight_level_index() + (dir > 0 ? 1 : -1);
+    backlight_osd_apply(idx);
+    draw_backlight_osd();
+}
+
 // 枚举型设置的候选值 (存值, 显示名)。空表示非选项字段(文本编辑或跳转)。
 static std::vector<std::pair<std::string, std::string>> setting_options(const std::string &k) {
     if(k == "theme") {
@@ -3739,9 +3948,13 @@ static std::vector<std::pair<std::string, std::string>> setting_options(const st
     if(k == "md_render" || k == "first_line_indent" || k == "version_history" ||
        k == "auto_save" || k == "recovery_draft" || k == "vertical_ref_line")
         return {{"1", "开"}, {"0", "关"}};
-    if(k == "font_size" || k == "ime_font_size") {
+    if(k == "font_size" || k == "ime_font_size" || k == "ui_font_size") {
         std::vector<std::pair<std::string, std::string>> o;
-        for(int n : {16, 18, 20, 22, 24, 28, 32, 36, 48}) o.push_back({std::to_string(n), std::to_string(n)});
+        if(k == "ui_font_size") {
+            for(int n : {24, 27, 30, 34, 38, 42, 48, 54, 60}) o.push_back({std::to_string(n), std::to_string(n)});
+        } else {
+            for(int n : {16, 18, 20, 22, 24, 28, 32, 36, 48}) o.push_back({std::to_string(n), std::to_string(n)});
+        }
         return o;
     }
     if(k == "font_file") {
@@ -3767,6 +3980,7 @@ static std::string setting_current_value(const std::string &k) {
     if(k == "home_view") return g_settings.home_view();
     if(k == "font_size") return std::to_string(g_settings.font_size());
     if(k == "ime_font_size") return std::to_string(g_settings.ime_font_size());
+    if(k == "ui_font_size") return std::to_string(g_settings.ui_font_size());
     if(k == "font_file") return g_settings.font_file().empty() ? g_fonts.default_font_path() : g_settings.font_file();
     if(k == "font_bold_file") return g_settings.font_bold_file();
     if(k == "font_italic_file") return g_settings.font_italic_file();
@@ -3785,7 +3999,10 @@ static std::string setting_current_value(const std::string &k) {
 
 static void setting_apply(const std::string &k, const std::string &v) {
     g_settings.set(k, v);
-    if(k == "font_file" || k == "font_bold_file" || k == "font_italic_file") app_ui_reload_font();
+    if(k == "font_file") g_fonts.reset_fallbacks();
+    if(k == "font_file" || k == "font_bold_file" || k == "font_italic_file" ||
+       k == "font_size" || k == "ime_font_size" || k == "ui_font_size")
+        app_ui_reload_font();
     if(k == "backlight") backlight_set_percent(atoi(v.c_str()));
     app_ui_reload_theme();
 }
@@ -3829,6 +4046,7 @@ static std::vector<SetItem> settings_items() {
         {"theme", "主题", theme_def(g_settings.theme())->label},
         {"app_mode", "工作模式", appModeLabel},
         {"home_view", "主页视图", g_settings.home_view() == "month" ? "月视图" : "周视图"},
+        {"ui_font_size", "界面字号", std::to_string(g_settings.ui_font_size())},
         {"font_size", "字号", std::to_string(g_settings.font_size())},
         {"ime_font_size", "输入法字号", std::to_string(g_settings.ime_font_size())},
         {"font_file", "正文字体", g_settings.font_file().empty() ? g_fonts.default_font_path() : g_settings.font_file()},
@@ -3840,6 +4058,8 @@ static std::vector<SetItem> settings_items() {
         {"webdav_url", "WebDAV URL", g_settings.get("webdav_url", "")},
         {"webdav_user", "WebDAV 用户", g_settings.get("webdav_user", "")},
         {"webdav_pass", "WebDAV 密码", g_settings.get("webdav_pass", "").empty() ? "" : "******"},
+        {"webdav_dir", "远程目录",
+         g_settings.get("webdav_dir", "").empty() ? "(默认 journal)" : g_settings.get("webdav_dir", "")},
         {"input_mode", "输入法", input},
         {"wifi", "WiFi管理", g_wifi.status().connected ? ("已连接 " + g_wifi.status().ssid) : "未连接"},
         {"md_render", "Markdown渲染", g_settings.markdown_render() ? "开" : "关"},
@@ -3906,7 +4126,7 @@ static void render_setting_pick() {
     int vis = total > maxVis ? maxVis : total;
     const int boxW = 640;
     int boxH = vis * 44 + 56;
-    lv_obj_t *p = box(g_root, (1024 - boxW) / 2, (600 - boxH) / 2, boxW, boxH, false);
+    lv_obj_t *p = box_raw(g_root, (screen_w() - boxW) / 2, (chrome_bottom() - boxH) / 2, boxW, boxH, false);
     lv_obj_set_style_bg_opa(p, LV_OPA_COVER, 0);
     lv_obj_t *t = label(p, g_setting_pick_label, 6, 8, boxW - 12, 30);
     lv_obj_set_style_text_align(t, LV_TEXT_ALIGN_CENTER, 0);
@@ -4088,8 +4308,8 @@ static void render_dict() {
     if(g_dict_sel >= g_dict_scroll + visible) g_dict_scroll = g_dict_sel - visible + 1;
     if(g_dict_scroll < 0) g_dict_scroll = 0;
     if(g_dict_filtered.empty()) {
-        lv_obj_t *empty = label(g_root, g_dict_entries.empty() ? "暂无词条。按 a 添加。" : "无匹配词条。",
-                                0, 252, 1024, 40);
+        lv_obj_t *empty = label_raw(g_root, g_dict_entries.empty() ? "暂无词条。按 a 添加。" : "无匹配词条。",
+                                0, screen_h() / 2 - 20, screen_w(), 40);
         lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
     }
     for(int i = 0; i < visible && g_dict_scroll + i < (int)g_dict_filtered.size(); ++i) {
@@ -4115,7 +4335,7 @@ static void render_filemgr() {
     clear_root();
     label(g_root, "文件管理", 8, 8, 1008, 32);
     if(!file_manager_server_running()) {
-        lv_obj_t *m = label(g_root, "服务未启动。端口 8080 可能已被占用。", 0, 252, 1024, 40);
+        lv_obj_t *m = label_raw(g_root, "服务未启动。端口 8080 可能已被占用。", 0, screen_h() / 2 - 20, screen_w(), 40);
         lv_obj_set_style_text_align(m, LV_TEXT_ALIGN_CENTER, 0);
         draw_status_bar("q返回");
         return;
@@ -4187,7 +4407,7 @@ static void render_inspiration() {
     if(g_inspiration_scroll < 0) g_inspiration_scroll = 0;
     auto &items = g_inspiration_data["items"];
     if(g_inspiration_filtered.empty()) {
-        lv_obj_t *empty = label(g_root, "暂无灵感。按 a 添加，/ 检索。", 0, 252, 1024, 40);
+        lv_obj_t *empty = label_raw(g_root, "暂无灵感。按 a 添加，/ 检索。", 0, screen_h() / 2 - 20, screen_w(), 40);
         lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
     }
     for(int i = 0; i < visible && g_inspiration_scroll + i < (int)g_inspiration_filtered.size(); ++i) {
@@ -4209,7 +4429,7 @@ static void render_inspiration() {
 static void render_sync() {
     clear_root();
     label(g_root, "WebDAV 同步", 8, 8, 1008, 34);
-    label(g_root, "远端: " + g_settings.get("webdav_url", ""), 8, 62, 1008, 34);
+    label(g_root, "远端: " + webdav_remote_base() + "/", 8, 62, 1008, 34);
     label(g_root, "本地: " + g_settings.journal_dir(), 8, 106, 1008, 34);
     std::string msg = g_sync_message.empty() ? "按 Enter 开始同步。请先在设置中配置 WebDAV URL、用户和密码。" : g_sync_message;
     lv_obj_t *m = label(g_root, msg, 8, 180, 1008, 160);
@@ -4220,7 +4440,7 @@ static void render_sync() {
 static void render_help() {
     clear_root();
     static const char *help[] = {
-        "主界面: p提示写作 f自由写作 v查看 w同步WebDAV t任务 o大纲 s设置 Ctrl+Q退出",
+        "主界面: p提示写作 f自由写作 v查看 w同步WebDAV t写作计划 o大纲 s设置 Ctrl+Q退出",
         "通用: hjkl/方向键移动 Enter确认 Esc/q返回 Ctrl+I灵感",
         "编辑: Ctrl+S保存 Ctrl+Q退出 Ctrl+A全选 Ctrl+C复制 Ctrl+X剪切 Ctrl+V粘贴",
         "编辑: Ctrl+Z撤销 Ctrl+R重做 Ctrl+Y历史 Ctrl+/查找替换 Ctrl+?帮助",
@@ -4232,14 +4452,14 @@ static void render_help() {
         "文件编辑: Ctrl+E文件面板 a新建 d删除 r改名 Enter编辑",
         "输入法: Ctrl+Space开关 候选数字直选 空格首选 方向键/无变换/变换/标点翻页",
         "浏览: Enter查看 e编辑 h历史 d删除 Ctrl+F发送Flomo",
-        "GTD: 1-5/←→切换视图 a加任务 i子任务 Enter详情 空格切状态 d删除 r重命名",
-        "GTD: j/k上移下移 h/l提降层级 z/Z折叠 /筛选 c/t情境标签 s摘要 A归档 E导出 n新项目 ?帮助",
+        "写作计划: 1-5/←→切换视图 a加任务 i子任务 Enter详情 空格切状态 d删除 r重命名",
+        "写作计划: j/k上移下移 h/l提降层级 z/Z折叠 /筛选 c/t情境标签 s摘要 A归档 E导出 n新项目 ?帮助",
         "大纲: 项目列表a新建 Enter打开；项目内a同级 i子级 Enter状态 d删除 ,/.调整层级",
         "WiFi: Tab扫描/已保存 r刷新 Enter连接/选择 d删保存 x断开 c重连",
         "灵感: Ctrl+I进入 a添加 Enter编辑 k关键词 /检索 c复制 d删除 q返回",
         "词库: 设置→词库管理 a添加 d删除 /检索 Space多选 Tab切换词库",
         "设置: 主题/字号/字体/保存位置/WebDAV/输入法/WiFi/Markdown",
-        "Linux版: 蓝牙/语音识别按要求移除，无声卡故打字音移除；TTF/OTF从/root/.fonts加载。",
+        "Linux版: TTF/OTF优先从当前用户 ~/.fonts 加载。",
         "UTF-8: LVGL文本和文件均为UTF-8。",
     };
     label(g_root, "快捷键帮助", 8, 8, 1008, 32);
@@ -4267,6 +4487,7 @@ static void render() {
     }
     // 退出框不属于任何一屏的渲染函数,clear_root 会把它抹掉,所以在这里补画一次。
     if(g_quit_asking) draw_quit_confirm();
+    if(g_bl_osd_until) draw_backlight_osd();
 }
 
 static void goto_screen(Screen s) {
@@ -4764,6 +4985,7 @@ static void handle_settings(int key) {
         if(k == "webdav_url") { open_setting_text("webdav_url", "WebDAV URL"); return; }
         if(k == "webdav_user") { open_setting_text("webdav_user", "WebDAV 用户"); return; }
         if(k == "webdav_pass") { open_setting_text("webdav_pass", "WebDAV 密码"); return; }
+        if(k == "webdav_dir") { open_setting_text("webdav_dir", "远程目录"); return; }
         if(k == "deepseek_key") { open_setting_text("deepseek_key", "Deepseek Key"); return; }
         if(k == "polish_prompt") { open_setting_text("polish_prompt", "润色提示词"); return; }
         if(k == "flomo_email") { open_setting_text("flomo_email", "Flomo 邮箱"); return; }
@@ -8772,6 +8994,14 @@ static void handle_key(int key) {
     // 免得被下面的输入法/文件槽位快捷键抢走。
     if(g_quit_asking) { quit_confirm_key(key); return; }
     if(key == 0x11) { quit_begin(); return; }
+    if(key == KEY_BACKLIGHT_UP || key == KEY_BACKLIGHT_DOWN) {
+        backlight_osd_step(key == KEY_BACKLIGHT_UP ? 1 : -1);
+        return;
+    }
+    if(g_bl_osd_until) {
+        if(key == 27) { backlight_osd_hide(); return; }
+        backlight_osd_hide();
+    }
     // Ctrl+Shift 轻点:只有 fcitx5 后端认(切 rime 方案),内置后端返回 false,不动。
     if(key == KEY_IM_SWITCH) {
         if(g_linux_ime.switch_schema()) update_ime_bar();
@@ -8827,6 +9057,7 @@ static void handle_key(int key) {
     case Screen::FileMgr: handle_filemgr(key); break;
     case Screen::Help: break;
     }
+    if(g_bl_osd_until) draw_backlight_osd();
 }
 
 extern "C" void app_ui_handle_key(int key) {
@@ -8870,8 +9101,14 @@ bool app_ui_should_quit() {
 
 void app_ui_tick() {
     static uint32_t next_main_status_ms = 0;
+    if(g_bl_osd_until && (int32_t)(lv_tick_get() - g_bl_osd_until) >= 0) backlight_osd_hide();
     if(g_screen == Screen::Main && g_status) {
         uint32_t tick = lv_tick_get();
+        if(g_main_ymd != 0 && g_main_ymd != local_ymd()) {
+            render();
+            next_main_status_ms = 0;
+            return;
+        }
         if(next_main_status_ms == 0 || (int32_t)(tick - next_main_status_ms) >= 0) {
             set_status(main_status_text());
             next_main_status_ms = tick + 30000;

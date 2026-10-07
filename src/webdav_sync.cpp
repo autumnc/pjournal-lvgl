@@ -6,6 +6,7 @@
 #include "settings.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -35,6 +36,99 @@ static std::string base_url() {
     return u;
 }
 
+static std::string url_encode(const std::string &s) {
+    static const char *hex = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size());
+    for(unsigned char c : s) {
+        if(isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            out += (char)c;
+        } else {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 0x0F];
+        }
+    }
+    return out;
+}
+
+static int hex_value(char c) {
+    if(c >= '0' && c <= '9') return c - '0';
+    if(c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if(c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static std::string url_decode(const std::string &s) {
+    std::string out;
+    out.reserve(s.size());
+    for(size_t i = 0; i < s.size(); ++i) {
+        if(s[i] == '%' && i + 2 < s.size()) {
+            int hi = hex_value(s[i + 1]);
+            int lo = hex_value(s[i + 2]);
+            if(hi >= 0 && lo >= 0) {
+                out += (char)((hi << 4) | lo);
+                i += 2;
+                continue;
+            }
+        }
+        out += s[i];
+    }
+    return out;
+}
+
+static std::string remote_dir_name() {
+    std::string d = trim(g_settings.get("webdav_dir", ""));
+    size_t a = d.find_first_not_of('/');
+    if(a == std::string::npos) return "journal";
+    size_t b = d.find_last_not_of('/');
+    d = d.substr(a, b - a + 1);
+    std::vector<std::string> parts;
+    size_t pos = 0;
+    while(pos < d.size()) {
+        size_t slash = d.find('/', pos);
+        std::string part = d.substr(pos, slash == std::string::npos ? std::string::npos : slash - pos);
+        part = trim(part);
+        if(!part.empty() && part != "." && part != "..") parts.push_back(part);
+        if(slash == std::string::npos) break;
+        pos = slash + 1;
+    }
+    if(parts.empty()) return "journal";
+    std::string out;
+    for(const auto &part : parts) {
+        if(!out.empty()) out += "/";
+        out += part;
+    }
+    return out;
+}
+
+static std::vector<std::string> split_remote_dir() {
+    std::vector<std::string> parts;
+    std::string d = remote_dir_name();
+    size_t pos = 0;
+    while(pos < d.size()) {
+        size_t slash = d.find('/', pos);
+        parts.push_back(d.substr(pos, slash == std::string::npos ? std::string::npos : slash - pos));
+        if(slash == std::string::npos) break;
+        pos = slash + 1;
+    }
+    return parts;
+}
+
+static std::string encode_path_segments(const std::vector<std::string> &parts) {
+    std::string out;
+    for(const auto &part : parts) {
+        if(part.empty()) continue;
+        if(!out.empty()) out += "/";
+        out += url_encode(part);
+    }
+    return out;
+}
+
+static std::string remote_dir() {
+    return encode_path_segments(split_remote_dir());
+}
+
 static void append_auth(std::vector<std::string> &args) {
     std::string user = g_settings.get("webdav_user", "");
     std::string pass = g_settings.get("webdav_pass", "");
@@ -58,7 +152,13 @@ static void append_net_opts(std::vector<std::string> &args) {
 }
 
 static std::string remote_url(const std::string &path) {
-    return base_url() + "/" + path;
+    std::string url = base_url() + "/" + remote_dir() + "/";
+    if(!path.empty()) url += url_encode(path);
+    return url;
+}
+
+std::string webdav_remote_base() {
+    return base_url() + "/" + remote_dir_name();
 }
 
 static bool is_journal_file(const std::string &name) {
@@ -105,7 +205,7 @@ static std::string url_basename(std::string href) {
     href = xml_unescape(href);
     while(!href.empty() && href.back() == '/') href.pop_back();
     size_t slash = href.rfind('/');
-    return slash == std::string::npos ? href : href.substr(slash + 1);
+    return url_decode(slash == std::string::npos ? href : href.substr(slash + 1));
 }
 
 static std::string tag_value(const std::string &block, const std::string &tag) {
@@ -123,7 +223,7 @@ static std::vector<RemoteFile> list_remote() {
     std::vector<std::string> args = {"curl", "-sS", "-X", "PROPFIND", "-H", "Depth: 1"};
     append_net_opts(args);
     append_auth(args);
-    args.push_back(remote_url("journal/"));
+    args.push_back(remote_url(""));
     std::string xml = process::run_capture(args, kCurlTimeoutMs);
     size_t pos = 0;
     while(true) {
@@ -154,20 +254,29 @@ static std::vector<RemoteFile> list_remote() {
     return out;
 }
 
-static bool curl_mkcol() {
+static bool curl_mkcol_url(const std::string &url) {
     std::vector<std::string> args = {"curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "-X", "MKCOL"};
     append_net_opts(args);
     append_auth(args);
-    args.push_back(remote_url("journal/"));
+    args.push_back(url);
     std::string code = trim(process::run_capture(args, kCurlTimeoutMs));
     return code == "201" || code == "405" || code == "301" || code == "302";
+}
+
+static bool curl_mkcol() {
+    std::string cur = base_url();
+    for(const auto &part : split_remote_dir()) {
+        cur += "/" + url_encode(part);
+        if(!curl_mkcol_url(cur + "/")) return false;
+    }
+    return true;
 }
 
 static bool curl_upload(const std::string &filename, const std::string &local_path) {
     std::vector<std::string> args = {"curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "-X", "PUT", "-T", local_path};
     append_net_opts(args);
     append_auth(args);
-    args.push_back(remote_url("journal/" + filename));
+    args.push_back(remote_url(filename));
     std::string code = trim(process::run_capture(args, kCurlTimeoutMs));
     return code == "200" || code == "201" || code == "204";
 }
@@ -176,7 +285,7 @@ static bool curl_download(const std::string &filename, const std::string &out_pa
     std::vector<std::string> args = {"curl", "-sS", "-L", "-o", out_path, "-w", "%{http_code}"};
     append_net_opts(args);
     append_auth(args);
-    args.push_back(remote_url("journal/" + filename));
+    args.push_back(remote_url(filename));
     std::string code = trim(process::run_capture(args, kCurlTimeoutMs));
     return code == "200" || code == "203";
 }
@@ -185,18 +294,21 @@ static bool curl_delete(const std::string &filename) {
     std::vector<std::string> args = {"curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "-X", "DELETE"};
     append_net_opts(args);
     append_auth(args);
-    args.push_back(remote_url("journal/" + filename));
+    args.push_back(remote_url(filename));
     std::string code = trim(process::run_capture(args, kCurlTimeoutMs));
     return code == "200" || code == "202" || code == "204" || code == "404";
 }
 
 static std::string state_path() {
-    return g_settings.get("journal_dir", "/root/pjournal") + "/.sync_state";
+    return g_settings.journal_dir() + "/.sync_state";
 }
 
 static std::map<std::string, time_t> load_state() {
     std::map<std::string, time_t> state;
-    std::istringstream in(read_whole_file(state_path()));
+    std::string raw = read_whole_file(state_path());
+    std::string want = "dir " + remote_dir_name() + "\n";
+    if(raw.compare(0, want.size(), want) != 0) return state;
+    std::istringstream in(raw.substr(want.size()));
     std::string name;
     long long t = 0;
     while(in >> name >> t) if(is_journal_file(name)) state[name] = (time_t)t;
@@ -204,7 +316,7 @@ static std::map<std::string, time_t> load_state() {
 }
 
 static void save_state(const std::map<std::string, time_t> &state) {
-    std::string s;
+    std::string s = "dir " + remote_dir_name() + "\n";
     for(const auto &p : state) s += p.first + " " + std::to_string((long long)p.second) + "\n";
     safe_write_file(state_path(), s);
 }

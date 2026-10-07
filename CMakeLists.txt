@@ -34,47 +34,31 @@ if(PJOURNAL_FCITX5)
     pkg_check_modules(GIO2 REQUIRED IMPORTED_TARGET gio-2.0)
 endif()
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
-    set(PJOURNAL_OBJCOPY_FORMAT elf32-littlearm)
-    set(PJOURNAL_OBJCOPY_ARCH arm)
-else()
-    set(PJOURNAL_OBJCOPY_FORMAT elf64-x86-64)
-    set(PJOURNAL_OBJCOPY_ARCH i386:x86-64)
-endif()
+function(pjournal_embed_binary src name)
+    set(sfile "${CMAKE_CURRENT_BINARY_DIR}/${name}.S")
+    file(WRITE "${sfile}"
+        "    .section .rodata\n"
+        "    .global _binary_${name}_start\n"
+        "    .global _binary_${name}_end\n"
+        "    .balign 16\n"
+        "_binary_${name}_start:\n"
+        "    .incbin \"${src}\"\n"
+        "_binary_${name}_end:\n"
+        "    .balign 1\n"
+        "    .section .note.GNU-stack,\"\",%progbits\n")
+    add_custom_command(
+        OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${name}.o"
+        COMMAND ${CMAKE_C_COMPILER} -c "${sfile}" -o "${CMAKE_CURRENT_BINARY_DIR}/${name}.o"
+        DEPENDS "${src}" "${sfile}"
+        VERBATIM
+    )
+    set(PJOURNAL_EMBED_OBJS ${PJOURNAL_EMBED_OBJS} "${CMAKE_CURRENT_BINARY_DIR}/${name}.o" PARENT_SCOPE)
+endfunction()
 
-set(PJOURNAL_IME_BIN ${CMAKE_CURRENT_BINARY_DIR}/ime_table_pinyin.bin)
-set(PJOURNAL_IME_OBJ ${CMAKE_CURRENT_BINARY_DIR}/ime_table_pinyin.o)
-set(PJOURNAL_LIANGFEN_BIN ${CMAKE_CURRENT_BINARY_DIR}/liangfen.bin)
-set(PJOURNAL_LIANGFEN_OBJ ${CMAKE_CURRENT_BINARY_DIR}/liangfen.o)
-set(PJOURNAL_ENGLISH_BIN ${CMAKE_CURRENT_BINARY_DIR}/english_words.txt)
-set(PJOURNAL_ENGLISH_OBJ ${CMAKE_CURRENT_BINARY_DIR}/english_words_txt.o)
-add_custom_command(
-    OUTPUT ${PJOURNAL_IME_OBJ}
-    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_SOURCE_DIR}/port/esp32_main/ime/ime_table_pinyin.bin ${PJOURNAL_IME_BIN}
-    COMMAND ${CMAKE_OBJCOPY} -I binary -O ${PJOURNAL_OBJCOPY_FORMAT} -B ${PJOURNAL_OBJCOPY_ARCH}
-            ime_table_pinyin.bin ime_table_pinyin.o
-    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/port/esp32_main/ime/ime_table_pinyin.bin
-    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
-    VERBATIM
-)
-add_custom_command(
-    OUTPUT ${PJOURNAL_LIANGFEN_OBJ}
-    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_SOURCE_DIR}/port/esp32_main/ime/liangfen.bin ${PJOURNAL_LIANGFEN_BIN}
-    COMMAND ${CMAKE_OBJCOPY} -I binary -O ${PJOURNAL_OBJCOPY_FORMAT} -B ${PJOURNAL_OBJCOPY_ARCH}
-            liangfen.bin liangfen.o
-    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/port/esp32_main/ime/liangfen.bin
-    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
-    VERBATIM
-)
-add_custom_command(
-    OUTPUT ${PJOURNAL_ENGLISH_OBJ}
-    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_SOURCE_DIR}/port/esp32_main/ime/english_words.txt ${PJOURNAL_ENGLISH_BIN}
-    COMMAND ${CMAKE_OBJCOPY} -I binary -O ${PJOURNAL_OBJCOPY_FORMAT} -B ${PJOURNAL_OBJCOPY_ARCH}
-            english_words.txt english_words_txt.o
-    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/port/esp32_main/ime/english_words.txt
-    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
-    VERBATIM
-)
+set(PJOURNAL_EMBED_OBJS)
+pjournal_embed_binary(${CMAKE_CURRENT_SOURCE_DIR}/port/esp32_main/ime/ime_table_pinyin.bin ime_table_pinyin_bin)
+pjournal_embed_binary(${CMAKE_CURRENT_SOURCE_DIR}/port/esp32_main/ime/liangfen.bin liangfen_bin)
+pjournal_embed_binary(${CMAKE_CURRENT_SOURCE_DIR}/port/esp32_main/ime/english_words.txt english_words_txt)
 
 add_compile_definitions(LV_CONF_INCLUDE_SIMPLE)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
@@ -131,6 +115,7 @@ if(PJOURNAL_YONG AND EXISTS "${PJOURNAL_YONG_DIR}/include/yong.h")
         "SHELL:-include stdint.h -include stdbool.h")
     target_compile_definitions(pjournal_yong PUBLIC
         PJOURNAL_HAS_YONG PJOURNAL_YONG_DATA="${PJOURNAL_YONG_DATA}")
+    set_target_properties(pjournal_yong PROPERTIES C_STANDARD 11)
 else()
     message(STATUS "yong 后端关闭(${PJOURNAL_YONG_DIR}/include/yong.h 不存在)")
 endif()
@@ -160,9 +145,7 @@ add_executable(pjournal-lvgl
     port/esp32_main/json_utils.cpp
     port/esp32_main/json_parser.cpp
     port/esp32_main/ime/IME.cpp
-    ${PJOURNAL_IME_OBJ}
-    ${PJOURNAL_LIANGFEN_OBJ}
-    ${PJOURNAL_ENGLISH_OBJ}
+    ${PJOURNAL_EMBED_OBJS}
 )
 
 target_include_directories(pjournal-lvgl PRIVATE include third_party/freetype/include port/esp32_main port/esp32_main/ime)

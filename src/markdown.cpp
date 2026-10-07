@@ -184,6 +184,13 @@ static const char *kHeadingGlyph[6] = {
     "\xf3\xb0\x8e\xad", "\xf3\xb0\x8e\xb1", "\xf3\xb0\x8e\xb3",
 };
 
+static const char *kIndentUnit = "\xe3\x80\x80";
+static const char *kBulletGlyph[3] = {
+    "\xe2\x80\xa2",
+    "\xe2\x97\x8b",
+    "\xe2\x96\xa0",
+};
+
 MdRender md_build_line(const std::string &raw, bool in_code, int caret_rel) {
     MdRender l;
     std::string prefix;
@@ -193,6 +200,10 @@ MdRender md_build_line(const std::string &raw, bool in_code, int caret_rel) {
         while(lead < raw.size() && raw[lead] == ' ') lead++;
         std::string t = raw.substr(lead);
         size_t b = 0;
+        int nest = (int)lead / 2;
+        if(nest > 8) nest = 8;
+        std::string indent;
+        for(int q = 0; q < nest; ++q) indent += kIndentUnit;
 
         int h = md_heading_level_of(raw);
         if(h > 0) {
@@ -209,10 +220,9 @@ MdRender md_build_line(const std::string &raw, bool in_code, int caret_rel) {
         } else if(!t.empty() && t[0] == '>') {
             b = 1;
             while(b < t.size() && t[b] == ' ') b++;
-            // 引用整块比正文右移一格。用两个半角空格而不是全角空格:横排宽度一样,
-            // 竖排也是 2 格,与缩进两级列表(两个空格)对齐,两种排版看着一致。
-            prefix = "  \xe2\x96\x8d ";
+            prefix = std::string(kIndentUnit) + "\xe2\x96\x8d ";
             l.muted = true;
+            l.prefix_indent = true;
             l.body_off = (int)(lead + b);
         } else if(t.size() >= 2 && (t[0] == '-' || t[0] == '*' || t[0] == '+') && t[1] == ' ') {
             size_t k = 2;
@@ -222,9 +232,10 @@ MdRender md_build_line(const std::string &raw, bool in_code, int caret_rel) {
                 task = true; done = true; k += 3;
             }
             while(k < t.size() && t[k] == ' ') k++;
-            if(task) prefix = done ? "[\xe2\x9c\x93] " : "[ ] ";
-            else prefix = lead > 0 ? "\xe2\x97\x8b " : "\xe2\x80\xa2 ";  // 次级列表用空心圆
+            if(task) prefix = indent + (done ? "[\xe2\x9c\x93] " : "[ ] ");
+            else prefix = indent + std::string(kBulletGlyph[nest % 3]) + " ";
             l.muted = task;
+            l.prefix_indent = true;
             l.body_off = (int)(lead + k);
         } else {
             size_t k = 0;
@@ -234,7 +245,8 @@ MdRender md_build_line(const std::string &raw, bool in_code, int caret_rel) {
             if(k > 0 && k < t.size() && (t[k] == '.' || t[k] == ')' || cn_sep)) {
                 size_t m = k + (cn_sep ? 3 : 1);
                 while(m < t.size() && t[m] == ' ') m++;
-                prefix = t.substr(0, m);
+                prefix = indent + t.substr(0, m);
+                l.prefix_indent = true;
                 l.body_off = (int)(lead + m);
             } else {
                 // 中文数字序号:一、二、十、十一、…(原文渲染,前缀即序号+顿号)
@@ -243,15 +255,12 @@ MdRender md_build_line(const std::string &raw, bool in_code, int caret_rel) {
                 if(v >= 0 && nl > 0 && t.compare(nl, 3, "\xe3\x80\x81") == 0) {
                     size_t m = (size_t)nl + 3;
                     while(m < t.size() && t[m] == ' ') m++;
-                    prefix = t.substr(0, m);
+                    prefix = indent + t.substr(0, m);
+                    l.prefix_indent = true;
                     l.body_off = (int)(lead + m);
                 }
             }
         }
-
-        // 嵌套块的缩进(前导空格)跟着前缀一起显示:横排靠它右移,竖排照旧把这些
-        // 字节排成空白格。前缀为空的行(普通段落)不动,竖排仍自己补缩进格。
-        if(!prefix.empty() && lead > 0) prefix = raw.substr(0, lead) + prefix;
 
         // 光标落在块标记(#、-、1.、一、、>)的字节范围里时,标记原样平文显示;
         // 离开这一小段才换成图标/子弹并套上标题样式,与行内标记的显隐规则一致。

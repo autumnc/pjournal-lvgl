@@ -40,6 +40,7 @@ struct MdRender {
     // 光标停在块标记(#、-、1.、一、、>)里:前缀原样显示,不再换成图标。
     // 此时前缀与原始字节一一对应,光标可以直接在前缀里挪。
     bool plain_marker = false;
+    bool prefix_indent = false;
     int level = 0;
 };
 
