@@ -33,6 +33,15 @@ public:
     std::string wlan_interface() const;
     int backlight_percent() const;
 
+    // 内置输入法设置。键名与 ESP32 版一致(移植过来的 IME.cpp 原样调用驼峰 getter)。
+    std::string imeFuzzy() const;          // "zcs" / "+nl" / "+nasal" / "all" / "off"
+    std::string imePredictMode() const;    // "always" / "space" / "off"
+    bool imeSentence() const;
+    bool imeDocContext() const;
+    bool imeCandidateHighlight() const;
+    std::string letterSelKey() const;      // "off"/"tab"/"lctrl"/"lwin"/"lalt"/"ralt"/"rwin"/"rctrl"
+    bool imeDebug() const;
+
 private:
     std::string settings_dir() const;
 };

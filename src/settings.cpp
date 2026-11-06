@@ -95,3 +95,11 @@ int Settings::backlight_percent() const {
     if(n > 100) n = 100;
     return n;
 }
+
+std::string Settings::imeFuzzy() const { return get("ime_fuzzy", "zcs"); }
+std::string Settings::imePredictMode() const { return get("ime_predict_mode", "always"); }
+bool Settings::imeSentence() const { return get("ime_sentence", "1") != "0"; }
+bool Settings::imeDocContext() const { return get("ime_doc_context", "1") != "0"; }
+bool Settings::imeCandidateHighlight() const { return get("ime_candidate_highlight", "0") == "1"; }
+std::string Settings::letterSelKey() const { return get("letter_sel_key", "off"); }
+bool Settings::imeDebug() const { return get("ime_debug", "0") == "1"; }

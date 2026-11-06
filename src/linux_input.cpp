@@ -21,6 +21,8 @@ extern "C" void app_ui_handle_key(int key);
 extern "C" void app_ui_request_quit();
 extern "C" bool app_ui_is_main_screen();
 
+static void dispatch_key(int key);
+
 static constexpr int APP_KEY_UP = 0x80;
 static constexpr int APP_KEY_DOWN = 0x81;
 static constexpr int APP_KEY_LEFT = 0x82;
@@ -44,6 +46,41 @@ static constexpr int APP_KEY_SEARCH = 0xA2;
 static constexpr int APP_KEY_HELP = 0xA3;
 static constexpr int APP_KEY_REDO = 0xA4;
 static constexpr int APP_KEY_IM_SWITCH = 0xA5;
+// 修饰键单击(与 include/key_codes.h 的 KEY_MOD_TAP_* 一致):输入法拿它当字母选字键
+static constexpr int APP_KEY_MOD_TAP_LCTRL = 0xB0;
+static constexpr int APP_KEY_MOD_TAP_LGUI = 0xB1;
+static constexpr int APP_KEY_MOD_TAP_LALT = 0xB2;
+static constexpr int APP_KEY_MOD_TAP_RALT = 0xB3;
+static constexpr int APP_KEY_MOD_TAP_RGUI = 0xB4;
+static constexpr int APP_KEY_MOD_TAP_RCTRL = 0xB5;
+
+// 修饰键 evdev code → 单击事件码;不是可单击修饰键返回 0
+static int modifier_tap_key(int code) {
+    switch(code) {
+    case KEY_LEFTCTRL: return APP_KEY_MOD_TAP_LCTRL;
+    case KEY_RIGHTCTRL: return APP_KEY_MOD_TAP_RCTRL;
+    case KEY_LEFTALT: return APP_KEY_MOD_TAP_LALT;
+    case KEY_RIGHTALT: return APP_KEY_MOD_TAP_RALT;
+    case KEY_LEFTMETA: return APP_KEY_MOD_TAP_LGUI;
+    case KEY_RIGHTMETA: return APP_KEY_MOD_TAP_RGUI;
+    default: return 0;
+    }
+}
+
+struct TapState {
+    int code = 0;       // 按住的 evdev code,0 = 没按
+    bool used = false;  // 按住期间按过别的键,抬起时不能再算单击
+};
+
+static void handle_tap_modifier(TapState &tap, int code, bool down) {
+    if(down) {
+        tap.code = code;
+        tap.used = false;
+    } else if(tap.code == code) {
+        if(!tap.used) dispatch_key(modifier_tap_key(code));
+        tap.code = 0;
+    }
+}
 
 struct InputState {
     bool shift = false;
@@ -51,6 +88,9 @@ struct InputState {
     bool alt = false;
     bool left_shift_down = false;
     bool left_shift_used = false;
+    TapState ctrl_tap;
+    TapState alt_tap;
+    TapState gui_tap;
 };
 
 // 控制台这条路上,tty 只送出按 K_XLATE 键表翻译后的字节,修饰键的信息到这里就丢了:
@@ -278,6 +318,9 @@ static void input_thread(std::string device) {
                 st.left_shift_down = true;
                 st.left_shift_used = false;
                 st.shift = true;
+                if(st.ctrl_tap.code) st.ctrl_tap.used = true;
+                if(st.alt_tap.code) st.alt_tap.used = true;
+                if(st.gui_tap.code) st.gui_tap.used = true;
             } else {
                 if(st.left_shift_down && !st.left_shift_used) dispatch_key(APP_KEY_LSHIFT_TAP);
                 st.left_shift_down = false;
@@ -285,11 +328,49 @@ static void input_thread(std::string device) {
             }
             continue;
         }
-        if(ev.code == KEY_RIGHTSHIFT) { st.shift = down; continue; }
-        if(ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL) { st.ctrl = down; continue; }
-        if(ev.code == KEY_LEFTALT || ev.code == KEY_RIGHTALT) { st.alt = down; continue; }
+        if(ev.code == KEY_RIGHTSHIFT) {
+            if(down) {
+                if(st.ctrl_tap.code) st.ctrl_tap.used = true;
+                if(st.alt_tap.code) st.alt_tap.used = true;
+                if(st.gui_tap.code) st.gui_tap.used = true;
+            }
+            st.shift = down;
+            continue;
+        }
+        if(ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL) {
+            st.ctrl = down;
+            handle_tap_modifier(st.ctrl_tap, ev.code, down);
+            if(down) {
+                if(st.alt_tap.code) st.alt_tap.used = true;
+                if(st.gui_tap.code) st.gui_tap.used = true;
+                if(st.shift) st.ctrl_tap.used = true;
+            }
+            continue;
+        }
+        if(ev.code == KEY_LEFTALT || ev.code == KEY_RIGHTALT) {
+            st.alt = down;
+            handle_tap_modifier(st.alt_tap, ev.code, down);
+            if(down) {
+                if(st.ctrl_tap.code) st.ctrl_tap.used = true;
+                if(st.gui_tap.code) st.gui_tap.used = true;
+                if(st.shift || st.ctrl) st.alt_tap.used = true;
+            }
+            continue;
+        }
+        if(ev.code == KEY_LEFTMETA || ev.code == KEY_RIGHTMETA) {
+            handle_tap_modifier(st.gui_tap, ev.code, down);
+            if(down) {
+                if(st.ctrl_tap.code) st.ctrl_tap.used = true;
+                if(st.alt_tap.code) st.alt_tap.used = true;
+                if(st.shift || st.ctrl || st.alt) st.gui_tap.used = true;
+            }
+            continue;
+        }
         if(!down) continue;
         if(st.left_shift_down) st.left_shift_used = true;
+        if(st.ctrl_tap.code) st.ctrl_tap.used = true;
+        if(st.alt_tap.code) st.alt_tap.used = true;
+        if(st.gui_tap.code) st.gui_tap.used = true;
         if(!st.ctrl && !st.alt && ev.code == KEY_Q && app_ui_is_main_screen()) {
             app_ui_request_quit();
             continue;
@@ -316,6 +397,7 @@ static void console_modifier_thread(std::string device) {
     // Ctrl+Shift 轻点切输入法方案。combo_used 记的是「这一对按住期间按过第三个键」,
     // 有的话就是 Ctrl+Shift+F/Z// 那类组合,不能再当成轻点。
     bool combo_used = false;
+    TapState ctrl_tap, alt_tap, gui_tap;
     input_event ev {};
     while(read(fd, &ev, sizeof(ev)) == sizeof(ev)) {
         if(ev.type != EV_KEY) continue;
@@ -328,7 +410,10 @@ static void console_modifier_thread(std::string device) {
                 } else {
                     if(left_down && !used) {
                         if(g_ctrl_held.load()) {
-                            if(!combo_used) dispatch_key(APP_KEY_IM_SWITCH);
+                            if(!combo_used) {
+                                dispatch_key(APP_KEY_IM_SWITCH);
+                                ctrl_tap.used = true;
+                            }
                         } else {
                             dispatch_key(APP_KEY_LSHIFT_TAP);
                         }
@@ -336,22 +421,57 @@ static void console_modifier_thread(std::string device) {
                     left_down = false;
                 }
             }
-            if(down && g_ctrl_held.load()) combo_used = false;
+            if(down) {
+                // Shift 加入组合时,别的修饰键就不是"单击"了
+                if(ctrl_tap.code) ctrl_tap.used = true;
+                if(alt_tap.code) alt_tap.used = true;
+                if(gui_tap.code) gui_tap.used = true;
+                if(g_ctrl_held.load()) combo_used = false;
+            }
             g_shift_held = down;
             continue;
         }
         if(ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL) {
-            if(down && g_shift_held.load()) combo_used = false;
-            // 先松 Ctrl 也算轻点,但要把 used 立起来,免得随后松 Shift 又发一次
-            else if(!down && g_shift_held.load() && !combo_used) {
-                dispatch_key(APP_KEY_IM_SWITCH);
-                used = true;
+            if(down) {
+                if(g_shift_held.load()) combo_used = false;
+                g_ctrl_held = true;
+                ctrl_tap.code = ev.code;
+                ctrl_tap.used = g_shift_held.load() || alt_tap.code != 0 || gui_tap.code != 0;
+            } else {
+                // 先松 Ctrl 也算轻点,但要把 used 立起来,免得随后松 Shift 又发一次
+                if(g_shift_held.load() && !combo_used) {
+                    dispatch_key(APP_KEY_IM_SWITCH);
+                    used = true;
+                    ctrl_tap.used = true;
+                }
+                g_ctrl_held = false;
+                handle_tap_modifier(ctrl_tap, ev.code, false);
             }
-            g_ctrl_held = down;
+            continue;
+        }
+        if(ev.code == KEY_LEFTALT || ev.code == KEY_RIGHTALT) {
+            if(down) {
+                alt_tap.code = ev.code;
+                alt_tap.used = g_shift_held.load() || g_ctrl_held.load() || gui_tap.code != 0;
+            } else {
+                handle_tap_modifier(alt_tap, ev.code, false);
+            }
+            continue;
+        }
+        if(ev.code == KEY_LEFTMETA || ev.code == KEY_RIGHTMETA) {
+            if(down) {
+                gui_tap.code = ev.code;
+                gui_tap.used = g_shift_held.load() || g_ctrl_held.load() || alt_tap.code != 0;
+            } else {
+                handle_tap_modifier(gui_tap, ev.code, false);
+            }
             continue;
         }
         if(!down) continue;
         if(left_down) used = true;
+        if(ctrl_tap.code) ctrl_tap.used = true;
+        if(alt_tap.code) alt_tap.used = true;
+        if(gui_tap.code) gui_tap.used = true;
         if(g_ctrl_held.load() && g_shift_held.load()) combo_used = true;
         if(g_ctrl_held && g_shift_held) {
             if(ev.code == KEY_F) dispatch_key(APP_KEY_TRAD_TOGGLE);

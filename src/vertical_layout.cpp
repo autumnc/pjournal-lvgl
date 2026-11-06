@@ -8,6 +8,13 @@ static bool vt_is_fence(const std::string &line) {
     return line.compare(lead, 3, "```") == 0 || line.compare(lead, 3, "~~~") == 0;
 }
 
+// 段落之间的空行(只含空白):竖排要多让出一列,分段才看得出来。
+static bool vt_blank(const std::string &line) {
+    for(unsigned char c : line)
+        if(c != ' ' && c != '\t' && c != '\r') return false;
+    return true;
+}
+
 static void vt_code_flags(const std::vector<std::string> &lines, std::vector<char> &in_code) {
     in_code.assign(lines.size(), 0);
     bool code = false;
@@ -157,6 +164,8 @@ VerticalData build_vertical_data(const std::vector<std::string> &lines, int rows
             ++row;
         }
         data.cols.push_back({(int)li, start, (int)cs.size()});
+        // 段落空行多占一列,否则竖排里两段之间只隔一列,看着像同一段
+        if(md_on && !in_code[li] && vt_blank(line)) data.cols.push_back({(int)li, 0, 0});
     }
     if(data.cols.empty()) data.cols.push_back({0, 0, 0});
     return data;

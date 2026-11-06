@@ -3,6 +3,7 @@
 #include "font_manager.h"
 #include "journal_storage.h"
 #include "linux_console.h"
+#include "linux_ime.h"
 #include "linux_input.h"
 #include "settings.h"
 
@@ -138,8 +139,10 @@ int main() {
     while(!app_ui_should_quit()) {
         app_ui_tick();
         lv_timer_handler();
+        g_linux_ime.flush_user_dict_idle();
         usleep(5000);
     }
+    g_linux_ime.flush_user_dict_now();
     linux_console_restore();
     return 0;
 }

@@ -221,6 +221,10 @@ static int g_settings_scroll = 0;
 static int g_wifi_sel = 0;
 static int g_wifi_saved_sel = 0;
 static std::vector<JournalEntry> g_entries;
+// 过往日记列表只在进入该屏/删除后重读。以前每次按键渲染都全量读盘,翻列表会一顿一顿的。
+static bool g_browser_needs_reload = true;
+// 删除日记不可恢复(d 键很容易误碰),先弹框确认
+static bool g_browser_confirm_delete = false;
 static std::vector<JournalHistoryVersion> g_history_versions;
 static std::vector<WifiNetwork> g_wifi_entries;
 static std::vector<WifiSavedNetwork> g_wifi_saved_entries;
@@ -460,9 +464,28 @@ static const lv_font_t *g_current_font = nullptr;
 // 正文行距。着重号画在字脚下面,行挨太紧会蹭到下一行,必须留出余量。
 static constexpr int k_md_line_space = 6;
 
+// 段落之间的空行比普通行多留半行,不然两段挨在一起分不出界。
+// 代码块里的空行只是代码的一部分,不加。
+static bool md_blank_line(const std::string &raw) {
+    for(unsigned char c : raw)
+        if(c != ' ' && c != '\t' && c != '\r') return false;
+    return true;
+}
+
+// 段距:一行一段的写法(回车分段)靠行尾加半行;空行本身已经是一整行白,
+// 它前面的段落就不再重复加,免得空行两侧双倍拉开。
+static int md_para_extra(const std::vector<std::string> &lines, size_t i,
+                         const std::vector<char> &in_code, int line_h) {
+    if(in_code[i]) return 0;
+    if(md_blank_line(lines[i])) return line_h / 2;
+    if(i + 1 < lines.size() && !in_code[i + 1] && md_blank_line(lines[i + 1])) return 0;
+    return line_h / 2;
+}
+
 static void render();
 static void goto_screen(Screen s);
 static void save_editor_text();
+static void draw_confirm_overlay(const std::string &title, const std::string &action);
 static void editor_follow_cursor();
 static void editor_md_refresh();
 static void editor_md_create(int x, int y, int w, int h, int content_w);
@@ -2101,6 +2124,7 @@ static void draw_file_panel() {
 
 static std::string editor_ime_text() {
     if(!g_linux_ime.active()) return "EN";
+    if(g_linux_ime.delete_mode()) return "[删]";
     if(g_linux_ime.english()) return "[英]";
     // [输入法名首字]:雾凇拼音 → [雾]、yong 的永码 → [永]。内置输入法没有方案概念
     // (schema_name() 空串),退回原来的 [中]。
@@ -2130,11 +2154,17 @@ static void ime_bar_layout_horizontal(int x, int y, int max_w) {
     g_linux_ime.set_page_size(kImeCandPerPage);
 
     std::string head = g_linux_ime.composition();
+    std::string mode = g_linux_ime.mode_label();   // [删]/[联]/[两]
+    if(!mode.empty()) head = head.empty() ? mode : mode + " " + head;
     const auto &c = g_linux_ime.candidates();
     int hi = g_linux_ime.highlight_index();
+    // 字母选字待选时序号画成 q./w./e. …(只认前 9 条,画什么就得按什么)
+    bool letter_sel = g_linux_ime.letter_select_armed();
+    std::string sel_keys = letter_sel ? g_linux_ime.letter_sel_keys() : std::string();
     std::string s;
     for(size_t i = 0; i < c.size(); ++i) {
-        std::string part = std::to_string((int)i + 1) + "." + c[i];
+        std::string part = (letter_sel && i < sel_keys.size()) ? std::string(1, sel_keys[i]) + "." + c[i]
+                                                               : std::to_string((int)i + 1) + "." + c[i];
         if((int)i == hi) part = "[" + part + "]";
         if(!s.empty()) s += " ";
         s += part;
@@ -2177,12 +2207,17 @@ static void ime_bar_layout_vertical() {
     g_linux_ime.set_page_size(kRows);
 
     std::string head = g_linux_ime.composition();
+    std::string mode = g_linux_ime.mode_label();   // [删]/[联]/[两]
+    if(!mode.empty()) head = head.empty() ? mode : mode + " " + head;
     const auto &c = g_linux_ime.candidates();
     int hi = g_linux_ime.highlight_index();
+    bool letter_sel = g_linux_ime.letter_select_armed();
+    std::string sel_keys = letter_sel ? g_linux_ime.letter_sel_keys() : std::string();
     int wmax = f ? (int)lv_text_get_width(head.c_str(), (uint32_t)head.size(), f, 0) : 0;
     std::string s;
     for(size_t i = 0; i < c.size(); ++i) {
-        std::string part = std::to_string((int)i + 1) + "." + c[i];
+        std::string part = (letter_sel && i < sel_keys.size()) ? std::string(1, sel_keys[i]) + "." + c[i]
+                                                               : std::to_string((int)i + 1) + "." + c[i];
         if((int)i == hi) part = "[" + part + "]";
         if(!s.empty()) s += "\n";
         s += part;
@@ -2361,6 +2396,11 @@ static void render_main() {
     main_cal_band(band_top, band_bot);
     const lv_font_t *calf = g_cal_font ? g_cal_font : g_ui_font;
     int cal_lh = lv_font_get_line_height(calf ? calf : LV_FONT_DEFAULT);
+    // 整屏只扫一次目录:落笔标记、总计、今日、连续都从这份快照里取
+    const JournalStats jstats = g_journal.stats();
+    auto has_day = [&jstats](const char *ds) {
+        return std::binary_search(jstats.dates.begin(), jstats.dates.end(), std::string(ds));
+    };
     auto cal_label = [&](const std::string &s, int x, int y, int w) {
         lv_obj_t *o = label_raw(g_root, s, x, y, w, cal_lh);
         lv_obj_set_style_text_font(o, calf, 0);
@@ -2395,7 +2435,7 @@ static void render_main() {
             localtime_r(&day_t, &day_tm);
             char ds[16];
             strftime(ds, sizeof(ds), "%Y-%m-%d", &day_tm);
-            bool has = g_journal.has_entry(ds);
+            bool has = has_day(ds);
             bool today = day == local.tm_mday;
             std::string cell = std::to_string(day);
             // 标记位始终占一个字符,否则居中时无标记的日期会比有标记的偏右
@@ -2427,7 +2467,7 @@ static void render_main() {
             strftime(ds, sizeof(ds), "%Y-%m-%d", &dtm);
             strftime(md, sizeof(md), "%m-%d", &dtm);
             bool is_today = i == since_mon;
-            bool has = g_journal.has_entry(ds);
+            bool has = has_day(ds);
             const char *mark = has ? "✓" : (d <= now ? "·" : "");
             int cx = i * col_w;
             if(is_today) {
@@ -2446,9 +2486,9 @@ static void render_main() {
     }
 
     MainChrome mc = main_chrome();
-    int total = g_journal.total_entries();
-    int today_count = g_journal.count_today();
-    lv_obj_t *stats = label_raw(g_root, "连续:" + std::to_string(g_journal.streak()) + "天 总计:" + std::to_string(total) + "篇 今日:" + std::to_string(today_count) + "篇",
+    int total = jstats.total;
+    int today_count = jstats.today;
+    lv_obj_t *stats = label_raw(g_root, "连续:" + std::to_string(jstats.streak) + "天 总计:" + std::to_string(total) + "篇 今日:" + std::to_string(today_count) + "篇",
                                 0, mc.stats_y, screen_w(), ui_px(32));
     lv_obj_set_style_text_align(stats, LV_TEXT_ALIGN_CENTER, 0);
 
@@ -2599,7 +2639,12 @@ static void render_editor() {
             }
         }
     }
-    if(initial.empty() && !g_edit_file.empty() && g_quick_slot < 0 && g_file_edit_path.empty()) initial = extract_body(g_journal.read_entry(g_edit_file));
+    if(initial.empty() && !g_edit_file.empty() && g_quick_slot < 0 && g_file_edit_path.empty()) {
+        std::string full = g_journal.read_entry(g_edit_file);
+        initial = extract_body(full);
+        // 打开已有日记时把「提示词」一并带回,否则保存时头部会被改写成「自由写作」
+        g_prompt = journal_prompt(full);
+    }
     if(!initial.empty()) lv_textarea_set_text(g_editor, initial.c_str());
     lv_obj_add_state(g_editor, LV_STATE_FOCUSED);
     lv_group_focus_obj(g_editor);
@@ -2656,6 +2701,20 @@ static std::vector<std::pair<int,int>> search_scan(const std::string &text, cons
 static int editor_caret_byte() {
     const char *t = g_editor ? lv_textarea_get_text(g_editor) : nullptr;
     return (int)lv_text_encoded_get_byte_id(t ? t : "", lv_textarea_get_cursor_pos(g_editor));
+}
+
+// 喂给输入法的"文档上下文":光标之前的正文尾部,最多 640 字节(约 200 个汉字)。
+// 只取光标之前的内容 —— 后面还没写的不算上下文;截断点回退到 UTF-8 字边界。
+static std::string editor_ime_context_text() {
+    if(!g_editor) return std::string();
+    const char *t = lv_textarea_get_text(g_editor);
+    if(!t) return std::string();
+    std::string all(t);
+    size_t end = (size_t)editor_caret_byte();
+    if(end > all.size()) end = all.size();
+    size_t start = end > 640 ? end - 640 : 0;
+    while(start < end && ((unsigned char)all[start] & 0xC0) == 0x80) ++start;
+    return all.substr(start, end - start);
 }
 
 // 词或正文变了就重算;匹配表失效后 g_search_cur 归 -1,由下一步按光标重新落点。
@@ -2790,9 +2849,13 @@ static void open_search_panel() {
 
 static void render_browser() {
     clear_root();
-    g_entries = g_journal.list_entries();
+    if(g_browser_needs_reload) {
+        g_entries = g_journal.list_entries();
+        g_browser_needs_reload = false;
+    }
     if(g_browser_sel >= (int)g_entries.size()) g_browser_sel = (int)g_entries.size() - 1;
     if(g_browser_sel < 0) g_browser_sel = 0;
+    if(g_browser_confirm_delete && g_entries.empty()) g_browser_confirm_delete = false;
     label(g_root, "过往日记", 8, 8, 1008, 32);
     int y = 52;
     int row_h = 52;
@@ -2806,6 +2869,9 @@ static void render_browser() {
         if(start + i == g_browser_sel) lv_obj_set_style_text_color(t, g_theme.bg, 0);
     }
     draw_status_bar("过往日记  " + std::to_string(g_entries.size()) + "篇");
+    if(g_browser_confirm_delete && !g_entries.empty())
+        draw_confirm_overlay("删除「" + g_entries[g_browser_sel].date + " " + g_entries[g_browser_sel].title + "」?",
+                             "Enter删除");
 }
 
 static void render_viewer() {
@@ -2818,6 +2884,17 @@ static void render_viewer() {
     if(!g_viewer_line_y.empty())
         lv_obj_scroll_to_y(g_ro_view, g_viewer_line_y[g_viewer_scroll], LV_ANIM_OFF);
     draw_status_bar("阅读");
+}
+
+// 阅读时只滚视口,不重排整篇:render_viewer 会重新读盘并把整篇 markdown 再排一遍,
+// 长文按一下 j 卡一下。
+static void viewer_scroll_by(int delta) {
+    int n = (int)g_viewer_line_y.size();
+    g_viewer_scroll += delta;
+    if(n <= 0) g_viewer_scroll = 0;
+    else if(g_viewer_scroll >= n) g_viewer_scroll = n - 1;
+    else if(g_viewer_scroll < 0) g_viewer_scroll = 0;
+    if(g_ro_view && n > 0) lv_obj_scroll_to_y(g_ro_view, g_viewer_line_y[g_viewer_scroll], LV_ANIM_OFF);
 }
 
 static void draw_confirm_overlay(const std::string &title, const std::string &action) {
@@ -3945,8 +4022,20 @@ static std::vector<std::pair<std::string, std::string>> setting_options(const st
                 {"typewriter_focus", "打字机聚焦"}};
     if(k == "vertical_ref_line_style")
         return {{"solid", "实线"}, {"dash", "虚线"}, {"dot", "点状虚线"}};
+    // 内置输入法选项。值与键名和 ESP32 版一致(见 Settings::imeFuzzy 等)。
+    if(k == "ime_fuzzy")
+        return {{"zcs", "z/zh c/ch s/sh"},
+                {"zcs,nl", "+ n/l"},
+                {"zcs,eneng,ining", "+ 前后鼻音"},
+                {"all", "全部"},
+                {"off", "关闭"}};
+    if(k == "ime_predict_mode") return {{"always", "总是"}, {"space", "空格后"}, {"off", "关闭"}};
+    if(k == "letter_sel_key")
+        return {{"tab", "Tab键"}, {"lctrl", "左Ctrl"}, {"lwin", "左Win"}, {"lalt", "左Alt"},
+                {"ralt", "右Alt"}, {"rwin", "右Win"}, {"rctrl", "右Ctrl"}, {"off", "关闭"}};
     if(k == "md_render" || k == "first_line_indent" || k == "version_history" ||
-       k == "auto_save" || k == "recovery_draft" || k == "vertical_ref_line")
+       k == "auto_save" || k == "recovery_draft" || k == "vertical_ref_line" ||
+       k == "ime_sentence" || k == "ime_doc_context" || k == "ime_candidate_highlight")
         return {{"1", "开"}, {"0", "关"}};
     if(k == "font_size" || k == "ime_font_size" || k == "ui_font_size") {
         std::vector<std::pair<std::string, std::string>> o;
@@ -3973,6 +4062,13 @@ static std::vector<std::pair<std::string, std::string>> setting_options(const st
     return {};
 }
 
+// 枚举值 → 显示名(设置列表里那一列用)。找不到就原样显示存值。
+static std::string setting_option_label(const std::string &k, const std::string &v) {
+    for(const auto &o : setting_options(k))
+        if(o.first == v) return o.second;
+    return v;
+}
+
 static std::string setting_current_value(const std::string &k) {
     if(k == "theme") return g_settings.theme();
     if(k == "backlight") return std::to_string(backlight_nearest_level(backlight_display_percent()));
@@ -3985,6 +4081,12 @@ static std::string setting_current_value(const std::string &k) {
     if(k == "font_bold_file") return g_settings.font_bold_file();
     if(k == "font_italic_file") return g_settings.font_italic_file();
     if(k == "input_mode") return g_settings.input_mode();
+    if(k == "ime_fuzzy") return g_settings.imeFuzzy();
+    if(k == "ime_predict_mode") return g_settings.imePredictMode();
+    if(k == "letter_sel_key") return g_settings.letterSelKey();
+    if(k == "ime_sentence") return g_settings.imeSentence() ? "1" : "0";
+    if(k == "ime_doc_context") return g_settings.imeDocContext() ? "1" : "0";
+    if(k == "ime_candidate_highlight") return g_settings.imeCandidateHighlight() ? "1" : "0";
     if(k == "editor_orientation") return editor_vertical() ? "vertical" : "horizontal";
     if(k == "editor_mode") return g_settings.editor_mode();
     if(k == "vertical_ref_line_style") return g_settings.vertical_reference_line_style();
@@ -4004,6 +4106,8 @@ static void setting_apply(const std::string &k, const std::string &v) {
        k == "font_size" || k == "ime_font_size" || k == "ui_font_size")
         app_ui_reload_font();
     if(k == "backlight") backlight_set_percent(atoi(v.c_str()));
+    // 输入法设置改了要立即生效,不能让用户重启(模糊音缓存/整句等快照都在 IME 里)
+    g_linux_ime.reload_settings();
     app_ui_reload_theme();
 }
 
@@ -4034,6 +4138,18 @@ static std::string vertical_style_label() {
     return "实线";
 }
 
+// 设置页只拿 WiFi 状态当显示值,不必每次重画都 fork 两次 wpa_cli。
+static const WifiStatus &settings_wifi_status() {
+    static WifiStatus st;
+    static uint32_t next_ms = 0;
+    uint32_t now = lv_tick_get();
+    if(next_ms == 0 || (int32_t)(now - next_ms) >= 0) {
+        st = g_wifi.status();
+        next_ms = now + 5000;
+    }
+    return st;
+}
+
 static std::vector<SetItem> settings_items() {
     std::string im = g_settings.input_mode();
     std::string input = im == "fcitx5_rime" ? "fcitx5+rime" : im == "yong" ? "yong" : "内置";
@@ -4042,6 +4158,7 @@ static std::vector<SetItem> settings_items() {
     else if(g_settings.app_mode() == "file") appModeLabel = "文件编辑";
     IME &ime = IME::getInstance();
     ime.ensureUserDictLoaded();
+    const WifiStatus &wst = settings_wifi_status();
     std::vector<SetItem> v = {
         {"theme", "主题", theme_def(g_settings.theme())->label},
         {"app_mode", "工作模式", appModeLabel},
@@ -4061,7 +4178,13 @@ static std::vector<SetItem> settings_items() {
         {"webdav_dir", "远程目录",
          g_settings.get("webdav_dir", "").empty() ? "(默认 journal)" : g_settings.get("webdav_dir", "")},
         {"input_mode", "输入法", input},
-        {"wifi", "WiFi管理", g_wifi.status().connected ? ("已连接 " + g_wifi.status().ssid) : "未连接"},
+        {"ime_fuzzy", "拼音模糊音", setting_option_label("ime_fuzzy", g_settings.imeFuzzy())},
+        {"ime_predict_mode", "联想候选", setting_option_label("ime_predict_mode", g_settings.imePredictMode())},
+        {"letter_sel_key", "字母选字按键", setting_option_label("letter_sel_key", g_settings.letterSelKey())},
+        {"ime_sentence", "整句候选", g_settings.imeSentence() ? "开" : "关"},
+        {"ime_doc_context", "正文词优先", g_settings.imeDocContext() ? "开" : "关"},
+        {"ime_candidate_highlight", "候选高亮", g_settings.imeCandidateHighlight() ? "开" : "关"},
+        {"wifi", "WiFi管理", wst.connected ? ("已连接 " + wst.ssid) : "未连接"},
         {"md_render", "Markdown渲染", g_settings.markdown_render() ? "开" : "关"},
         {"first_line_indent", "首行缩进", g_settings.first_line_indent() ? "开" : "关"},
         {"version_history", "历史版本", g_settings.version_history() ? "开" : "关"},
@@ -4088,7 +4211,8 @@ static std::vector<SetItem> settings_items() {
     v.push_back({"editor_mode", "编辑模式", editor_mode_label()});
     v.push_back({"dict", "词库管理",
                  "固定 " + std::to_string(ime.userDictSize(IME::FIXED_DICT)) + " / 动态 " +
-                     std::to_string(ime.userDictSize(IME::DYNAMIC_DICT))});
+                     std::to_string(ime.userDictSize(IME::DYNAMIC_DICT)) + " / 联想 " +
+                     std::to_string(ime.userDictSize(IME::PREDICT_DICT))});
     v.push_back({"file_mgr", "文件管理",
                  file_manager_server_running() ? ("运行中 :" + std::to_string(file_manager_server_get_port()))
                                                : "已停止"});
@@ -4227,7 +4351,15 @@ static std::string dict_trim(const std::string &s) {
 }
 
 static const char *dict_kind_label(int kind) {
-    return kind == IME::FIXED_DICT ? "固定词库" : "动态词库";
+    if(kind == IME::FIXED_DICT) return "固定词库";
+    if(kind == IME::PREDICT_DICT) return "联想词库";
+    return "动态词库";
+}
+
+static int dict_kind_limit(int kind) {
+    if(kind == IME::DYNAMIC_DICT) return 5000;
+    if(kind == IME::PREDICT_DICT) return 2000;
+    return 1000;
 }
 
 static void dict_reload() {
@@ -4255,7 +4387,11 @@ static void render_dict() {
         lv_obj_t *r1 = box(g_root, 8, 136, 1008, 56, g_dict_sel == 1);
         lv_obj_t *l1 = label(r1, "动态词库", 6, 10, 988, 34);
         if(g_dict_sel == 1) lv_obj_set_style_text_color(l1, g_theme.bg, 0);
-        label(g_root, "固定词库长期保留；动态词库由输入法自动积累，超限后淘汰旧词。", 8, 220, 1008, 68);
+        lv_obj_t *r2 = box(g_root, 8, 200, 1008, 56, g_dict_sel == 2);
+        lv_obj_t *l2 = label(r2, "联想词库", 6, 10, 988, 34);
+        if(g_dict_sel == 2) lv_obj_set_style_text_color(l2, g_theme.bg, 0);
+        label(g_root, "固定词库长期保留；动态词库由输入法自动积累，超限后淘汰旧词；联想词库记录上文与联想词。",
+              8, 284, 1008, 68);
         draw_status_bar("↑↓选择  Enter进入  Esc返回");
         return;
     }
@@ -4272,7 +4408,9 @@ static void render_dict() {
         lv_group_focus_obj(g_dict_text);
         create_ime_bar();
         update_ime_bar();
-        label(g_root, "格式: 编码 空格 候选词，例如 aaa 好", 8, 156, 1008, 34);
+        label(g_root, g_dict_kind == IME::PREDICT_DICT ? "格式: 上文 空格 联想词，例如 输入法 设置"
+                                                       : "格式: 编码 空格 候选词，例如 aaa 好",
+              8, 156, 1008, 34);
         draw_status_bar("Enter确定  Esc取消");
         return;
     }
@@ -4296,11 +4434,11 @@ static void render_dict() {
     }
 
     std::string title = std::string(dict_kind_label(g_dict_kind)) + " " + std::to_string(g_dict_entries.size()) + "/" +
-                        (g_dict_kind == IME::FIXED_DICT ? "500" : "1000");
+                        std::to_string(dict_kind_limit(g_dict_kind));
     if(!g_dict_query.empty()) title += "  检索: " + g_dict_query;
     label(g_root, title, 8, 8, 1008, 32);
-    label(g_root, "编码", 18, 44, 180, 28);
-    label(g_root, "候选词", 232, 44, 620, 28);
+    label(g_root, g_dict_kind == IME::PREDICT_DICT ? "上文" : "编码", 18, 44, 180, 28);
+    label(g_root, g_dict_kind == IME::PREDICT_DICT ? "联想词" : "候选词", 232, 44, 620, 28);
     label(g_root, "频次", 872, 44, 120, 28);
 
     int visible = 9;
@@ -4504,6 +4642,7 @@ static void goto_screen(Screen s) {
     }
     g_screen = s;
     if(s != Screen::Settings) g_setting_pick_active = false;
+    if(s == Screen::Browser) g_browser_confirm_delete = false;
     if(s == Screen::Editor) {
         g_recovery_checked = false;
         g_recovery_meta.clear();
@@ -4608,7 +4747,15 @@ static void save_editor_text() {
         return;
     }
     std::string content = make_journal_text(g_prompt, body);
-    bool ok = g_edit_file.empty() ? g_journal.save_entry(content) : g_journal.save_entry_raw(g_edit_file, content, true);
+    std::string name;
+    bool ok;
+    if(g_edit_file.empty()) {
+        ok = g_journal.save_entry(content, &name);
+        // 记住新文件名,否则再按一次 Ctrl+S 又会建一篇新日记
+        if(ok) g_edit_file = name;
+    } else {
+        ok = g_journal.save_entry_raw(g_edit_file, content, true);
+    }
     if(ok) {
         g_journal.clear_recovery_draft();
         g_last_recovery_hash = 0;
@@ -4632,11 +4779,10 @@ static bool save_editor_text_for_history() {
         if(ok) g_journal.clear_recovery_draft();
         return ok;
     }
-    if(!g_journal.save_entry(content)) return false;
+    std::string name;
+    if(!g_journal.save_entry(content, &name)) return false;
     g_journal.clear_recovery_draft();
-    g_entries = g_journal.list_entries();
-    if(g_entries.empty()) return false;
-    g_edit_file = g_entries.front().filename;
+    g_edit_file = name;
     return true;
 }
 
@@ -4804,13 +4950,14 @@ static void insert_utf8(const std::string &s) {
 }
 
 static void handle_main(int key) {
-    int visible = g_journal.total_entries() > 0 ? 7 : 6;
+    const int entry_count = g_journal.stats().total;
+    int visible = entry_count > 0 ? 7 : 6;
     if(key == KEY_LEFT || key == KEY_UP || key == 'h' || key == 'k') g_main_sel = (g_main_sel + visible - 1) % visible;
     else if(key == KEY_RIGHT || key == KEY_DOWN || key == 'l' || key == 'j') g_main_sel = (g_main_sel + 1) % visible;
     else {
         char ch = key >= 'A' && key <= 'Z' ? key + 32 : key;
         for(int i = 0; i < visible; ++i) {
-            int idx = (g_journal.total_entries() > 0 || i < 2) ? i : i + 1;
+            int idx = (entry_count > 0 || i < 2) ? i : i + 1;
             if(k_actions[idx].key == ch) {
                 g_main_sel = i;
                 key = '\n';
@@ -4819,11 +4966,11 @@ static void handle_main(int key) {
         }
     }
     if(key == '\n' || key == '\r') {
-        int idx = (g_journal.total_entries() > 0 || g_main_sel < 2) ? g_main_sel : g_main_sel + 1;
+        int idx = (entry_count > 0 || g_main_sel < 2) ? g_main_sel : g_main_sel + 1;
         const Action &a = k_actions[idx];
         if(a.key == 'p') { g_quick_slot = -1; g_file_edit_path.clear(); g_prompt = random_builtin_prompt(); g_edit_file.clear(); goto_screen(Screen::Editor); return; }
         if(a.key == 'f') { g_quick_slot = -1; g_file_edit_path.clear(); g_prompt.clear(); g_edit_file.clear(); goto_screen(Screen::Editor); return; }
-        if(a.key == 'v') { g_browser_sel = 0; goto_screen(Screen::Browser); return; }
+        if(a.key == 'v') { g_browser_sel = 0; g_browser_needs_reload = true; goto_screen(Screen::Browser); return; }
         goto_screen(a.screen);
         return;
     }
@@ -4831,6 +4978,17 @@ static void handle_main(int key) {
 }
 
 static void handle_browser(int key) {
+    if(g_browser_confirm_delete) {
+        if((key == '\n' || key == '\r' || key == 'y' || key == 'Y') && !g_entries.empty()) {
+            g_journal.delete_entry(g_entries[g_browser_sel].filename);
+            g_browser_confirm_delete = false;
+            g_browser_needs_reload = true;
+        } else if(key == 27 || key == 'q' || key == 'n' || key == 'N') {
+            g_browser_confirm_delete = false;
+        }
+        render();
+        return;
+    }
     if(key == 'q' || key == 27) { goto_screen(Screen::Main); return; }
     if(key == KEY_DOWN || key == 'j') g_browser_sel++;
     if(key == KEY_UP || key == 'k') g_browser_sel--;
@@ -4840,7 +4998,7 @@ static void handle_browser(int key) {
     if(key == '\n' || key == '\r') { g_view_file = g_entries[g_browser_sel].filename; g_viewer_scroll = 0; goto_screen(Screen::Viewer); return; }
     if(key == 'e' || key == 'E') { g_quick_slot = -1; g_file_edit_path.clear(); g_edit_file = g_entries[g_browser_sel].filename; g_prompt.clear(); goto_screen(Screen::Editor); return; }
     if(key == 'h' || key == 'H') { open_history(g_entries[g_browser_sel].filename, Screen::Browser); return; }
-    if(key == 'd' || key == 'D') { g_journal.delete_entry(g_entries[g_browser_sel].filename); }
+    if(key == 'd' || key == 'D') g_browser_confirm_delete = true;
     render();
 }
 
@@ -4857,6 +5015,8 @@ static void handle_history(int key) {
                     g_edit_file = g_history_file;
                     g_prompt.clear();
                 }
+                // 恢复会改正文,列表里的标题/预览是从正文推出来的,得重读
+                if(g_history_return == Screen::Browser) g_browser_needs_reload = true;
                 goto_screen(g_history_return);
             } else {
                 set_status("恢复失败");
@@ -5044,6 +5204,7 @@ static void handle_setting_text(int key) {
         g_settings.set(g_setting_key, value);
         g_journal.begin();
         g_entries.clear();
+        g_browser_needs_reload = true;
         goto_screen(Screen::Settings);
         return;
     }
@@ -6797,7 +6958,8 @@ static void handle_dict(int key) {
                 std::string word = sp == std::string::npos ? "" : dict_trim(s.substr(sp + 1));
                 if(code.empty() || word.empty()) msg = "格式应为: 编码 空格 候选词";
                 else if(!ime.addUserDictEntry((IME::UserDictKind)g_dict_kind, code, word))
-                    msg = "添加失败: 候选词至少一个汉字";
+                    msg = g_dict_kind == IME::PREDICT_DICT ? "添加失败: 上文和联想词都要是 1~4 个汉字"
+                                                           : "添加失败: 候选词至少一个汉字";
                 else {
                     msg = "已添加 " + code + " " + word;
                     g_dict_query.clear();
@@ -6824,9 +6986,10 @@ static void handle_dict(int key) {
 
     if(g_dict_mode == DictMode::Choose) {
         if(key == 'q' || key == 'Q' || key == 27) { goto_screen(Screen::Settings); return; }
-        if(key == KEY_UP || key == 'k' || key == KEY_DOWN || key == 'j') g_dict_sel = 1 - g_dict_sel;
+        if(key == KEY_UP || key == 'k') g_dict_sel = (g_dict_sel + 2) % 3;
+        else if(key == KEY_DOWN || key == 'j') g_dict_sel = (g_dict_sel + 1) % 3;
         else if(key == '\n' || key == '\r') {
-            g_dict_kind = g_dict_sel == 0 ? IME::FIXED_DICT : IME::DYNAMIC_DICT;
+            g_dict_kind = (IME::UserDictKind)g_dict_sel;
             g_dict_sel = 0;
             g_dict_scroll = 0;
             g_dict_selected.clear();
@@ -6850,10 +7013,10 @@ static void handle_dict(int key) {
     }
     if((key == KEY_DOWN || key == 'j') && g_dict_sel < total - 1) { g_dict_sel++; render(); return; }
     if((key == KEY_UP || key == 'k') && g_dict_sel > 0) { g_dict_sel--; render(); return; }
-    if(key == KEY_PAGE_DOWN) { g_dict_sel = std::min(total - 1, g_dict_sel + 9); render(); return; }
+    if(key == KEY_PAGE_DOWN && total > 0) { g_dict_sel = std::min(total - 1, g_dict_sel + 9); render(); return; }
     if(key == KEY_PAGE_UP) { g_dict_sel = std::max(0, g_dict_sel - 9); render(); return; }
     if(key == '\t') {
-        g_dict_kind = g_dict_kind == IME::FIXED_DICT ? IME::DYNAMIC_DICT : IME::FIXED_DICT;
+        g_dict_kind = (g_dict_kind + 1) % 3;
         g_dict_sel = 0;
         g_dict_scroll = 0;
         g_dict_selected.clear();
@@ -7398,7 +7561,7 @@ static void editor_md_refresh() {
         int rows = 1;
         for(const MdPiece &q : pieces)
             if(q.row + 1 > rows) rows = q.row + 1;
-        int h = rows * line_h;
+        int h = rows * line_h + md_para_extra(lines, i, in_code, line_h);
 
         lv_color_t color = d.heading ? md_heading_color() : (d.muted ? g_theme.muted : g_theme.fg);
 
@@ -7629,7 +7792,7 @@ static void md_render_readonly(const std::string &text, int content_w, int line_
         int rows = 1;
         for(const MdPiece &q : pieces)
             if(q.row + 1 > rows) rows = q.row + 1;
-        int h = rows * line_h;
+        int h = rows * line_h + md_para_extra(doc.lines, i, in_code, line_h);
         lv_color_t color = d.heading ? md_heading_color() : (d.muted ? g_theme.muted : g_theme.fg);
 
         md_push_deco(disp, pieces, y, line_h, letter_h, letter_space);
@@ -8855,12 +9018,28 @@ static void handle_editor_keys(int key) {
         return;
     }
     std::string ime_out;
+    // 组字前把光标前的正文尾部喂给输入法,正文里出现过的词会小幅加分。
+    if(g_linux_ime.active() && !g_linux_ime.composing())
+        g_linux_ime.set_document_context(editor_ime_context_text());
     if(g_linux_ime.handle_key(key, ime_out)) {
         if(!ime_out.empty()) {
             if(g_ed_sel_anchor >= 0) editor_delete_selection();
             else editor_record_undo();
             lv_textarea_add_text(g_editor, ime_out.c_str());
         }
+        std::string ime_status = g_linux_ime.take_status_message();
+        if(!ime_status.empty()) set_status(ime_status);
+        // 刚上屏的词也要立刻进文档上下文(同一篇里再打同一个人名/术语就该排前面)
+        if(!ime_out.empty() && g_linux_ime.active() && !g_linux_ime.composing())
+            g_linux_ime.set_document_context(editor_ime_context_text());
+        update_ime_bar();
+        return;
+    }
+    // Ctrl+D:输入法开着时切"删除模式"——下次上屏的候选从用户词库里删掉。
+    if(key == 0x04 && g_linux_ime.active()) {
+        g_linux_ime.toggle_delete_mode();
+        std::string msg = g_linux_ime.take_status_message();
+        set_status(msg.empty() ? "删除模式" : msg);
         update_ime_bar();
         return;
     }
@@ -8973,6 +9152,8 @@ static void handle_editor_keys(int key) {
     else if(key == 8 || key == 127) {
         if(g_ed_sel_anchor >= 0) editor_delete_selection();
         else { editor_record_undo(); lv_textarea_delete_char(g_editor); }
+        // 联想/学习上下文跟着正文回退
+        if(g_linux_ime.active()) g_linux_ime.handle_host_backspace();
     } else if(key == '\n' || key == '\r') {
         if(g_ed_sel_anchor >= 0) {
             editor_delete_selection();
@@ -9039,10 +9220,10 @@ static void handle_key(int key) {
         if(key == 'q' || key == 27) goto_screen(Screen::Browser);
         else if(key == 'e' || key == 'E') { g_quick_slot = -1; g_file_edit_path.clear(); g_edit_file = g_view_file; g_prompt.clear(); goto_screen(Screen::Editor); }
         else if(key == 'h' || key == 'H') { open_history(g_view_file, Screen::Viewer); }
-        else if(key == KEY_DOWN || key == 'j') { g_viewer_scroll++; render(); }
-        else if(key == KEY_UP || key == 'k') { g_viewer_scroll--; render(); }
-        else if(key == KEY_PAGE_DOWN) { g_viewer_scroll += 10; render(); }
-        else if(key == KEY_PAGE_UP) { g_viewer_scroll -= 10; render(); }
+        else if(key == KEY_DOWN || key == 'j') viewer_scroll_by(1);
+        else if(key == KEY_UP || key == 'k') viewer_scroll_by(-1);
+        else if(key == KEY_PAGE_DOWN) viewer_scroll_by(10);
+        else if(key == KEY_PAGE_UP) viewer_scroll_by(-10);
         else render();
         break;
     case Screen::History: handle_history(key); break;
@@ -9115,12 +9296,14 @@ void app_ui_tick() {
         }
     }
     if(g_screen != Screen::Editor || !g_editor) return;
-    if(!g_file_edit_path.empty()) {
-        if(g_settings.auto_save() && editor_dirty()) save_editor_text();
-        return;
-    }
-    if(g_quick_slot >= 0) {
-        if(g_settings.auto_save() && editor_dirty()) save_editor_text();
+    if(!g_file_edit_path.empty() || g_quick_slot >= 0) {
+        if(!g_settings.auto_save()) return;
+        // tick 每 5ms 跑一次,而 editor_dirty 要对全文做哈希、保存还要 fsync 整个文件。
+        // 和日记模式一样攒 1 秒再落盘。
+        uint32_t now = lv_tick_get();
+        if(g_next_recovery_ms != 0 && (int32_t)(now - g_next_recovery_ms) < 0) return;
+        g_next_recovery_ms = now + 1000;
+        if(editor_dirty()) save_editor_text();
         return;
     }
     if(!g_ol.editPath.empty()) return;  // 大纲正文文件不做草稿恢复
@@ -9139,16 +9322,16 @@ void app_ui_tick() {
         std::string content = make_journal_text(g_prompt, body);
         bool ok = false;
         if(g_edit_file.empty()) {
-            ok = g_journal.save_entry(content);
-            if(ok) {
-                g_entries = g_journal.list_entries();
-                if(!g_entries.empty()) g_edit_file = g_entries.front().filename;
-            }
+            std::string name;
+            ok = g_journal.save_entry(content, &name);
+            if(ok) g_edit_file = name;
         } else {
             ok = g_journal.save_entry_raw(g_edit_file, content, false);
         }
         if(ok) {
             g_journal.clear_recovery_draft();
+            // 自动保存后标记干净,Esc 退出时就不会再写一遍(还会白白生成一个历史版本)
+            editor_mark_clean();
             g_last_recovery_hash = h;
         }
         return;

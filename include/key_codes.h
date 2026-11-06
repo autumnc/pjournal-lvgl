@@ -27,4 +27,11 @@ enum AppKey {
     KEY_IM_SWITCH = 0xA5,
     KEY_BACKLIGHT_UP = 0xA7,
     KEY_BACKLIGHT_DOWN = 0xA8,
+    // 修饰键"单击"(按下后没按别的键就抬起)。输入法用它触发字母选字。
+    KEY_MOD_TAP_LCTRL = 0xB0,
+    KEY_MOD_TAP_LGUI = 0xB1,
+    KEY_MOD_TAP_LALT = 0xB2,
+    KEY_MOD_TAP_RALT = 0xB3,
+    KEY_MOD_TAP_RGUI = 0xB4,
+    KEY_MOD_TAP_RCTRL = 0xB5,
 };

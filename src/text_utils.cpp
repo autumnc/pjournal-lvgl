@@ -38,6 +38,13 @@ std::string extract_body(const std::string &content) {
     return body == std::string::npos ? content : content.substr(body + 2);
 }
 
+std::string journal_prompt(const std::string &content) {
+    static const std::string prefix = "提示词: ";
+    if(content.compare(0, prefix.size(), prefix) != 0) return std::string();
+    size_t eol = content.find('\n');
+    return content.substr(prefix.size(), eol == std::string::npos ? std::string::npos : eol - prefix.size());
+}
+
 std::string make_journal_text(const std::string &prompt, const std::string &body) {
     time_t now = time(nullptr);
     tm local {};

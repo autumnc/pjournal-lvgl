@@ -30,6 +30,34 @@ static bool safe_name(const std::string &fn) {
     return !fn.empty() && fn.find('/') == std::string::npos && fn.find("..") == std::string::npos;
 }
 
+// 列表只需要头部(提示词/日期/字数/正文首行),不必把整篇读进内存。
+static std::string read_head(const std::string &path, size_t max_bytes) {
+    FILE *f = fopen(path.c_str(), "rb");
+    if(!f) return "";
+    std::string out(max_bytes, '\0');
+    size_t rd = fread(&out[0], 1, max_bytes, f);
+    fclose(f);
+    out.resize(rd);
+    // 截断点可能落在多字节字符中间,退到完整字符边界
+    size_t n = out.size();
+    while(n > 0 && ((unsigned char)out[n - 1] & 0xC0) == 0x80) --n;
+    if(n > 0) {
+        unsigned char lead = (unsigned char)out[n - 1];
+        size_t need = lead < 0x80 ? 1 : (lead & 0xE0) == 0xC0 ? 2 : (lead & 0xF0) == 0xE0 ? 3
+                      : (lead & 0xF8) == 0xF0 ? 4 : 1;
+        if(out.size() - (n - 1) < need) out.resize(n - 1);
+    }
+    return out;
+}
+
+// 按字节截断时不要把一个多字节字符切成半个
+static std::string utf8_trim(const std::string &s, size_t max_bytes) {
+    if(s.size() <= max_bytes) return s;
+    size_t n = max_bytes;
+    while(n > 0 && ((unsigned char)s[n] & 0xC0) == 0x80) --n;
+    return s.substr(0, n);
+}
+
 static std::vector<std::string> list_journal_files(const std::string &dir) {
     std::vector<std::string> files;
     DIR *d = opendir(dir.c_str());
@@ -92,7 +120,7 @@ void JournalStorage::ensure_dir() {
     ensure_dir_path(base_path());
 }
 
-bool JournalStorage::save_entry(const std::string &text) {
+bool JournalStorage::save_entry(const std::string &text, std::string *filename_out) {
     std::lock_guard<std::recursive_mutex> lock(g_journal_mutex);
     ensure_dir();
     time_t now = time(nullptr);
@@ -100,7 +128,10 @@ bool JournalStorage::save_entry(const std::string &text) {
     localtime_r(&now, &local);
     char ts[32];
     strftime(ts, sizeof(ts), "%Y-%m-%d_%H%M%S", &local);
-    return safe_write_file(base_path() + "/" + ts + ".txt", text);
+    std::string name = std::string(ts) + ".txt";
+    bool ok = safe_write_file(base_path() + "/" + name, text);
+    if(ok && filename_out) *filename_out = name;
+    return ok;
 }
 
 bool JournalStorage::save_entry_raw(const std::string &filename, const std::string &content, bool create_history) {
@@ -123,20 +154,20 @@ std::vector<JournalEntry> JournalStorage::list_entries() {
         JournalEntry e;
         e.filename = fn;
         e.date = fn.size() >= 10 ? fn.substr(0, 10) : "";
-        e.full_text = read_whole_file(base_path() + "/" + fn);
-        size_t first_nl = e.full_text.find('\n');
-        std::string first = first_nl == std::string::npos ? e.full_text : e.full_text.substr(0, first_nl);
+        std::string head = read_head(base_path() + "/" + fn, 8192);
+        size_t first_nl = head.find('\n');
+        std::string first = first_nl == std::string::npos ? head : head.substr(0, first_nl);
         if(first.find("提示词:") == 0) e.title = "提示写作";
         else if(first.find("自由写作") != std::string::npos) e.title = "自由写作";
-        else e.title = first.empty() ? "日记" : first.substr(0, 32);
-        size_t body_start = e.full_text.find("\n\n");
-        std::string body = body_start == std::string::npos ? e.full_text : e.full_text.substr(body_start + 2);
+        else e.title = first.empty() ? "日记" : utf8_trim(first, 32);
+        size_t body_start = head.find("\n\n");
+        std::string body = body_start == std::string::npos ? head : head.substr(body_start + 2);
         size_t pos = 0;
         while(pos < body.size()) {
             size_t nl = body.find('\n', pos);
             std::string line = nl == std::string::npos ? body.substr(pos) : body.substr(pos, nl - pos);
             if(!line.empty() && line.find("日期:") != 0 && line.find("字数:") != 0 && line.find("提示词:") != 0 && line != "自由写作") {
-                e.preview = line.substr(0, 80);
+                e.preview = utf8_trim(line, 80);
                 break;
             }
             if(nl == std::string::npos) break;
@@ -169,41 +200,40 @@ bool JournalStorage::delete_entry(const std::string &filename) {
     return remove((base_path() + "/" + filename).c_str()) == 0;
 }
 
-bool JournalStorage::has_entry(const std::string &date) {
-    for(const auto &fn : list_journal_files(base_path())) if(fn.substr(0, 10) == date) return true;
-    return false;
-}
-
-int JournalStorage::count_today() {
+JournalStats JournalStorage::stats() {
+    std::lock_guard<std::recursive_mutex> lock(g_journal_mutex);
     time_t now = time(nullptr);
     tm local {};
     localtime_r(&now, &local);
     char today[16];
     strftime(today, sizeof(today), "%Y-%m-%d", &local);
-    int n = 0;
-    for(const auto &fn : list_journal_files(base_path())) if(fn.substr(0, 10) == today) ++n;
-    return n;
-}
 
-int JournalStorage::total_entries() {
-    return (int)list_journal_files(base_path()).size();
-}
-
-int JournalStorage::streak() {
+    JournalStats st;
     std::set<std::string> dates;
-    for(const auto &fn : list_journal_files(base_path())) if(fn.size() >= 10) dates.insert(fn.substr(0, 10));
-    time_t now = time(nullptr);
-    int s = 0;
-    for(int i = 0; i < 365; ++i) {
-        time_t t = now - i * 86400;
-        tm local {};
-        localtime_r(&t, &local);
-        char d[16];
-        strftime(d, sizeof(d), "%Y-%m-%d", &local);
-        if(!dates.count(d)) break;
-        ++s;
+    bool has_today = false;
+    for(const auto &fn : list_journal_files(base_path())) {
+        ++st.total;
+        if(fn.size() < 10) continue;
+        std::string d = fn.substr(0, 10);
+        if(d == today) {
+            ++st.today;
+            has_today = true;
+        }
+        dates.insert(std::move(d));
     }
-    return s;
+    // 今天还没写不代表连续记录断了:从昨天往回数,避免每天早上先显示 0 天。
+    int start = has_today ? 0 : 1;
+    for(int i = start; i < 365 + start; ++i) {
+        time_t t = now - (time_t)i * 86400;
+        tm dtm {};
+        localtime_r(&t, &dtm);
+        char d[16];
+        strftime(d, sizeof(d), "%Y-%m-%d", &dtm);
+        if(!dates.count(d)) break;
+        ++st.streak;
+    }
+    st.dates.assign(dates.begin(), dates.end());
+    return st;
 }
 
 bool JournalStorage::save_recovery_draft(const std::string &content, const std::string &meta) {

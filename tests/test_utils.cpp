@@ -3,6 +3,7 @@
 #include "outline_model.h"
 #include "process_utils.h"
 #include "settings.h"
+#include "text_utils.h"
 
 #include <cstdlib>
 #include <cstdio>
@@ -57,6 +58,20 @@ static int test_journal_storage() {
     if(empty_versions.empty()) return fail("empty history missing");
     if(!g_journal.restore_history_version("empty.md", empty_versions.front().filename)) return fail("restore empty history failed");
     if(!g_journal.read_entry("empty.md").empty()) return fail("empty history restore content mismatch");
+
+    // 列表只读文件头部,长正文不能把标题/预览解析弄坏
+    const std::string long_body(20000, 'a');
+    if(!g_journal.save_entry_raw("2026-01-02_030405.txt", make_journal_text("提示", long_body), false))
+        return fail("save long entry failed");
+    bool checked = false;
+    for(const auto &e : g_journal.list_entries()) {
+        if(e.filename != "2026-01-02_030405.txt") continue;
+        checked = true;
+        if(e.date != "2026-01-02") return fail("entry date mismatch");
+        if(e.title != "提示写作") return fail("long entry title mismatch: " + e.title);
+        if(e.preview != std::string(80, 'a')) return fail("long entry preview mismatch");
+    }
+    if(!checked) return fail("long entry missing from list");
     return 0;
 }
 

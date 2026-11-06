@@ -74,6 +74,8 @@ bool safe_write_file(const std::string &path, const std::string &content) {
 
     FILE *f = fopen(tmp.c_str(), "wb");
     if(!f) return false;
+    // 设置文件里有 WiFi/WebDAV/API 密码,日记本身也私密:落盘只给属主读写
+    fchmod(fileno(f), 0600);
     // 不能写成 `if(!wrote || !flush_close(f))`:短路求值会让 fwrite 失败时跳过
     // flush_close,fclose 永远不执行 —— 每失败一次就漏一个 fd(闪存写满时会累积到耗尽)。
     const bool wrote = fwrite(content.data(), 1, content.size(), f) == content.size();

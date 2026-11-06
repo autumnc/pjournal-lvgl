@@ -4,11 +4,25 @@
 #include "fcitx5_ime.h"
 #include "settings.h"
 
+#include <atomic>
+#include <chrono>
+
 #ifdef PJOURNAL_HAS_YONG
 #include "yong_ime.h"
 #endif
 
 LinuxIme g_linux_ime;
+
+static int64_t monotonic_us() {
+    using namespace std::chrono;
+    return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+// 主循环空闲时判断"用户已经停手":最后一次按键时间与上次落盘时间。
+static std::atomic<int64_t> g_last_ime_key_us{0};
+static int64_t g_last_userdict_flush_us = 0;
+static const int64_t IME_IDLE_FLUSH_AFTER_US = 400000;
+static const int64_t IME_FLUSH_MIN_INTERVAL_US = 200000;
 
 // 设置里选了哪个后端就把这一层整个让给那边。方法签名和语义都不变,所以
 // src/app_ui.cpp 里二十多个调用点一行都不用改。
@@ -80,6 +94,7 @@ void LinuxIme::set_active(bool on) {
 
 bool LinuxIme::handle_key(int key, std::string &out) {
     if(key == '\r') key = '\n';
+    g_last_ime_key_us.store(monotonic_us());
     if(use_fcitx5()) return fcitx5_ime().handle_key(key, out);
 #ifdef PJOURNAL_HAS_YONG
     if(use_yong()) return yong_ime().handle_key(key, out);
@@ -265,4 +280,74 @@ void LinuxIme::set_width_fn(WidthFn fn) {
     }
 #endif
     IME::getInstance().setWidthFn(fn);
+}
+
+std::string LinuxIme::mode_label() const {
+    if(use_fcitx5() || use_yong()) return std::string();
+    return IME::getInstance().modeLabel();
+}
+
+bool LinuxIme::delete_mode() const {
+    if(use_fcitx5() || use_yong()) return false;
+    return IME::getInstance().isDeleteMode();
+}
+
+bool LinuxIme::predicting() const {
+    if(use_fcitx5() || use_yong()) return false;
+    return IME::getInstance().predicting();
+}
+
+bool LinuxIme::letter_select_armed() const {
+    if(use_fcitx5() || use_yong()) return false;
+    return IME::getInstance().letterSelectArmed();
+}
+
+std::string LinuxIme::letter_sel_keys() const {
+    if(use_fcitx5() || use_yong()) return std::string();
+    return IME::letterSelKeys();
+}
+
+std::string LinuxIme::take_status_message() {
+    if(use_fcitx5() || use_yong()) return std::string();
+    return IME::getInstance().takeStatusMessage();
+}
+
+void LinuxIme::set_document_context(const std::string &text) {
+    if(use_fcitx5() || use_yong()) return;
+    IME::getInstance().setDocumentContext(text);
+}
+
+void LinuxIme::handle_host_backspace() {
+    if(use_fcitx5() || use_yong()) return;
+    IME::getInstance().handleHostBackspace();
+}
+
+void LinuxIme::toggle_delete_mode() {
+    if(use_fcitx5() || use_yong()) return;
+    IME::getInstance().toggleDeleteMode();
+}
+
+void LinuxIme::reload_settings() {
+    if(use_fcitx5() || use_yong()) return;
+    IME::getInstance().reloadSettings();
+}
+
+void LinuxIme::flush_user_dict_idle() {
+    if(use_fcitx5() || use_yong()) return;
+    const int64_t last = g_last_ime_key_us.load();
+    if(last == 0) return;
+    const int64_t now = monotonic_us();
+    if(now - last < IME_IDLE_FLUSH_AFTER_US) return;
+    if(now - g_last_userdict_flush_us < IME_FLUSH_MIN_INTERVAL_US) return;
+    IME &ime = IME::getInstance();
+    if(!ime.hasPendingUserDictWrites()) return;
+    ime.flushUserDictSavesIdle();
+    g_last_userdict_flush_us = now;
+}
+
+void LinuxIme::flush_user_dict_now() {
+    if(use_fcitx5() || use_yong()) return;
+    // 先等异步写盘队列排空(超时 10s), 再结束写盘线程 —— 线程留着不走的话,
+    // 进程退出时静态条件变量析构会一直等它, exit 卡死。
+    IME::getInstance().shutdownUserDictWriter();
 }

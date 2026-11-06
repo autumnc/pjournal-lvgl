@@ -145,6 +145,8 @@ add_executable(pjournal-lvgl
     port/esp32_main/json_utils.cpp
     port/esp32_main/json_parser.cpp
     port/esp32_main/ime/IME.cpp
+    port/esp32_main/ime/yong_pinyin.cpp
+    port/esp32_main/ime/yong_dict.cpp
     ${PJOURNAL_EMBED_OBJS}
 )
 
@@ -188,6 +190,7 @@ if(BUILD_TESTING)
         src/safe_file.cpp
         src/esp32_compat.cpp
         src/settings.cpp
+        src/text_utils.cpp
         port/esp32_main/json_parser.cpp
     )
     target_include_directories(pjournal-tests PRIVATE include port/esp32_main)
