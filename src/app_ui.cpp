@@ -111,12 +111,12 @@ struct Action {
 };
 
 static const Action k_actions[] = {
-    {'p', "提示写作", LV_SYMBOL_FILE, Screen::Editor},
+    {'p', "提示写作", "\xF3\xB0\x8C\xB5", Screen::Editor},      // U+F0335 灯泡
     {'f', "自由写作", LV_SYMBOL_KEYBOARD, Screen::Editor},
-    {'v', "查看过往日记", LV_SYMBOL_LIST, Screen::Browser},
+    {'v', "查看过往日记", "\xEF\x80\xAD", Screen::Browser},      // U+F02D 书
     {'w', "同步WebDAV", LV_SYMBOL_UPLOAD, Screen::Sync},
-    {'t', "写作计划", LV_SYMBOL_OK, Screen::Gtd},
-    {'o', "大纲写作", LV_SYMBOL_DIRECTORY, Screen::Outline},
+    {'t', "写作计划", "\xEE\x9A\x9C", Screen::Gtd},             // U+E69C 勾选框
+    {'o', "大纲写作", "\xF3\xB0\x88\x9A", Screen::Outline},      // U+F021A 便签
     {'m', "浮墨笔记", "\xF3\xB1\xAB\xB1", Screen::Flomo},   // U+F1AF1
     {'c', "终端", "\xEF\x84\xA0", Screen::Terminal},        // U+F120
     {'s', "设置", LV_SYMBOL_SETTINGS, Screen::Settings},
