@@ -31,6 +31,7 @@ public:
     bool vertical_reference_line() const;
     std::string vertical_reference_line_style() const;
     std::string wlan_interface() const;
+    bool wifi_power() const;  // 上次退出时 WiFi 电源开关的状态(默认开)
     int backlight_percent() const;
 
     // 内置输入法设置。键名与 ESP32 版一致(移植过来的 IME.cpp 原样调用驼峰 getter)。

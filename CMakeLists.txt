@@ -143,6 +143,15 @@ add_executable(pjournal-lvgl
     src/flomo_db.cpp
     src/flomo_sync.cpp
     src/flomo_screen.cpp
+    src/term_vt.cpp
+    src/term_sixel.cpp
+    src/term_theme.cpp
+    src/term_settings.cpp
+    src/term_settings_ui.cpp
+    src/term_ui.cpp
+    src/term_pty.cpp
+    src/term_keys.cpp
+    src/terminal_screen.cpp
     src/linux_ime.cpp
     src/linux_input.cpp
     src/linux_console.cpp
@@ -199,6 +208,11 @@ if(BUILD_TESTING)
         src/flomo_http.cpp
         src/flomo_api.cpp
         src/flomo_db.cpp
+        src/term_vt.cpp
+        src/term_sixel.cpp
+        src/term_theme.cpp
+        src/term_settings.cpp
+        src/term_keys.cpp
         port/esp32_main/json_utils.cpp
         port/esp32_main/json_parser.cpp
     )

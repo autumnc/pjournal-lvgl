@@ -13,6 +13,7 @@
 #include "process_utils.h"
 #include "safe_file.h"
 #include "settings.h"
+#include "terminal_screen.h"
 #include "text_utils.h"
 #include "vertical_layout.h"
 #include "webdav_sync.h"
@@ -53,6 +54,7 @@ enum class Screen {
     Gtd,
     Outline,
     Flomo,
+    Terminal,
     Sync,
     SettingText,
     Settings,
@@ -116,6 +118,7 @@ static const Action k_actions[] = {
     {'t', "写作计划", LV_SYMBOL_OK, Screen::Gtd},
     {'o', "大纲写作", LV_SYMBOL_DIRECTORY, Screen::Outline},
     {'m', "浮墨笔记", "\xF3\xB1\xAB\xB1", Screen::Flomo},   // U+F1AF1
+    {'c', "终端", "\xEF\x84\xA0", Screen::Terminal},        // U+F120
     {'s', "设置", LV_SYMBOL_SETTINGS, Screen::Settings},
 };
 
@@ -457,6 +460,7 @@ static std::string g_sync_message;
 static bool g_sync_done = false;
 // 输入线程里按 Q 会直接写它,主循环每 5ms 读一次,必须是原子量
 static std::atomic<bool> g_should_quit{false};
+static std::atomic<bool> g_reload_requested{false};
 static lv_font_t *g_ui_font = nullptr;
 static lv_font_t *g_icon_font = nullptr;
 static lv_font_t *g_cal_font = nullptr;static lv_font_t *g_editor_font = nullptr;
@@ -474,6 +478,22 @@ static const char *flomo_menu_icon() {
     if(lv_font_get_glyph_dsc(font, &dsc, 0xF1AF1, 0)) return "\xF3\xB1\xAB\xB1";
     if(lv_font_get_glyph_dsc(font, &dsc, 0xF249, 0)) return "\xef\x89\x89";
     return LV_SYMBOL_FILE;
+}
+
+// 终端图标 U+F120;设备上的旧字体缺这个字形时退回便签,再退回键盘,主菜单上
+// 不留豆腐块。
+static const char *terminal_menu_icon() {
+    const lv_font_t *font = g_icon_font ? g_icon_font : LV_FONT_DEFAULT;
+    lv_font_glyph_dsc_t dsc {};
+    if(lv_font_get_glyph_dsc(font, &dsc, 0xF120, 0)) return "\xEF\x84\xA0";
+    if(lv_font_get_glyph_dsc(font, &dsc, 0xF249, 0)) return "\xef\x89\x89";
+    return LV_SYMBOL_KEYBOARD;
+}
+
+static const char *action_menu_icon(const Action &a) {
+    if(a.screen == Screen::Flomo) return flomo_menu_icon();
+    if(a.screen == Screen::Terminal) return terminal_menu_icon();
+    return a.symbol;
 }
 
 // 主菜单当前该显示的 k_actions 下标。「查看过往日记」在没有日记时跳过。
@@ -2545,7 +2565,7 @@ static void render_main() {
     for(int i = 0; i < shown; ++i) {
         const int sel_i = g_main_top + i;
         const Action &a = k_actions[acts[sel_i]];
-        const char *sym_txt = a.screen == Screen::Flomo ? flomo_menu_icon() : a.symbol;
+        const char *sym_txt = action_menu_icon(a);
         int cx = start_x + i * (icon_w + gap) + icon_w / 2;
         lv_obj_t *icon = box_raw(g_root, cx - icon_w / 2, mc.icon_y, icon_w, mc.icon_h, sel_i == g_main_sel);
         lv_obj_set_style_border_width(icon, 0, 0);
@@ -4092,7 +4112,8 @@ static std::vector<std::pair<std::string, std::string>> setting_options(const st
                 {"ralt", "右Alt"}, {"rwin", "右Win"}, {"rctrl", "右Ctrl"}, {"off", "关闭"}};
     if(k == "md_render" || k == "first_line_indent" || k == "version_history" ||
        k == "auto_save" || k == "recovery_draft" || k == "vertical_ref_line" ||
-       k == "ime_sentence" || k == "ime_doc_context" || k == "ime_candidate_highlight")
+       k == "ime_sentence" || k == "ime_doc_context" || k == "ime_candidate_highlight" ||
+       k == "wifi_power")
         return {{"1", "开"}, {"0", "关"}};
     if(k == "font_size" || k == "ime_font_size" || k == "ui_font_size") {
         std::vector<std::pair<std::string, std::string>> o;
@@ -4153,6 +4174,7 @@ static std::string setting_current_value(const std::string &k) {
     if(k == "auto_save") return g_settings.auto_save() ? "1" : "0";
     if(k == "recovery_draft") return g_settings.recovery_draft() ? "1" : "0";
     if(k == "vertical_ref_line") return g_settings.vertical_reference_line() ? "1" : "0";
+    if(k == "wifi_power") return g_wifi.powered() ? "1" : "0";
     return "";
 }
 
@@ -4163,6 +4185,11 @@ static void setting_apply(const std::string &k, const std::string &v) {
        k == "font_size" || k == "ime_font_size" || k == "ui_font_size")
         app_ui_reload_font();
     if(k == "backlight") backlight_set_percent(atoi(v.c_str()));
+    if(k == "wifi_power") {
+        // 真正给射频断电/上电;列表里的开/关读的是驱动实际状态
+        std::string message;
+        g_wifi.set_power(v == "1", message);
+    }
     // 输入法设置改了要立即生效,不能让用户重启(模糊音缓存/整句等快照都在 IME 里)
     g_linux_ime.reload_settings();
     app_ui_reload_theme();
@@ -4201,7 +4228,8 @@ static const WifiStatus &settings_wifi_status() {
     static uint32_t next_ms = 0;
     uint32_t now = lv_tick_get();
     if(next_ms == 0 || (int32_t)(now - next_ms) >= 0) {
-        st = g_wifi.status();
+        // 射频断电时 wpa_cli 只会空转,不必每 5 秒 fork 两次
+        st = g_wifi.powered() ? g_wifi.status() : WifiStatus{};
         next_ms = now + 5000;
     }
     return st;
@@ -4221,7 +4249,7 @@ static std::vector<SetItem> settings_items() {
         {"app_mode", "工作模式", appModeLabel},
         {"home_view", "主页视图", g_settings.home_view() == "month" ? "月视图" : "周视图"},
         {"ui_font_size", "界面字号", std::to_string(g_settings.ui_font_size())},
-        {"font_size", "字号", std::to_string(g_settings.font_size())},
+        {"font_size", "文字编辑字号", std::to_string(g_settings.font_size())},
         {"ime_font_size", "输入法字号", std::to_string(g_settings.ime_font_size())},
         {"font_file", "正文字体", g_settings.font_file().empty() ? g_fonts.default_font_path() : g_settings.font_file()},
         {"font_bold_file", "粗体字体",
@@ -4241,7 +4269,9 @@ static std::vector<SetItem> settings_items() {
         {"ime_sentence", "整句候选", g_settings.imeSentence() ? "开" : "关"},
         {"ime_doc_context", "正文词优先", g_settings.imeDocContext() ? "开" : "关"},
         {"ime_candidate_highlight", "候选高亮", g_settings.imeCandidateHighlight() ? "开" : "关"},
-        {"wifi", "WiFi管理", wst.connected ? ("已连接 " + wst.ssid) : "未连接"},
+        {"wifi_power", "WiFi开关", g_wifi.powered() ? "开" : "关"},
+        {"wifi", "WiFi管理",
+         !g_wifi.powered() ? "已关闭" : (wst.connected ? ("已连接 " + wst.ssid) : "未连接")},
         {"md_render", "Markdown渲染", g_settings.markdown_render() ? "开" : "关"},
         {"first_line_indent", "首行缩进", g_settings.first_line_indent() ? "开" : "关"},
         {"version_history", "历史版本", g_settings.version_history() ? "开" : "关"},
@@ -4256,6 +4286,10 @@ static std::vector<SetItem> settings_items() {
         {"personal_hob", "个人爱好", g_settings.get("personal_hob", "").empty() ? "(未设置)" : "(已设置)"},
         {"editor_orientation", "文字方向", editor_vertical() ? "竖排" : "横排"},
     };
+    // 机器上没有 rkwifi 控制口(开发机)就不显示电源开关,免得留一个按了没反应的项
+    if(!g_wifi.power_control_available())
+        for(auto it = v.begin(); it != v.end(); ++it)
+            if(it->key == "wifi_power") { v.erase(it); break; }
     // 机器上没有背光设备就没有这一项(x86 上跑时整项消失,不留一个按了没反应的死项)
     if(backlight_available())
         v.insert(v.begin() + 1, {"backlight", "背光亮度", std::to_string(backlight_display_percent()) + "%"});
@@ -4274,6 +4308,7 @@ static std::vector<SetItem> settings_items() {
                  file_manager_server_running() ? ("运行中 :" + std::to_string(file_manager_server_get_port()))
                                                : "已停止"});
     v.push_back({"file_mgr_token", "文件管理密码", g_settings.get("file_mgr_token", "").empty() ? "" : "******"});
+    v.push_back({"reload", "重新加载", "应用输入法等更改"});
     return v;
 }
 
@@ -4352,10 +4387,14 @@ static void render_setting_text() {
 
 static void render_wifi() {
     clear_root();
-    WifiStatus st = g_wifi.status();
-    label(g_root, std::string("WiFi管理  ") + (g_wifi_saved_mode ? "已保存" : "扫描") + "  " +
-                      (st.connected ? ("已连接 " + st.ssid + " " + st.ip) : st.state),
-          8, 8, 1008, 32);
+    const bool powered = g_wifi.powered();
+    WifiStatus st = powered ? g_wifi.status() : WifiStatus{};
+    std::string title = "WiFi管理  ";
+    if(!powered) title += "已关闭";
+    else
+        title += std::string(g_wifi_saved_mode ? "已保存" : "扫描") + "  " +
+                 (st.connected ? ("已连接 " + st.ssid + " " + st.ip) : st.state);
+    label(g_root, title, 8, 8, 1008, 32);
     lv_obj_t *scan_tab = box(g_root, 8, 44, 170, 34, !g_wifi_saved_mode);
     lv_obj_t *scan_txt = label(scan_tab, "扫描网络", 0, 4, 162, 24);
     lv_obj_set_style_text_align(scan_txt, LV_TEXT_ALIGN_CENTER, 0);
@@ -4366,7 +4405,7 @@ static void render_wifi() {
     if(g_wifi_saved_mode) lv_obj_set_style_text_color(saved_txt, g_theme.bg, 0);
 
     if(g_wifi_saved_mode) {
-        if(g_wifi_saved_entries.empty()) g_wifi_saved_entries = g_wifi.list_networks();
+        if(g_wifi_saved_entries.empty() && powered) g_wifi_saved_entries = g_wifi.list_networks();
         if(g_wifi_saved_sel >= (int)g_wifi_saved_entries.size()) g_wifi_saved_sel = (int)g_wifi_saved_entries.size() - 1;
         if(g_wifi_saved_sel < 0) g_wifi_saved_sel = 0;
         int start = std::max(0, g_wifi_saved_sel - 6);
@@ -4378,7 +4417,7 @@ static void render_wifi() {
             if(idx == g_wifi_saved_sel) lv_obj_set_style_text_color(l, g_theme.bg, 0);
         }
     } else {
-        if(g_wifi_entries.empty()) g_wifi_entries = g_wifi.scan();
+        if(g_wifi_entries.empty() && powered) g_wifi_entries = g_wifi.scan();
         if(g_wifi_sel >= (int)g_wifi_entries.size()) g_wifi_sel = (int)g_wifi_entries.size() - 1;
         if(g_wifi_sel < 0) g_wifi_sel = 0;
         int start = std::max(0, g_wifi_sel - 6);
@@ -4396,7 +4435,11 @@ static void render_wifi() {
     base_style(g_wifi_password);
     lv_textarea_set_one_line(g_wifi_password, true);
     lv_textarea_set_password_mode(g_wifi_password, true);
-    lv_textarea_set_placeholder_text(g_wifi_password, g_wifi_saved_mode ? "已保存网络: Enter选择 d删除 r刷新 x断开 c重连" : "扫描网络: 输入密码 Enter连接 Tab切换 r刷新");
+    lv_textarea_set_placeholder_text(g_wifi_password,
+                                     !powered ? "WiFi 电源已关闭: 返回设置,打开 WiFi开关"
+                                     : g_wifi_saved_mode
+                                         ? "已保存网络: Enter选择 d删除 r刷新 x断开 c重连"
+                                         : "扫描网络: 输入密码 Enter连接 Tab切换 r刷新");
     draw_status_bar(st.connected ? ("WiFi  " + st.ssid) : "WiFi");
 }
 
@@ -4672,6 +4715,7 @@ static void render() {
     case Screen::Gtd: render_gtd(); break;
     case Screen::Outline: render_outline(); break;
     case Screen::Flomo: flomo::render(); break;
+    case Screen::Terminal: terminal::render(); break;
     case Screen::Sync: render_sync(); break;
     case Screen::SettingText: render_setting_text(); break;
     case Screen::Settings: render_settings(); break;
@@ -4694,6 +4738,8 @@ static void goto_screen(Screen s) {
     g_prev_screen = g_screen;
     // 离开浮墨屏时先让它收尾(关输入法、落盘、清屏),它自己清掉的是同一个 root。
     if(g_screen == Screen::Flomo && s != Screen::Flomo) flomo::leave();
+    // 终端离开即关闭 shell 会话(用户选的),再进来是全新的一只。
+    if(g_screen == Screen::Terminal && s != Screen::Terminal) terminal::leave();
     // 离开编辑器时把「大纲正文文件」的路径收回来(进入时保留,供编辑器读取)。
     bool back_from_outline_file = false;
     if(g_screen == Screen::Editor && s != Screen::Editor) {
@@ -4759,6 +4805,11 @@ static void goto_screen(Screen s) {
         // 浮墨屏自己画 root,app_ui 的背光浮层指针会变成野指针,先进来收掉。
         if(g_bl_osd_until) backlight_osd_hide();
         flomo::create();
+    }
+    if(s == Screen::Terminal) {
+        // 终端同样自己画 root。
+        if(g_bl_osd_until) backlight_osd_hide();
+        terminal::create();
     }
     render();
 }
@@ -5007,6 +5058,7 @@ static bool handle_file_panel_key(int key) {
 
 static void insert_utf8(const std::string &s) {
     if(g_screen == Screen::Flomo) { flomo::insert_utf8(s); return; }
+    if(g_screen == Screen::Terminal) { terminal::insert_utf8(s); return; }
     if(g_screen == Screen::Editor && g_editor && utf8_valid(s)) lv_textarea_add_text(g_editor, s.c_str());
     if(g_screen == Screen::SettingText && g_setting_text && utf8_valid(s)) lv_textarea_add_text(g_setting_text, s.c_str());
     if(g_screen == Screen::Gtd && g_gtd.input && utf8_valid(s)) lv_textarea_add_text(g_gtd.input, s.c_str());
@@ -5192,8 +5244,13 @@ static void handle_settings(int key) {
         if(moved && g_setting_pick_key == "backlight" && total > 0)
             backlight_set_percent(atoi(g_setting_pick_opts[g_setting_pick_sel].first.c_str()));
         if((key == '\n' || key == '\r' || key == KEY_RIGHT) && total > 0) {
+            const bool wifi_power = g_setting_pick_key == "wifi_power";
             setting_apply(g_setting_pick_key, g_setting_pick_opts[g_setting_pick_sel].first);
             g_setting_pick_active = false;
+            render();
+            // render() 会重建状态栏,提示得在它之后再写
+            if(wifi_power) set_status(g_wifi.powered() ? "WiFi 已开启" : "WiFi 已关闭");
+            return;
         }
         render();
         return;
@@ -5206,6 +5263,7 @@ static void handle_settings(int key) {
     if(key == '\n' || key == '\r' || key == KEY_RIGHT || key == KEY_LEFT) {
         const SetItem &it = items[g_settings_sel];
         const std::string &k = it.key;
+        if(k == "reload") { app_ui_request_reload(); return; }
         if(k == "wifi") {
             g_wifi_entries.clear();
             g_wifi_saved_entries.clear();
@@ -6835,6 +6893,12 @@ static void handle_wifi(int key) {
         g_wifi_entries.clear();
         g_wifi_saved_entries.clear();
         render();
+        return;
+    }
+    // 射频断电时 wpa_cli 什么都不做,别让按键看着像没反应
+    if(!g_wifi.powered()) {
+        render();
+        set_status("WiFi 电源已关闭,请在设置中打开 WiFi开关");
         return;
     }
     if(key == 'r' || key == 'R') {
@@ -9251,6 +9315,8 @@ static void handle_key(int key) {
     // 浮墨屏自己处理所有键(含背光 OSD、输入法修饰键);Ctrl+Q 已在上面分流。
     // 它每帧 launder root,绝不能让 app_ui 的 OSD/退出框指针活到那一屏里。
     if(g_screen == Screen::Flomo) { flomo::handle_key(key); return; }
+    // 终端自己处理所有键(含 F10 菜单、输入法键、背光和回看)。
+    if(g_screen == Screen::Terminal) { terminal::handle_key(key); return; }
     if(key == KEY_BACKLIGHT_UP || key == KEY_BACKLIGHT_DOWN) {
         backlight_osd_step(key == KEY_BACKLIGHT_UP ? 1 : -1);
         return;
@@ -9313,6 +9379,7 @@ static void handle_key(int key) {
     case Screen::Dict: handle_dict(key); break;
     case Screen::FileMgr: handle_filemgr(key); break;
     case Screen::Flomo: break;   // 已在前面整键转给 flomo::handle_key
+    case Screen::Terminal: break;  // 同上,已转给 terminal::handle_key
     case Screen::Help: break;
     }
     if(g_bl_osd_until) draw_backlight_osd();
@@ -9357,12 +9424,22 @@ bool app_ui_should_quit() {
     return g_should_quit;
 }
 
+void app_ui_request_reload() {
+    g_reload_requested = true;
+    g_should_quit = true;
+}
+
+bool app_ui_reload_requested() {
+    return g_reload_requested;
+}
+
 void app_ui_return_to_main() {
     goto_screen(Screen::Main);
 }
 
 void app_ui_tick() {
     if(g_screen == Screen::Flomo) { flomo::tick(); return; }
+    if(g_screen == Screen::Terminal) { terminal::tick(); return; }
     static uint32_t next_main_status_ms = 0;
     if(g_bl_osd_until && (int32_t)(lv_tick_get() - g_bl_osd_until) >= 0) backlight_osd_hide();
     if(g_screen == Screen::Main && g_status) {

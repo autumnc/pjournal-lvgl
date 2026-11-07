@@ -32,6 +32,12 @@ public:
     void set_interface(const std::string &iface);
     std::string interface() const { return iface_; }
 
+    // rkwifi 驱动提供真正的射频电源开关(写 /sys/class/rkwifi/driver 0/1)。
+    // 开发机没有这个文件,设置里就不显示开关。
+    bool power_control_available() const;
+    bool powered() const;
+    bool set_power(bool on, std::string &message);
+
     WifiStatus status() const;
     std::vector<WifiNetwork> scan();
     std::vector<WifiSavedNetwork> list_networks();

@@ -6,6 +6,7 @@
 #include "linux_ime.h"
 #include "linux_input.h"
 #include "settings.h"
+#include "wifi_manager.h"
 
 #include <lvgl.h>
 #include <src/drivers/display/fb/lv_linux_fbdev.h>
@@ -107,6 +108,11 @@ int main() {
     // 存过档位才去动硬件;没设过就保留系统开机时给的那个亮度
     int backlight = g_settings.backlight_percent();
     if(backlight > 0) backlight_set_percent(backlight);
+    // 用户上次关了 WiFi 电源:开机服务会重新上电,这里按设置再关一次
+    if(g_wifi.power_control_available() && !g_settings.wifi_power()) {
+        std::string ignored;
+        g_wifi.set_power(false, ignored);
+    }
     g_journal.begin();
     scan_fonts();
 
@@ -144,5 +150,17 @@ int main() {
     }
     g_linux_ime.flush_user_dict_now();
     linux_console_restore();
+    if(app_ui_reload_requested()) {
+        // 原地换一份新进程:输入法、字体、主题这些只在启动时读的设置都能干净生效。
+        // 必须 exec 真实路径而不是 /proc/self/exe,否则内核会把 comm 改成 "exe",
+        // 部署脚本的 pkill -x pjournal-lvgl 就找不到进程了。
+        char exe[4096] = {};
+        ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+        if(n > 0) {
+            exe[n] = 0;
+            execl(exe, "pjournal-lvgl", (char *)nullptr);
+        }
+        _exit(1);
+    }
     return 0;
 }
