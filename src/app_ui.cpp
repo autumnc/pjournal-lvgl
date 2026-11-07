@@ -2,6 +2,7 @@
 
 #include "backlight.h"
 #include "file_manager_server.h"
+#include "flomo_screen.h"
 #include "font_manager.h"
 #include "hash_utils.h"
 #include "journal_storage.h"
@@ -51,6 +52,7 @@ enum class Screen {
     History,
     Gtd,
     Outline,
+    Flomo,
     Sync,
     SettingText,
     Settings,
@@ -113,6 +115,7 @@ static const Action k_actions[] = {
     {'w', "同步WebDAV", LV_SYMBOL_UPLOAD, Screen::Sync},
     {'t', "写作计划", LV_SYMBOL_OK, Screen::Gtd},
     {'o', "大纲写作", LV_SYMBOL_DIRECTORY, Screen::Outline},
+    {'m', "浮墨笔记", "\xF3\xB1\xAB\xB1", Screen::Flomo},   // U+F1AF1
     {'s', "设置", LV_SYMBOL_SETTINGS, Screen::Settings},
 };
 
@@ -129,6 +132,9 @@ static Screen g_prev_screen = Screen::Main;
 // 子界面。设置里改完东西按 Esc 要回到这里。
 static Screen g_settings_return = Screen::Main;
 static int g_main_sel = 0;
+// 主菜单图标放不下一屏时,第一个可见项的索引(横向滚动窗口)。g_main_sel 是
+// main_action_indices() 里的下标,不是 k_actions 的下标。
+static int g_main_top = 0;
 static int g_browser_sel = 0;
 static int g_history_sel = 0;
 static int g_history_scroll = 0;
@@ -453,13 +459,33 @@ static bool g_sync_done = false;
 static std::atomic<bool> g_should_quit{false};
 static lv_font_t *g_ui_font = nullptr;
 static lv_font_t *g_icon_font = nullptr;
-static lv_font_t *g_cal_font = nullptr;
-static lv_font_t *g_editor_font = nullptr;
+static lv_font_t *g_cal_font = nullptr;static lv_font_t *g_editor_font = nullptr;
 static lv_font_t *g_editor_bold_font = nullptr;    // 真粗体字体;未配置为 nullptr(改用描两遍)
 static lv_font_t *g_editor_italic_font = nullptr;  // 真斜体字体;未配置为 nullptr
 static lv_font_t *g_editor_faux_italic = nullptr;  // 正文路径 + FreeType 斜切,伪斜体免费
 static lv_font_t *g_ime_font = nullptr;  // 候选条字号独立于正文,由设置里的输入法字号决定
 static const lv_font_t *g_current_font = nullptr;
+
+// 浮墨图标(U+F1AF1)在用户更新的 Nerd Font 里;万一设备上还是旧字体,回退到
+// U+F249(便签),再回退 LV_SYMBOL_FILE,主菜单上不留豆腐块。
+static const char *flomo_menu_icon() {
+    const lv_font_t *font = g_icon_font ? g_icon_font : LV_FONT_DEFAULT;
+    lv_font_glyph_dsc_t dsc {};
+    if(lv_font_get_glyph_dsc(font, &dsc, 0xF1AF1, 0)) return "\xF3\xB1\xAB\xB1";
+    if(lv_font_get_glyph_dsc(font, &dsc, 0xF249, 0)) return "\xef\x89\x89";
+    return LV_SYMBOL_FILE;
+}
+
+// 主菜单当前该显示的 k_actions 下标。「查看过往日记」在没有日记时跳过。
+static std::vector<int> main_action_indices(bool has_entries) {
+    std::vector<int> idx;
+    const int n = (int)(sizeof(k_actions) / sizeof(k_actions[0]));
+    for(int i = 0; i < n; ++i) {
+        if(k_actions[i].key == 'v' && !has_entries) continue;
+        idx.push_back(i);
+    }
+    return idx;
+}
 
 // 正文行距。着重号画在字脚下面,行挨太紧会蹭到下一行,必须留出余量。
 static constexpr int k_md_line_space = 6;
@@ -2494,27 +2520,58 @@ static void render_main() {
 
     lv_obj_t *sep = box_raw(g_root, 40, mc.sep_y, screen_w() - 80, 2);
     lv_obj_set_style_border_width(sep, 0, 0);
-    int visible = total > 0 ? 7 : 6;
-    if(g_main_sel >= visible) g_main_sel = visible - 1;
-    int slot = screen_w() / visible;
+    std::vector<int> acts = main_action_indices(total > 0);
+    const int count = (int)acts.size();
+    if(g_main_sel >= count) g_main_sel = count - 1;
+    if(g_main_sel < 0) g_main_sel = 0;
+
+    // 一屏放得下几个:按图标宽 + 间距算,两侧各留一条提示箭头的位置。
     int icon_w = ui_px(84);
-    if(icon_w > slot - ui_px(4)) icon_w = slot - ui_px(4);
-    for(int i = 0; i < visible; ++i) {
-        int action_idx = (total > 0 || i < 2) ? i : i + 1;
-        const Action &a = k_actions[action_idx];
-        int cx = i * slot + slot / 2;
-        lv_obj_t *icon = box_raw(g_root, cx - icon_w / 2, mc.icon_y, icon_w, mc.icon_h, i == g_main_sel);
+    int gap = ui_px(16);
+    int chev_w = ui_px(28);
+    int side = chev_w + ui_px(8);
+    int per = (screen_w() - 2 * side) / (icon_w + gap);
+    if(per < 1) per = 1;
+    if(per > count) per = count;
+    // 选中项始终滚在窗口内
+    if(g_main_sel < g_main_top) g_main_top = g_main_sel;
+    if(g_main_sel >= g_main_top + per) g_main_top = g_main_sel - per + 1;
+    if(g_main_top > count - per) g_main_top = count - per;
+    if(g_main_top < 0) g_main_top = 0;
+
+    const int shown = per < count ? per : count;
+    int row_w = shown * icon_w + (shown - 1) * gap;
+    int start_x = (screen_w() - row_w) / 2;
+    for(int i = 0; i < shown; ++i) {
+        const int sel_i = g_main_top + i;
+        const Action &a = k_actions[acts[sel_i]];
+        const char *sym_txt = a.screen == Screen::Flomo ? flomo_menu_icon() : a.symbol;
+        int cx = start_x + i * (icon_w + gap) + icon_w / 2;
+        lv_obj_t *icon = box_raw(g_root, cx - icon_w / 2, mc.icon_y, icon_w, mc.icon_h, sel_i == g_main_sel);
         lv_obj_set_style_border_width(icon, 0, 0);
         lv_obj_set_style_pad_all(icon, 0, 0);
         // 图标字号大,PUA 字形在字宽里靠左、墨迹还可能比字宽宽,得铺满框再按墨迹居中
-        lv_obj_t *sym = label_raw(icon, a.symbol, 0, 0, icon_w);
+        lv_obj_t *sym = label_raw(icon, sym_txt, 0, 0, icon_w);
         if(g_icon_font) lv_obj_set_style_text_font(sym, g_icon_font, 0);
         lv_obj_set_style_text_align(sym, LV_TEXT_ALIGN_CENTER, 0);
-        center_ink(sym, a.symbol);
-        if(i == g_main_sel) lv_obj_set_style_text_color(sym, g_theme.bg, 0);
+        center_ink(sym, sym_txt);
+        if(sel_i == g_main_sel) lv_obj_set_style_text_color(sym, g_theme.bg, 0);
     }
-    int sel_idx = (total > 0 || g_main_sel < 2) ? g_main_sel : g_main_sel + 1;
-    lv_obj_t *hint = label_raw(g_root, std::string("[") + k_actions[sel_idx].key + "] " + k_actions[sel_idx].title,
+    // 两侧的「还有内容」提示。箭头本身用界面字体,垂直居中在图标带里。
+    if(per < count) {
+        int lh = lv_font_get_line_height(g_ui_font ? g_ui_font : LV_FONT_DEFAULT);
+        int cy = mc.icon_y + (mc.icon_h - lh) / 2;
+        if(g_main_top > 0) {
+            lv_obj_t *l = label_raw(g_root, LV_SYMBOL_LEFT, ui_px(4), cy, chev_w, lh);
+            lv_obj_set_style_text_color(l, g_theme.muted, 0);
+        }
+        if(g_main_top + per < count) {
+            lv_obj_t *r = label_raw(g_root, LV_SYMBOL_RIGHT, screen_w() - chev_w - ui_px(4), cy, chev_w, lh);
+            lv_obj_set_style_text_color(r, g_theme.muted, 0);
+        }
+    }
+    const Action &sel_action = k_actions[acts[g_main_sel]];
+    lv_obj_t *hint = label_raw(g_root, std::string("[") + sel_action.key + "] " + sel_action.title,
                                0, mc.hint_y, screen_w(), ui_px(34));
     lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
     draw_status_bar(main_status_text(), true);
@@ -4614,6 +4671,7 @@ static void render() {
     case Screen::History: render_history(); break;
     case Screen::Gtd: render_gtd(); break;
     case Screen::Outline: render_outline(); break;
+    case Screen::Flomo: flomo::render(); break;
     case Screen::Sync: render_sync(); break;
     case Screen::SettingText: render_setting_text(); break;
     case Screen::Settings: render_settings(); break;
@@ -4634,6 +4692,8 @@ static void goto_screen(Screen s) {
        g_screen != Screen::Dict && g_screen != Screen::FileMgr)
         g_settings_return = g_screen;
     g_prev_screen = g_screen;
+    // 离开浮墨屏时先让它收尾(关输入法、落盘、清屏),它自己清掉的是同一个 root。
+    if(g_screen == Screen::Flomo && s != Screen::Flomo) flomo::leave();
     // 离开编辑器时把「大纲正文文件」的路径收回来(进入时保留,供编辑器读取)。
     bool back_from_outline_file = false;
     if(g_screen == Screen::Editor && s != Screen::Editor) {
@@ -4695,6 +4755,11 @@ static void goto_screen(Screen s) {
         dict_reload();
     }
     if(s == Screen::FileMgr) file_manager_server_start(8080);
+    if(s == Screen::Flomo) {
+        // 浮墨屏自己画 root,app_ui 的背光浮层指针会变成野指针,先进来收掉。
+        if(g_bl_osd_until) backlight_osd_hide();
+        flomo::create();
+    }
     render();
 }
 
@@ -4941,6 +5006,7 @@ static bool handle_file_panel_key(int key) {
 }
 
 static void insert_utf8(const std::string &s) {
+    if(g_screen == Screen::Flomo) { flomo::insert_utf8(s); return; }
     if(g_screen == Screen::Editor && g_editor && utf8_valid(s)) lv_textarea_add_text(g_editor, s.c_str());
     if(g_screen == Screen::SettingText && g_setting_text && utf8_valid(s)) lv_textarea_add_text(g_setting_text, s.c_str());
     if(g_screen == Screen::Gtd && g_gtd.input && utf8_valid(s)) lv_textarea_add_text(g_gtd.input, s.c_str());
@@ -4950,15 +5016,23 @@ static void insert_utf8(const std::string &s) {
 }
 
 static void handle_main(int key) {
-    const int entry_count = g_journal.stats().total;
-    int visible = entry_count > 0 ? 7 : 6;
-    if(key == KEY_LEFT || key == KEY_UP || key == 'h' || key == 'k') g_main_sel = (g_main_sel + visible - 1) % visible;
-    else if(key == KEY_RIGHT || key == KEY_DOWN || key == 'l' || key == 'j') g_main_sel = (g_main_sel + 1) % visible;
-    else {
+    const std::vector<int> acts = main_action_indices(g_journal.stats().total > 0);
+    const int count = (int)acts.size();
+    if(g_main_sel >= count) g_main_sel = count - 1;
+    if(g_main_sel < 0) g_main_sel = 0;
+    // 左右在两端是夹紧,不循环 —— 横向滚动时循环会让人分不清从哪头进来的。
+    if(key == KEY_LEFT || key == KEY_UP || key == 'h' || key == 'k') {
+        if(g_main_sel > 0) --g_main_sel;
+    } else if(key == KEY_RIGHT || key == KEY_DOWN || key == 'l' || key == 'j') {
+        if(g_main_sel + 1 < count) ++g_main_sel;
+    } else if(key == KEY_HOME) {
+        g_main_sel = 0;
+    } else if(key == KEY_END) {
+        g_main_sel = count - 1;
+    } else {
         char ch = key >= 'A' && key <= 'Z' ? key + 32 : key;
-        for(int i = 0; i < visible; ++i) {
-            int idx = (entry_count > 0 || i < 2) ? i : i + 1;
-            if(k_actions[idx].key == ch) {
+        for(int i = 0; i < count; ++i) {
+            if(k_actions[acts[i]].key == ch) {
                 g_main_sel = i;
                 key = '\n';
                 break;
@@ -4966,8 +5040,7 @@ static void handle_main(int key) {
         }
     }
     if(key == '\n' || key == '\r') {
-        int idx = (entry_count > 0 || g_main_sel < 2) ? g_main_sel : g_main_sel + 1;
-        const Action &a = k_actions[idx];
+        const Action &a = k_actions[acts[g_main_sel]];
         if(a.key == 'p') { g_quick_slot = -1; g_file_edit_path.clear(); g_prompt = random_builtin_prompt(); g_edit_file.clear(); goto_screen(Screen::Editor); return; }
         if(a.key == 'f') { g_quick_slot = -1; g_file_edit_path.clear(); g_prompt.clear(); g_edit_file.clear(); goto_screen(Screen::Editor); return; }
         if(a.key == 'v') { g_browser_sel = 0; g_browser_needs_reload = true; goto_screen(Screen::Browser); return; }
@@ -9175,6 +9248,9 @@ static void handle_key(int key) {
     // 免得被下面的输入法/文件槽位快捷键抢走。
     if(g_quit_asking) { quit_confirm_key(key); return; }
     if(key == 0x11) { quit_begin(); return; }
+    // 浮墨屏自己处理所有键(含背光 OSD、输入法修饰键);Ctrl+Q 已在上面分流。
+    // 它每帧 launder root,绝不能让 app_ui 的 OSD/退出框指针活到那一屏里。
+    if(g_screen == Screen::Flomo) { flomo::handle_key(key); return; }
     if(key == KEY_BACKLIGHT_UP || key == KEY_BACKLIGHT_DOWN) {
         backlight_osd_step(key == KEY_BACKLIGHT_UP ? 1 : -1);
         return;
@@ -9236,6 +9312,7 @@ static void handle_key(int key) {
     case Screen::Inspiration: handle_inspiration(key); break;
     case Screen::Dict: handle_dict(key); break;
     case Screen::FileMgr: handle_filemgr(key); break;
+    case Screen::Flomo: break;   // 已在前面整键转给 flomo::handle_key
     case Screen::Help: break;
     }
     if(g_bl_osd_until) draw_backlight_osd();
@@ -9280,7 +9357,12 @@ bool app_ui_should_quit() {
     return g_should_quit;
 }
 
+void app_ui_return_to_main() {
+    goto_screen(Screen::Main);
+}
+
 void app_ui_tick() {
+    if(g_screen == Screen::Flomo) { flomo::tick(); return; }
     static uint32_t next_main_status_ms = 0;
     if(g_bl_osd_until && (int32_t)(lv_tick_get() - g_bl_osd_until) >= 0) backlight_osd_hide();
     if(g_screen == Screen::Main && g_status) {

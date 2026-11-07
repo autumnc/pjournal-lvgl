@@ -120,7 +120,9 @@ std::string JsonValue::serialize(int indent) const {
     case JsonType::Number: {
         char buf[64];
         double intpart;
-        if (std::modf(numberValue, &intpart) == 0.0 && numberValue >= -1e9 && numberValue <= 1e9)
+        // 2^53 以内的整数在 double 里是精确的;用 %.0f 写出去才能原样读回。
+        // 之前卡在 1e9,把 unix 秒(1.7e9)写成了 %g 的 6 位有效数字。
+        if (std::modf(numberValue, &intpart) == 0.0 && numberValue >= -9e15 && numberValue <= 9e15)
             snprintf(buf, sizeof(buf), "%.0f", numberValue);
         else
             snprintf(buf, sizeof(buf), "%g", numberValue);

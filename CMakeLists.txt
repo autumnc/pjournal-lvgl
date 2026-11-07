@@ -138,6 +138,11 @@ add_executable(pjournal-lvgl
     src/file_manager_server.cpp
     src/app_ui.cpp
     src/text_utils.cpp
+    src/flomo_http.cpp
+    src/flomo_api.cpp
+    src/flomo_db.cpp
+    src/flomo_sync.cpp
+    src/flomo_screen.cpp
     src/linux_ime.cpp
     src/linux_input.cpp
     src/linux_console.cpp
@@ -191,6 +196,10 @@ if(BUILD_TESTING)
         src/esp32_compat.cpp
         src/settings.cpp
         src/text_utils.cpp
+        src/flomo_http.cpp
+        src/flomo_api.cpp
+        src/flomo_db.cpp
+        port/esp32_main/json_utils.cpp
         port/esp32_main/json_parser.cpp
     )
     target_include_directories(pjournal-tests PRIVATE include port/esp32_main)

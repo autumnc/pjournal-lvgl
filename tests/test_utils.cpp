@@ -1,3 +1,6 @@
+#include "flomo_api.h"
+#include "flomo_db.h"
+#include "flomo_model.h"
 #include "hash_utils.h"
 #include "journal_storage.h"
 #include "outline_model.h"
@@ -119,6 +122,79 @@ static int test_outline_shift_subtree() {
     return 0;
 }
 
+static int test_flomo_protocol() {
+    if(text_to_html("hello") != "<p>hello</p>") return fail("text_to_html paragraph mismatch");
+    if(html_to_text("<p>hello</p>") != "hello") return fail("html_to_text paragraph mismatch");
+    if(html_to_text(text_to_html("a\n\nb")) != "a\n\nb") return fail("blank line roundtrip mismatch");
+    if(html_to_text(text_to_html("- a\n- b")) != "- a\n- b") return fail("list roundtrip mismatch");
+    if(html_to_text(text_to_html("1. a\n2. b")) != "1. a\n2. b") return fail("ordered list roundtrip mismatch");
+    const std::string inline_md = "**粗** __下划线__ ==高亮==";
+    if(html_to_text(text_to_html(inline_md)) != inline_md)
+        return fail("inline markdown roundtrip mismatch: " + html_to_text(text_to_html(inline_md)));
+
+    auto tags = extract_tags("今天 #a 还有 #a/b 和重复 #a");
+    if(tags.size() != 3) return fail("extract_tags count mismatch");
+    if(tags[0] != "a" || tags[1] != "a/b" || tags[2] != "a") return fail("extract_tags value mismatch");
+
+    JsonValue memo = JsonValue::object();
+    memo.set("slug", JsonValue("abc"));
+    memo.set("content", JsonValue("<p>正文 #tag</p>"));
+    memo.set("content_text", JsonValue("正文 #tag"));
+    memo.set("updated_at", JsonValue("2026-11-07 09:00:00"));
+    memo.set("deleted_at", JsonValue(nullptr));
+    memo.set("pin", JsonValue(1));
+    Memo m = memo_from_json(memo);
+    if(m.slug != "abc" || !m.pinned()) return fail("memo_from_json slug/pin mismatch");
+    if(m.deleted) return fail("memo_from_json deleted flag mismatch");
+    if(m.tags.size() != 1 || m.tags[0] != "tag") return fail("memo_from_json tag extraction mismatch");
+
+    memo.set("deleted_at", JsonValue("2026-11-07 10:00:00"));
+    if(!memo_from_json(memo).deleted) return fail("memo_from_json deleted_at ignored");
+
+    // 2026-11-07 09:00:00 (UTC+8) == 2026-11-07 01:00:00 UTC
+    if(flomo_cursor_from_stamp("2026-11-07 09:00:00") != 1794013200LL)
+        return fail("cursor conversion mismatch");
+    if(flomo_cursor_from_stamp("1970-01-01 08:00:00") != 0) return fail("cursor epoch boundary mismatch");
+    if(flomo_cursor_from_stamp("") != 0) return fail("cursor empty stamp mismatch");
+    return 0;
+}
+
+static int test_flomo_db() {
+    Store store;
+    store.token = "tok-123";
+    store.lastSync = "2026-11-07 09:30:00";
+    store.cursorUpdatedAt = 1794018000LL;
+    store.cursorSlug = "slug-last";
+    Memo m;
+    m.slug = "slug-1";
+    m.contentHtml = "<p>hi</p>";
+    m.contentText = "hi";
+    m.updatedAt = "2026-11-07 09:00:00";
+    m.pin = 1;
+    m.dirty = true;
+    m.pendingOp = "update";
+    m.tags = {"a", "a/b"};
+    store.memos.push_back(m);
+    if(!flomo_db_save(store)) return fail("flomo_db_save failed");
+
+    Store loaded;
+    if(!flomo_db_load(loaded)) return fail("flomo_db_load failed");
+    if(loaded.token != store.token) return fail("flomo db token mismatch");
+    if(loaded.lastSync != store.lastSync) return fail("flomo db last_sync mismatch");
+    if(loaded.cursorUpdatedAt != store.cursorUpdatedAt) return fail("flomo db cursor mismatch");
+    if(loaded.cursorSlug != store.cursorSlug) return fail("flomo db cursor slug mismatch");
+    if(loaded.memos.size() != 1) return fail("flomo db memo count mismatch");
+    const Memo &lm = loaded.memos[0];
+    if(lm.slug != "slug-1" || lm.contentText != "hi") return fail("flomo db memo content mismatch");
+    if(!lm.pinned() || !lm.dirty || lm.pendingOp != "update") return fail("flomo db memo flags mismatch");
+    if(lm.tags.size() != 2 || lm.tags[1] != "a/b") return fail("flomo db memo tags mismatch");
+
+    // 界面每次进入都会对同一个 Store 调一次 load;不能把库内容追加成两份
+    if(!flomo_db_load(loaded)) return fail("flomo db reload failed");
+    if(loaded.memos.size() != 1) return fail("flomo db reload duplicated memos");
+    return 0;
+}
+
 int main() {
     if(hash::md5_hex("") != "d41d8cd98f00b204e9800998ecf8427e") return fail("md5 empty mismatch");
     if(hash::md5_hex("abc") != "900150983cd24fb0d6963f7d28e17f72") return fail("md5 abc mismatch");
@@ -131,6 +207,8 @@ int main() {
     if(access(printf_path, X_OK) != 0) return fail("printf not found");
     if(process::run_capture({printf_path, "hello"}) != "hello") return fail("run_capture printf mismatch");
     if(int rc = test_journal_storage()) return rc;
+    if(int rc = test_flomo_protocol()) return rc;
+    if(int rc = test_flomo_db()) return rc;
     if(int rc = test_outline_shift_subtree()) return rc;
     return 0;
 }
