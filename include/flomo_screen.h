@@ -24,6 +24,9 @@ void tick();
 // 输入法上屏文字。
 void insert_utf8(const std::string &text);
 
+// 剪贴板历史粘贴,返回 false 表示当前没有可输入的目标。
+bool paste_text(const std::string &text);
+
 // 离开浮墨屏:关输入法、保存本地库、释放对象。
 void leave();
 

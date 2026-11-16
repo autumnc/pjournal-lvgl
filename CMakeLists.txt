@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(pjournal_lvgl VERSION 1.3.1 LANGUAGES C CXX)
+project(pjournal_lvgl VERSION 1.3.2 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -137,6 +137,8 @@ add_executable(pjournal-lvgl
     src/webdav_sync.cpp
     src/file_manager_server.cpp
     src/app_ui.cpp
+    src/clip_history.cpp
+    src/clip_web.cpp
     src/text_utils.cpp
     src/flomo_http.cpp
     src/flomo_api.cpp

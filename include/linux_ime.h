@@ -41,6 +41,9 @@ public:
     bool predicting() const;
     bool letter_select_armed() const;    // 字母选字待选(候选编号画 q./w./e. …)
     std::string letter_sel_keys() const; // 1..9 对应的字母,内置后端返回 "qwertyuio"
+    // 轻点修饰键能否切字母选字(有候选且不在特殊模式)。快捷菜单用它决定轻点归属。
+    bool letter_sel_tap_available() const;
+    void cancel_composition();           // 丢弃当前组字(非内置后端无操作)
     std::string take_status_message();   // 取走一次性状态提示("已删除 xx" 等)
     void set_document_context(const std::string &text);
     void handle_host_backspace();

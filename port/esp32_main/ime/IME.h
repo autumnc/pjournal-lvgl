@@ -93,6 +93,11 @@ public:
     // 这一次的 q/w/e/r/t/y/u/i/o 就当成数字 1..9 选字（见 handleKey）。
     bool letterSelectArmed() const { return _letterSelArmed; }
     void disarmLetterSelect() { _letterSelArmed = false; }
+    // 当前是否处于"按住修饰键轻点就能切字母选字"的状态。app 用它判断轻点该给输入法还是
+    // 弹快捷菜单。
+    bool letterSelTapAvailable() const {
+        return !_page.empty() && !_vMode && !_lfMode && !_deleteMode;
+    }
     // 数字 1..9 对应的字母，翻译表和屏幕提示共用这一份。
     static const char *letterSelKeys();
 

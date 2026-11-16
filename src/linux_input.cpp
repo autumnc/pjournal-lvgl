@@ -46,6 +46,7 @@ static constexpr int APP_KEY_SEARCH = 0xA2;
 static constexpr int APP_KEY_HELP = 0xA3;
 static constexpr int APP_KEY_REDO = 0xA4;
 static constexpr int APP_KEY_IM_SWITCH = 0xA5;
+static constexpr int APP_KEY_WIN_V = 0xA6;  // Alt/GUI+V:打开剪贴板历史
 // 修饰键单击(与 include/key_codes.h 的 KEY_MOD_TAP_* 一致):输入法拿它当字母选字键
 static constexpr int APP_KEY_MOD_TAP_LCTRL = 0xB0;
 static constexpr int APP_KEY_MOD_TAP_LGUI = 0xB1;
@@ -86,6 +87,7 @@ struct InputState {
     bool shift = false;
     bool ctrl = false;
     bool alt = false;
+    bool gui = false;
     bool left_shift_down = false;
     bool left_shift_used = false;
     TapState ctrl_tap;
@@ -99,10 +101,14 @@ struct InputState {
 // 重复的那一个字节丢掉。两个线程共享这几个标志,必须用原子量。
 static std::atomic<bool> g_shift_held{false};
 static std::atomic<bool> g_ctrl_held{false};
+static std::atomic<bool> g_alt_held{false};
+static std::atomic<bool> g_gui_held{false};
 static std::atomic<bool> g_modifier_tap_live{false};
 
 static bool console_byte_swallowed(uint8_t ch) {
     if(g_ctrl_held.load() && ch == '\r') return true;
+    // Alt/GUI+V:tty 可能只翻译出裸 'v',真正的事件由 console_modifier_thread 补发
+    if((g_alt_held.load() || g_gui_held.load()) && (ch == 'v' || ch == 'V')) return true;
     if(!g_modifier_tap_live.load() || !g_shift_held.load()) return false;
     if(ch == ' ') return true;
     return g_ctrl_held.load() && (ch == 0x06 || ch == 0x1A || ch == 0x1F);
@@ -140,6 +146,7 @@ static int letter_of(int code) {
 }
 
 static int map_key(int code, const InputState &st) {
+    if((st.alt || st.gui) && code == KEY_V) return APP_KEY_WIN_V;
     if(st.ctrl) {
         if(code == KEY_SPACE) return APP_KEY_IME_TOGGLE;
         if(code == KEY_ENTER) return APP_KEY_CTRL_ENTER;
@@ -292,6 +299,9 @@ static void console_input_thread() {
             seq.push_back((char)next);
             if((next >= 'A' && next <= 'Z') || next == '~') break;
         }
+        // Alt+V 在 tty 里是 ESC 'v';修饰键线程已经补发 KEY_WIN_V,这里别再当成裸 Esc。
+        if(seq.size() == 1 && seq[0] == 'v' && (g_alt_held.load() || g_gui_held.load()))
+            continue;
         int key = parse_csi_key(seq);
         dispatch_key(key ? key : 27);
     }
@@ -358,6 +368,7 @@ static void input_thread(std::string device) {
             continue;
         }
         if(ev.code == KEY_LEFTMETA || ev.code == KEY_RIGHTMETA) {
+            st.gui = down;
             handle_tap_modifier(st.gui_tap, ev.code, down);
             if(down) {
                 if(st.ctrl_tap.code) st.ctrl_tap.used = true;
@@ -375,6 +386,9 @@ static void input_thread(std::string device) {
             app_ui_request_quit();
             continue;
         }
+        // Alt/GUI+V 按住不放时内核会持续发 value==2 的重复事件;那会让刚弹出来的
+        // 剪贴板菜单被反复开/关。这里只放行第一次按下。
+        if(ev.value == 2 && (st.alt || st.gui) && ev.code == KEY_V) continue;
         int key = map_key(ev.code, st);
         dispatch_key(key);
     }
@@ -456,6 +470,7 @@ static void console_modifier_thread(std::string device) {
             } else {
                 handle_tap_modifier(alt_tap, ev.code, false);
             }
+            g_alt_held = down;
             continue;
         }
         if(ev.code == KEY_LEFTMETA || ev.code == KEY_RIGHTMETA) {
@@ -465,6 +480,7 @@ static void console_modifier_thread(std::string device) {
             } else {
                 handle_tap_modifier(gui_tap, ev.code, false);
             }
+            g_gui_held = down;
             continue;
         }
         if(!down) continue;
@@ -473,6 +489,12 @@ static void console_modifier_thread(std::string device) {
         if(alt_tap.code) alt_tap.used = true;
         if(gui_tap.code) gui_tap.used = true;
         if(g_ctrl_held.load() && g_shift_held.load()) combo_used = true;
+        // Alt/GUI+V 打开剪贴板历史。只认按下的那一次(ev.value==1),按住不放的重复
+        // 事件(value==2)会把刚弹出的菜单立刻再关掉。
+        if(ev.value == 1 && ev.code == KEY_V && (g_alt_held.load() || g_gui_held.load())) {
+            dispatch_key(APP_KEY_WIN_V);
+            continue;
+        }
         if(g_ctrl_held && g_shift_held) {
             if(ev.code == KEY_F) dispatch_key(APP_KEY_TRAD_TOGGLE);
             else if(ev.code == KEY_Z) dispatch_key(APP_KEY_REDO);

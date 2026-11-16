@@ -22,6 +22,7 @@
 #include "linux_ime.h"
 #include "safe_file.h"
 #include "settings.h"
+#include "text_utils.h"
 #include "wifi_manager.h"
 
 #include <algorithm>
@@ -2998,6 +2999,17 @@ void insert_utf8(const std::string &text) {
     lv_textarea_add_text(g_ta, text.c_str());
     md_refresh();
     update_ime_bar();
+}
+
+// 剪贴板历史粘贴:单行输入框先把多行压平,其它情况原样插入。
+bool paste_text(const std::string &text) {
+    if(!g_ta || text.empty()) return false;
+    std::string t = lv_textarea_get_one_line(g_ta) ? flatten_single_line(text) : text;
+    if(t.empty()) return false;
+    lv_textarea_add_text(g_ta, t.c_str());
+    md_refresh();
+    update_ime_bar();
+    return true;
 }
 
 void leave() {

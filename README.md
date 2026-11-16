@@ -12,6 +12,9 @@ Implemented target changes:
 - Markdown themes are configurable: dark is default, light is available.
 - Font size is user-adjustable rather than fixed bitmap slots.
 - Journal save location is configurable.
+- Clipboard history (20 entries, 64 KB each) with an `Alt+V` overlay; `w` in that menu
+  serves a browser UI over HTTP for viewing/editing entries.
+- Left-Win tap in the editor opens a shortcut menu mirroring the keyboard shortcuts.
 - Static ARM build target is provided.
 
 Build for the target:

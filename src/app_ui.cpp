@@ -1,6 +1,8 @@
 #include "app_ui.h"
 
 #include "backlight.h"
+#include "clip_history.h"
+#include "clip_web.h"
 #include "file_manager_server.h"
 #include "flomo_screen.h"
 #include "font_manager.h"
@@ -244,6 +246,15 @@ static std::string g_file_edit_path;
 static std::string g_prompt;
 static int g_quick_slot = -1;
 static std::string g_clipboard;
+static bool g_clipboard_linewise = false;
+
+// 所有「复制」统一走这里:更新当前剪贴板,同时记账到剪贴板历史。
+// record=false 用于从历史里选一条粘贴(那次不算新的复制,不重排历史)。
+static void clipboard_set(const std::string &text, bool linewise = false, bool record = true) {
+    g_clipboard = text;
+    g_clipboard_linewise = linewise;
+    if(record) cliphist_record(text, linewise);
+}
 static std::vector<std::string> g_undo_stack;
 static std::vector<std::string> g_redo_stack;
 static std::string g_recovery_meta;
@@ -4680,8 +4691,8 @@ static void render_help() {
     static const char *help[] = {
         "主界面: p提示写作 f自由写作 v查看 w同步WebDAV t写作计划 o大纲 s设置 Ctrl+Q退出",
         "通用: hjkl/方向键移动 Enter确认 Esc/q返回 Ctrl+I灵感",
-        "编辑: Ctrl+S保存 Ctrl+Q退出 Ctrl+A全选 Ctrl+C复制 Ctrl+X剪切 Ctrl+V粘贴",
-        "编辑: Ctrl+Z撤销 Ctrl+R重做 Ctrl+Y历史 Ctrl+/查找替换 Ctrl+?帮助",
+        "编辑: Ctrl+S保存 Ctrl+Q退出 Ctrl+A全选 Ctrl+C复制 Ctrl+X剪切 Ctrl+V粘贴 Alt+V历史",
+        "编辑: Ctrl+Z撤销 Ctrl+R重做 Ctrl+Y历史 Ctrl+/查找替换 Ctrl+?帮助 单按左Win快捷菜单",
         "查找: Enter下一处 Ctrl+Enter上一处 Tab切查找/替换 Ctrl+R替换 Ctrl+A全部替换 Esc关闭",
         "编辑: Ctrl+P生成提示(仅日记模式) Ctrl+O润色(有选区只润色选区) Ctrl+F发送Flomo",
         "润色: Shift+方向键/Ctrl+A选文本 Enter应用 R改指令重润色 Esc取消",
@@ -7049,7 +7060,7 @@ static void handle_inspiration(int key) {
         return;
     }
     if((key == 'c' || key == 'C') && idx >= 0) {
-        g_clipboard = g_inspiration_data["items"][idx]["content"].asString();
+        clipboard_set(g_inspiration_data["items"][idx]["content"].asString());
         set_status("已复制到内部剪贴板");
         return;
     }
@@ -9230,19 +9241,19 @@ static void handle_editor_keys(int key) {
     if(key == 0x03 && g_editor) {
         if(g_ed_sel_anchor >= 0) {
             std::string sel = editor_selected_text();
-            if(!sel.empty()) { g_clipboard = sel; set_status("已复制选中文本"); return; }
+            if(!sel.empty()) { clipboard_set(sel); set_status("已复制选中文本"); return; }
         }
-        g_clipboard = lv_textarea_get_text(g_editor);
+        clipboard_set(lv_textarea_get_text(g_editor));
         set_status("已复制全部文本");
         return;
     }
     if(key == 0x18 && g_editor) {
         if(g_ed_sel_anchor >= 0) {
             std::string sel = editor_selected_text();
-            if(!sel.empty()) { g_clipboard = sel; editor_delete_selection(); set_status("已剪切选中文本"); return; }
+            if(!sel.empty()) { clipboard_set(sel); editor_delete_selection(); set_status("已剪切选中文本"); return; }
         }
         editor_record_undo();
-        g_clipboard = lv_textarea_get_text(g_editor);
+        clipboard_set(lv_textarea_get_text(g_editor));
         lv_textarea_set_text(g_editor, "");
         return;
     }
@@ -9307,11 +9318,570 @@ static void handle_editor_keys(int key) {
     update_ime_bar();
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// 浮层菜单:剪贴板历史 / 编辑器快捷菜单
+//
+// 原项目是 u8g2 整帧缓冲,打开菜单时先复制一帧当底板,以后每次重绘都还原底板
+// 再画面板。这里是 LVGL 的保留模式:直接在 g_root 上盖一层全屏半透明容器,
+// 底层控件一个都不碰 —— 关掉时删掉这一层就回到原样。菜单开着期间 app_ui_tick
+// 会跳过 flomo/terminal 的 tick,否则它们重建 root 时会把浮层一起抹掉。
+// ─────────────────────────────────────────────────────────────────────────
+
+static void overlay_drop(lv_obj_t *&layer) {
+    if(layer) {
+        lv_obj_delete(layer);
+        layer = nullptr;
+    }
+}
+
+static lv_obj_t *overlay_layer_begin() {
+    lv_obj_t *layer = lv_obj_create(g_root);
+    lv_obj_remove_style_all(layer);
+    lv_obj_set_pos(layer, 0, 0);
+    lv_obj_set_size(layer, screen_w(), screen_h());
+    lv_obj_set_style_bg_color(layer, g_theme.bg, 0);
+    lv_obj_set_style_bg_opa(layer, LV_OPA_70, 0);
+    lv_obj_set_style_text_color(layer, g_theme.fg, 0);
+    if(g_ui_font) lv_obj_set_style_text_font(layer, g_ui_font, 0);
+    lv_obj_remove_flag(layer, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_move_foreground(layer);
+    return layer;
+}
+
+// 面板里的一行文字。sel 时反白(文字用底色),muted 时压暗。
+static void menu_text(lv_obj_t *parent, const std::string &text, int x, int y, int w, int h,
+                      bool sel = false, bool muted = false) {
+    lv_obj_t *lbl = label_raw(parent, text, x, y, w, h);
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
+    if(sel) lv_obj_set_style_text_color(lbl, g_theme.bg, 0);
+    else if(muted) lv_obj_set_style_text_color(lbl, g_theme.muted, 0);
+}
+
+static void menu_highlight(lv_obj_t *panel, int x, int y, int w, int h) {
+    lv_obj_t *hl = lv_obj_create(panel);
+    lv_obj_remove_style_all(hl);
+    lv_obj_set_pos(hl, x, y);
+    lv_obj_set_size(hl, w, h);
+    lv_obj_set_style_bg_color(hl, g_theme.fg, 0);
+    lv_obj_set_style_bg_opa(hl, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(hl, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(hl, LV_OBJ_FLAG_CLICKABLE);
+}
+
+static lv_obj_t *menu_panel(lv_obj_t *layer, int w, int h) {
+    lv_obj_t *panel = box_raw(layer, (screen_w() - w) / 2, (screen_h() - h) / 2, w, h);
+    lv_obj_set_style_bg_color(panel, g_theme.bg, 0);
+    lv_obj_set_style_border_width(panel, 2, 0);
+    lv_obj_set_style_pad_all(panel, 0, 0);
+    return panel;
+}
+
+// 首行预览(最多 max_bytes 字节,不劈开 UTF-8 字符)。截断时补省略号。
+static std::string clip_preview(int idx, size_t max_bytes) {
+    const char *p = cliphist_text(idx);
+    if(!p) return "（空）";
+    const uint32_t len = cliphist_len(idx);
+    std::string out;
+    uint32_t k = 0;
+    bool cut = false;
+    while(k < len) {
+        unsigned char c = (unsigned char)p[k];
+        if(c == '\n' || c == '\r') {
+            cut = k + 1 < len;
+            break;
+        }
+        size_t step = 1;
+        if((c & 0xE0) == 0xC0) step = 2;
+        else if((c & 0xF0) == 0xE0) step = 3;
+        else if((c & 0xF8) == 0xF0) step = 4;
+        if(k + step > len) break;
+        if(out.size() + step > max_bytes) {
+            cut = true;
+            break;
+        }
+        if(c < 0x20) out += ' ';
+        else out.append(p + k, step);
+        k += (uint32_t)step;
+    }
+    if(out.empty()) return "（空）";
+    if(cut) out += " …";
+    return out;
+}
+
+struct ClipMenuState {
+    bool active = false;
+    bool web = false;
+    int sel = 0;
+    int scroll = 0;
+    uint32_t last_delete_ms = 0;
+    bool wifi_owned = false;
+    std::string web_url;
+    std::string web_msg;
+    lv_obj_t *layer = nullptr;
+};
+static ClipMenuState g_clip_menu;
+
+// 停 HTTP 服务,并只在「WiFi 是本菜单连的」时断开,别踢掉用户原来的连接。
+static void clip_web_stop_resources() {
+    if(clip_web_active()) clip_web_stop();
+    if(g_clip_menu.wifi_owned) {
+        std::string msg;
+        g_wifi.disconnect(msg);
+        g_clip_menu.wifi_owned = false;
+    }
+    g_clip_menu.web = false;
+    g_clip_menu.web_url.clear();
+    g_clip_menu.web_msg.clear();
+}
+
+static void draw_clip_web_panel(lv_obj_t *layer) {
+    const int lh = ui_line_h();
+    const int row_h = lh + ui_px(6);
+    const int pad = ui_px(12);
+    const int margin = ui_px(24);
+    int panel_w = screen_w() - margin * 2;
+    if(panel_w > ui_px(620)) panel_w = ui_px(620);
+    const int panel_h = pad * 2 + row_h * 5;
+    lv_obj_t *panel = menu_panel(layer, panel_w, panel_h);
+    const int inner_x = pad;
+    const int inner_w = panel_w - pad * 2;
+
+    WifiStatus st = g_wifi.status();
+    menu_text(panel, "网络剪贴板", inner_x, pad, inner_w, row_h);
+    menu_text(panel, "WiFi: " + (st.ssid.empty() ? std::string("（未连接）") : st.ssid),
+              inner_x, pad + row_h, inner_w, row_h);
+    if(!g_clip_menu.web_url.empty())
+        menu_text(panel, "地址: " + g_clip_menu.web_url, inner_x, pad + row_h * 2, inner_w, row_h);
+    else
+        menu_text(panel, "状态: " + (g_clip_menu.web_msg.empty() ? std::string("准备中…") : g_clip_menu.web_msg),
+                  inner_x, pad + row_h * 2, inner_w, row_h);
+    menu_text(panel, "历史: " + std::to_string(cliphist_count()) + "/" +
+                        std::to_string(CLIPHIST_MAX_ENTRIES) + " 条（最新在前）",
+              inner_x, pad + row_h * 3, inner_w, row_h);
+    menu_text(panel, "电脑浏览器打开后可查看/编辑  Esc 返回列表", inner_x, pad + row_h * 4,
+              inner_w, row_h, false, true);
+}
+
+static void draw_clip_menu() {
+    overlay_drop(g_clip_menu.layer);
+    g_clip_menu.layer = overlay_layer_begin();
+    lv_obj_t *layer = g_clip_menu.layer;
+    if(g_clip_menu.web) {
+        draw_clip_web_panel(layer);
+        return;
+    }
+
+    const int count = cliphist_count();
+    const int lh = ui_line_h();
+    const int row_h = lh + ui_px(6);
+    const int pad = ui_px(10);
+    const int margin = ui_px(24);
+    int panel_w = screen_w() - margin * 2;
+    if(panel_w > ui_px(720)) panel_w = ui_px(720);
+    const int max_h = screen_h() - margin * 2;
+    int visible = (max_h - pad * 2 - row_h * 2) / row_h;
+    if(visible > CLIPHIST_MAX_ENTRIES) visible = CLIPHIST_MAX_ENTRIES;
+    if(visible < 1) visible = 1;
+    const int panel_h = pad * 2 + row_h * 2 + visible * row_h;
+
+    if(g_clip_menu.sel >= count) g_clip_menu.sel = count - 1;
+    if(g_clip_menu.sel < 0) g_clip_menu.sel = 0;
+    const int max_scroll = count > visible ? count - visible : 0;
+    if(g_clip_menu.scroll > max_scroll) g_clip_menu.scroll = max_scroll;
+    if(g_clip_menu.scroll < 0) g_clip_menu.scroll = 0;
+    if(g_clip_menu.sel < g_clip_menu.scroll) g_clip_menu.scroll = g_clip_menu.sel;
+    if(g_clip_menu.sel >= g_clip_menu.scroll + visible)
+        g_clip_menu.scroll = g_clip_menu.sel - visible + 1;
+
+    lv_obj_t *panel = menu_panel(layer, panel_w, panel_h);
+    const int inner_x = pad;
+    const int inner_w = panel_w - pad * 2;
+
+    menu_text(panel, "剪贴板历史  " + std::to_string(count) + "/" + std::to_string(CLIPHIST_MAX_ENTRIES),
+              inner_x, pad, inner_w, row_h);
+
+    const int list_y = pad + row_h;
+    if(count == 0) {
+        menu_text(panel, "（暂无剪贴板历史）", inner_x, list_y + (visible / 2) * row_h,
+                  inner_w, row_h, false, true);
+    } else {
+        for(int i = 0; i < visible; ++i) {
+            const int idx = g_clip_menu.scroll + i;
+            if(idx >= count) break;
+            const int top = list_y + i * row_h;
+            const bool sel = idx == g_clip_menu.sel;
+            if(sel) menu_highlight(panel, ui_px(4), top, panel_w - ui_px(8), row_h);
+            menu_text(panel, clip_preview(idx, 160), inner_x, top, inner_w, row_h, sel);
+        }
+    }
+
+    menu_text(panel, "↑↓ 选择  Enter 粘贴  d 删除  w 网络  Esc 关闭",
+              inner_x, panel_h - pad - row_h, inner_w, row_h, false, true);
+}
+
+static void clip_menu_close() {
+    if(!g_clip_menu.active) return;
+    clip_web_stop_resources();
+    g_clip_menu.active = false;
+    overlay_drop(g_clip_menu.layer);
+    // 打开时取消了输入法的组字,候选条可能还停在旧位置;让底层界面再刷一次状态。
+    if(g_screen == Screen::Editor && g_editor) update_ime_bar();
+}
+
+static void clip_enter_web() {
+    g_clip_menu.web = true;
+    g_clip_menu.web_url.clear();
+    g_clip_menu.web_msg = "正在连接 WiFi...";
+    draw_clip_menu();
+
+    WifiStatus st = g_wifi.status();
+    if(!st.connected) {
+        std::vector<WifiSavedNetwork> saved = g_wifi.list_networks();
+        if(saved.empty()) {
+            g_clip_menu.web_msg = "没有已保存的 WiFi,请先在设置里连接";
+            draw_clip_menu();
+            return;
+        }
+        std::string msg;
+        if(!g_wifi.select_network(saved.front().id, msg)) {
+            g_clip_menu.web_msg = msg.empty() ? "WiFi 连接失败" : ("连接失败: " + msg);
+            draw_clip_menu();
+            return;
+        }
+        g_clip_menu.wifi_owned = true;
+        for(int i = 0; i < 20; ++i) {
+            st = g_wifi.status();
+            if(st.connected) break;
+            usleep(150000);
+        }
+    }
+    if(!st.connected || st.ip.empty()) {
+        if(g_clip_menu.wifi_owned) {
+            std::string msg;
+            g_wifi.disconnect(msg);
+            g_clip_menu.wifi_owned = false;
+        }
+        g_clip_menu.web_msg = "获取 IP 失败";
+        draw_clip_menu();
+        return;
+    }
+    if(!clip_web_start(80)) {
+        if(g_clip_menu.wifi_owned) {
+            std::string msg;
+            g_wifi.disconnect(msg);
+            g_clip_menu.wifi_owned = false;
+        }
+        g_clip_menu.web_msg = "服务启动失败(端口被占用?)";
+        draw_clip_menu();
+        return;
+    }
+    g_clip_menu.web_url = "http://" + st.ip + "/";
+    g_clip_menu.web_msg.clear();
+    draw_clip_menu();
+}
+
+static void clip_menu_open() {
+    if(g_clip_menu.active) return;
+    g_linux_ime.cancel_composition();  // 只丢未上屏的拼音,不动输入法开关
+    g_clip_menu.active = true;
+    g_clip_menu.web = false;
+    g_clip_menu.sel = 0;
+    g_clip_menu.scroll = 0;
+    g_clip_menu.last_delete_ms = 0;
+    g_clip_menu.wifi_owned = false;
+    g_clip_menu.web_url.clear();
+    g_clip_menu.web_msg.clear();
+    g_clip_menu.layer = nullptr;
+    draw_clip_menu();
+}
+
+// 把一条历史粘贴进当前输入目标。单行输入框先把多行压平。
+static void clip_paste_active(const std::string &text) {
+    if(text.empty()) return;
+    if(g_screen == Screen::Flomo) { flomo::paste_text(text); return; }
+    if(g_screen == Screen::Terminal) { terminal::insert_utf8(text); return; }
+    lv_obj_t *ta = active_textarea();
+    if(!ta) return;
+    std::string t = lv_textarea_get_one_line(ta) ? flatten_single_line(text) : text;
+    if(t.empty()) return;
+    if(ta == g_editor) {
+        if(g_ed_sel_anchor >= 0) editor_delete_selection();
+        else editor_record_undo();
+    }
+    lv_textarea_add_text(ta, t.c_str());
+    // 编辑器有自己的叠加层/竖排视图,插入后要按 handle_editor 的收尾流程重排一次。
+    if(ta == g_editor) {
+        if(g_vt_view) editor_vt_refresh();
+        else if(g_md_view) editor_md_refresh();
+        else { editor_sel_sync_label(); editor_follow_cursor(); }
+        if(g_linux_ime.composing()) update_ime_bar();
+    }
+}
+
+static void clip_menu_handle(int key) {
+    if(!g_clip_menu.active) return;
+
+    // 网络模式:HTTP 线程可能正在增删条目,这里不读历史。Esc 停服回列表,
+    // Win+V 关掉整个菜单;其余键吞掉。
+    if(g_clip_menu.web) {
+        if(key == 27) {
+            clip_web_stop_resources();
+            const int count = cliphist_count();
+            if(g_clip_menu.sel >= count) g_clip_menu.sel = count - 1;
+            if(g_clip_menu.sel < 0) g_clip_menu.sel = 0;
+            draw_clip_menu();
+        } else if(key == KEY_WIN_V) {
+            clip_menu_close();
+        }
+        return;
+    }
+
+    int count = cliphist_count();
+    if(g_clip_menu.sel >= count) g_clip_menu.sel = count - 1;
+    if(g_clip_menu.sel < 0) g_clip_menu.sel = 0;
+
+    if(key == 'w' || key == 'W') { clip_enter_web(); return; }
+    if(key == KEY_UP || key == 'k') {
+        if(g_clip_menu.sel > 0) --g_clip_menu.sel;
+        draw_clip_menu();
+        return;
+    }
+    if(key == KEY_DOWN || key == 'j') {
+        if(g_clip_menu.sel + 1 < count) ++g_clip_menu.sel;
+        draw_clip_menu();
+        return;
+    }
+    if(key == KEY_WIN_V || key == 27) { clip_menu_close(); return; }
+    if(key == 'd' || key == 'D') {
+        // 300ms 去抖:按住 d 的自动重复不该把历史一口气清空。
+        const uint32_t now = lv_tick_get();
+        if(count > 0 && (g_clip_menu.last_delete_ms == 0 || now - g_clip_menu.last_delete_ms >= 300)) {
+            g_clip_menu.last_delete_ms = now;
+            cliphist_remove(g_clip_menu.sel);
+            count = cliphist_count();
+            if(g_clip_menu.sel >= count) g_clip_menu.sel = count - 1;
+            if(g_clip_menu.sel < 0) g_clip_menu.sel = 0;
+        }
+        draw_clip_menu();
+        return;
+    }
+    if(key == '\n' || key == '\r') {
+        if(count == 0) return;
+        std::string text(cliphist_text(g_clip_menu.sel), cliphist_len(g_clip_menu.sel));
+        const bool linewise = cliphist_linewise(g_clip_menu.sel);
+        // 用历史条目不算一次新的复制:只更新当前剪贴板,不重排历史。
+        clipboard_set(text, linewise, false);
+        clip_menu_close();
+        clip_paste_active(text);
+        return;
+    }
+    // 其余按键吞掉,避免菜单开着时触发底层界面的快捷键。
+}
+
+// ── 编辑器快捷菜单(单按左 Win 弹出) ────────────────────────────────────
+
+enum class ShortcutAction {
+    None = 0,
+    Save,
+    Clipboard,
+    Inspiration,
+    Flomo,
+    Search,
+    History,
+    Prompt,
+    Polish,
+    FileManager,
+    Help,
+    Exit,
+};
+
+struct ShortcutItem {
+    ShortcutAction action;
+    const char *label;
+    const char *shortcut;
+};
+
+static ShortcutItem g_sc_items[12];
+static int g_sc_count = 0;
+static int g_sc_sel = 0;
+static bool g_sc_active = false;
+static lv_obj_t *g_sc_layer = nullptr;
+
+static bool editor_has_selection() {
+    if(!g_editor || g_ed_sel_anchor < 0) return false;
+    return !editor_selected_text().empty();
+}
+
+static bool editor_is_empty() {
+    if(!g_editor) return true;
+    const char *t = lv_textarea_get_text(g_editor);
+    return !t || !*t;
+}
+
+// 单按 Win 时是否允许弹快捷菜单。模态框/后台生成期间不弹;字母选字键设为 lwin
+// 且候选正可用时,这一下轻点归输入法。
+static bool shortcut_menu_allowed() {
+    if(g_editor_exit_asking) return false;
+    if(g_search_panel || g_polish_panel || g_file_panel_state.active) return false;
+    if(g_settings.letterSelKey() == "lwin" && g_linux_ime.active() &&
+       g_linux_ime.letter_sel_tap_available())
+        return false;
+    return true;
+}
+
+static void sc_add(ShortcutAction action, const char *label, const char *shortcut) {
+    if(g_sc_count >= (int)(sizeof(g_sc_items) / sizeof(g_sc_items[0]))) return;
+    g_sc_items[g_sc_count].action = action;
+    g_sc_items[g_sc_count].label = label;
+    g_sc_items[g_sc_count].shortcut = shortcut;
+    ++g_sc_count;
+}
+
+static void sc_build() {
+    g_sc_count = 0;
+    sc_add(ShortcutAction::Save, "保存", "Ctrl+S");
+    sc_add(ShortcutAction::Clipboard, "剪贴板", "Alt+V");
+    sc_add(ShortcutAction::Inspiration, "灵感", "Ctrl+I");
+    sc_add(ShortcutAction::Flomo, "发送到 Flomo", "Ctrl+F");
+    sc_add(ShortcutAction::Search, "查找/替换", "Ctrl+/");
+    // 快捷编辑/文件编辑里 Ctrl+Y 有自己的含义,版本历史只在日记会话里列。
+    if(g_settings.version_history() && g_quick_slot < 0 && g_file_edit_path.empty())
+        sc_add(ShortcutAction::History, "版本历史", "Ctrl+Y");
+    if(g_settings.app_mode() == "journal")
+        sc_add(ShortcutAction::Prompt, "AI 提示词", "Ctrl+P");
+    if(editor_has_selection()) sc_add(ShortcutAction::Polish, "AI 润色(选区)", "Ctrl+O");
+    else if(!editor_is_empty()) sc_add(ShortcutAction::Polish, "AI 润色", "Ctrl+O");
+    if(!g_file_edit_path.empty()) sc_add(ShortcutAction::FileManager, "文件管理器", "Ctrl+E");
+    sc_add(ShortcutAction::Help, "帮助", "Ctrl+?");
+    sc_add(ShortcutAction::Exit, "退出", "Ctrl+Q");
+}
+
+static int menu_text_width(const std::string &s) {
+    const lv_font_t *f = g_ui_font ? g_ui_font : LV_FONT_DEFAULT;
+    return (int)lv_text_get_width(s.c_str(), (uint32_t)s.size(), f, 0);
+}
+
+static void draw_shortcut_menu() {
+    overlay_drop(g_sc_layer);
+    g_sc_layer = overlay_layer_begin();
+    lv_obj_t *layer = g_sc_layer;
+    if(g_sc_count <= 0) return;
+
+    const int lh = ui_line_h();
+    const int row_h = lh + ui_px(4);
+    const int pad = ui_px(10);
+    const int margin = ui_px(24);
+    int panel_w = screen_w() - margin * 2;
+    if(panel_w > ui_px(640)) panel_w = ui_px(640);
+    int panel_h = pad * 2 + row_h * (g_sc_count + 2);
+    const int max_h = screen_h() - margin * 2;
+    if(panel_h > max_h) panel_h = max_h;
+
+    if(g_sc_sel < 0) g_sc_sel = 0;
+    if(g_sc_sel >= g_sc_count) g_sc_sel = g_sc_count - 1;
+
+    lv_obj_t *panel = menu_panel(layer, panel_w, panel_h);
+    const int inner_x = pad;
+    const int inner_w = panel_w - pad * 2;
+
+    int sc_w = 0;
+    for(int i = 0; i < g_sc_count; ++i) {
+        const int w = menu_text_width(g_sc_items[i].shortcut);
+        if(w > sc_w) sc_w = w;
+    }
+    const int label_x = inner_x + ui_px(4) + sc_w + ui_px(14);
+
+    menu_text(panel, "快捷菜单", inner_x, pad, inner_w, row_h);
+    const int list_y = pad + row_h;
+    for(int i = 0; i < g_sc_count; ++i) {
+        const int top = list_y + i * row_h;
+        if(top + row_h > panel_h - pad - row_h) break;
+        const bool sel = i == g_sc_sel;
+        if(sel) menu_highlight(panel, ui_px(4), top, panel_w - ui_px(8), row_h);
+        menu_text(panel, g_sc_items[i].shortcut, inner_x, top, sc_w + ui_px(8), row_h, sel);
+        menu_text(panel, g_sc_items[i].label, label_x, top,
+                  panel_w - label_x - pad, row_h, sel);
+    }
+    menu_text(panel, "↑↓ 选择  Enter 执行  Esc 关闭",
+              inner_x, panel_h - pad - row_h, inner_w, row_h, false, true);
+}
+
+static void shortcut_menu_close() {
+    if(!g_sc_active) return;
+    g_sc_active = false;
+    overlay_drop(g_sc_layer);
+    if(g_editor) update_ime_bar();
+}
+
+static void shortcut_menu_open() {
+    if(g_sc_active) return;
+    g_linux_ime.cancel_composition();
+    sc_build();
+    g_sc_sel = 0;
+    g_sc_active = true;
+    g_sc_layer = nullptr;
+    draw_shortcut_menu();
+}
+
+static ShortcutAction shortcut_menu_handle(int key) {
+    if(!g_sc_active) return ShortcutAction::None;
+    if(key == KEY_UP || key == 'k') {
+        if(g_sc_sel > 0) --g_sc_sel;
+        draw_shortcut_menu();
+        return ShortcutAction::None;
+    }
+    if(key == KEY_DOWN || key == 'j') {
+        if(g_sc_sel + 1 < g_sc_count) ++g_sc_sel;
+        draw_shortcut_menu();
+        return ShortcutAction::None;
+    }
+    if(key == 27 || key == 'q' || key == 'Q' || key == KEY_MOD_TAP_LGUI) {
+        shortcut_menu_close();
+        return ShortcutAction::None;
+    }
+    if(key == '\n' || key == '\r') {
+        ShortcutAction act = ShortcutAction::None;
+        if(g_sc_sel >= 0 && g_sc_sel < g_sc_count) act = g_sc_items[g_sc_sel].action;
+        shortcut_menu_close();
+        return act;
+    }
+    // 其余按键吞掉,避免菜单开着时触发底层界面的快捷键。
+    return ShortcutAction::None;
+}
+
 static void handle_key(int key) {
     // 退出确认框是模态的:吃掉所有按键。Ctrl+Q 在三种工作模式下都灵,也放在最前面,
     // 免得被下面的输入法/文件槽位快捷键抢走。
     if(g_quit_asking) { quit_confirm_key(key); return; }
+    // 浮层菜单开着时吞掉所有键。快捷菜单的选项在这里翻译成原有快捷键、再走一遍
+    // handle_key —— 比如「剪贴板」注入 KEY_WIN_V,正好命中下面的剪贴板历史分支。
+    if(g_clip_menu.active) { clip_menu_handle(key); return; }
+    if(g_sc_active) {
+        ShortcutAction act = shortcut_menu_handle(key);
+        switch(act) {
+        case ShortcutAction::Clipboard: handle_key(KEY_WIN_V); break;
+        case ShortcutAction::Save: handle_key(0x13); break;
+        case ShortcutAction::Inspiration: handle_key(KEY_CTRL_I); break;
+        case ShortcutAction::Flomo: handle_key(0x06); break;
+        case ShortcutAction::Search: handle_key(KEY_SEARCH); break;
+        case ShortcutAction::History: handle_key(0x19); break;
+        case ShortcutAction::Prompt: handle_key(0x10); break;
+        case ShortcutAction::Polish: handle_key(0x0F); break;
+        case ShortcutAction::FileManager: handle_key(0x05); break;
+        case ShortcutAction::Help: handle_key(KEY_HELP); break;
+        case ShortcutAction::Exit: handle_key(0x11); break;
+        case ShortcutAction::None: break;
+        }
+        return;
+    }
     if(key == 0x11) { quit_begin(); return; }
+    // 剪贴板历史是全局的,必须在把按键转给浮墨/终端之前拦截。
+    if(key == KEY_WIN_V) { clip_menu_open(); return; }
+    // 单按左 Win → 编辑器快捷菜单。右 Win 不认,免得设备报文误解析成修饰键单击。
+    if(key == KEY_MOD_TAP_LGUI && g_screen == Screen::Editor && shortcut_menu_allowed()) {
+        shortcut_menu_open();
+        return;
+    }
     // 浮墨屏自己处理所有键(含背光 OSD、输入法修饰键);Ctrl+Q 已在上面分流。
     // 它每帧 launder root,绝不能让 app_ui 的 OSD/退出框指针活到那一屏里。
     if(g_screen == Screen::Flomo) { flomo::handle_key(key); return; }
@@ -9438,6 +10008,9 @@ void app_ui_return_to_main() {
 }
 
 void app_ui_tick() {
+    // 浮层菜单开着时,底层界面(尤其 flomo/terminal)不能继续 tick —— 它们可能重建
+    // root,把盖在上面的菜单层一起删掉。菜单自己按按键事件重绘,不需要帧定时。
+    if(g_clip_menu.active || g_sc_active) return;
     if(g_screen == Screen::Flomo) { flomo::tick(); return; }
     if(g_screen == Screen::Terminal) { terminal::tick(); return; }
     static uint32_t next_main_status_ms = 0;

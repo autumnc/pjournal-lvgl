@@ -38,6 +38,14 @@ std::string extract_body(const std::string &content) {
     return body == std::string::npos ? content : content.substr(body + 2);
 }
 
+// 把多行文本压成一行(换行/制表符变空格),供单行输入框粘贴。
+std::string flatten_single_line(const std::string &s) {
+    std::string out = s;
+    for(char &c : out)
+        if(c == '\n' || c == '\r' || c == '\t') c = ' ';
+    return out;
+}
+
 std::string journal_prompt(const std::string &content) {
     static const std::string prefix = "提示词: ";
     if(content.compare(0, prefix.size(), prefix) != 0) return std::string();

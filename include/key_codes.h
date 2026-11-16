@@ -25,6 +25,7 @@ enum AppKey {
     KEY_HELP = 0xA3,
     KEY_REDO = 0xA4,
     KEY_IM_SWITCH = 0xA5,
+    KEY_WIN_V = 0xA6,  // Alt/GUI+V:打开剪贴板历史
     KEY_BACKLIGHT_UP = 0xA7,
     KEY_BACKLIGHT_DOWN = 0xA8,
     // 修饰键"单击"(按下后没按别的键就抬起)。输入法用它触发字母选字。

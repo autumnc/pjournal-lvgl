@@ -307,6 +307,16 @@ std::string LinuxIme::letter_sel_keys() const {
     return IME::letterSelKeys();
 }
 
+bool LinuxIme::letter_sel_tap_available() const {
+    if(use_fcitx5() || use_yong()) return false;
+    return IME::getInstance().letterSelTapAvailable();
+}
+
+void LinuxIme::cancel_composition() {
+    if(use_fcitx5() || use_yong()) return;
+    IME::getInstance().cancelComposition();
+}
+
 std::string LinuxIme::take_status_message() {
     if(use_fcitx5() || use_yong()) return std::string();
     return IME::getInstance().takeStatusMessage();
