@@ -168,7 +168,13 @@ struct ParseCtx {
     const char *p;
     size_t len;
     size_t pos;
+    int depth = 0;
 };
+
+// 嵌套深度的硬上限。parseArray/parseObject 是递归下降,没有上限时一个
+// "[[[[[..."/"{{{{{"(来自被截断的网络响应或损坏的文件)会一层一层压栈,
+// 8MB 输入就足以把栈爆掉、直接 SIGSEGV。真实数据远达不到这个深度。
+static constexpr int kMaxParseDepth = 200;
 
 static void skipWS(ParseCtx &c) {
     while (c.pos < c.len) {
@@ -293,8 +299,16 @@ static JsonValue parseValue(ParseCtx &c) {
     if (c.pos >= c.len) return JsonValue(nullptr);
     char ch = c.p[c.pos];
     if (ch == '"') return JsonValue(parseString(c));
-    if (ch == '{') return parseObject(c);
-    if (ch == '[') return parseArray(c);
+    if (ch == '{' || ch == '[') {
+        if (c.depth >= kMaxParseDepth) {  // 超深:放弃整份输入,别继续压栈
+            c.pos = c.len;
+            return JsonValue(nullptr);
+        }
+        c.depth++;
+        JsonValue v = (ch == '{') ? parseObject(c) : parseArray(c);
+        c.depth--;
+        return v;
+    }
     if (ch == 't' && peek(c, "true"))  { c.pos += 4; return JsonValue(true); }
     if (ch == 'f' && peek(c, "false")) { c.pos += 5; return JsonValue(false); }
     if (ch == 'n' && peek(c, "null"))  { c.pos += 4; return JsonValue(nullptr); }

@@ -71,22 +71,13 @@ int cliphist_count() {
     return (int)g_entries.size();
 }
 
-const char *cliphist_text(int i) {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if(i < 0 || i >= (int)g_entries.size()) return nullptr;
-    return g_entries[(size_t)i].data.c_str();
-}
-
-uint32_t cliphist_len(int i) {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if(i < 0 || i >= (int)g_entries.size()) return 0;
-    return (uint32_t)g_entries[(size_t)i].data.size();
-}
-
-bool cliphist_linewise(int i) {
+bool cliphist_get(int i, std::string &data, bool *linewise) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if(i < 0 || i >= (int)g_entries.size()) return false;
-    return g_entries[(size_t)i].linewise;
+    const ClipEntry &e = g_entries[(size_t)i];
+    data = e.data;
+    if(linewise) *linewise = e.linewise;
+    return true;
 }
 
 bool cliphist_add_raw(const char *data, size_t len, bool linewise) {

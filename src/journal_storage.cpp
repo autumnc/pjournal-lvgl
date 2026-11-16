@@ -108,6 +108,8 @@ static bool save_history(const std::string &base, const std::string &filename, c
 }
 
 bool JournalStorage::begin() {
+    // 目录可能在外部被增删/改名,旧的全文结果不能继续信任
+    m_contentRevision.fetch_add(1, std::memory_order_relaxed);
     ensure_dir();
     return true;
 }
@@ -130,7 +132,10 @@ bool JournalStorage::save_entry(const std::string &text, std::string *filename_o
     strftime(ts, sizeof(ts), "%Y-%m-%d_%H%M%S", &local);
     std::string name = std::string(ts) + ".txt";
     bool ok = safe_write_file(base_path() + "/" + name, text);
-    if(ok && filename_out) *filename_out = name;
+    if(ok) {
+        m_contentRevision.fetch_add(1, std::memory_order_relaxed);
+        if(filename_out) *filename_out = name;
+    }
     return ok;
 }
 
@@ -143,7 +148,9 @@ bool JournalStorage::save_entry_raw(const std::string &filename, const std::stri
         std::string old = read_whole_file(path);
         if(old != content) save_history(base_path(), filename, old);
     }
-    return safe_write_file(path, content);
+    bool ok = safe_write_file(path, content);
+    if(ok) m_contentRevision.fetch_add(1, std::memory_order_relaxed);
+    return ok;
 }
 
 std::vector<JournalEntry> JournalStorage::list_entries() {
@@ -194,10 +201,59 @@ std::string JournalStorage::read_entry(const std::string &filename) {
     return read_whole_file(base_path() + "/" + filename);
 }
 
+static bool ascii_contains_len(const char *hay, size_t len, const std::string &needle_lower) {
+    const size_t n = needle_lower.size();
+    if(n == 0) return true;
+    if(len < n) return false;
+    for(size_t i = 0; i + n <= len; ++i) {
+        size_t j = 0;
+        while(j < n) {
+            char c = hay[i + j];
+            if(c >= 'A' && c <= 'Z') c = (char)(c + ('a' - 'A'));
+            if(c != needle_lower[j]) break;
+            ++j;
+        }
+        if(j == n) return true;
+    }
+    return false;
+}
+
+bool JournalStorage::search_entry_content(const std::string &filename, const std::string &needle_lower) {
+    if(needle_lower.empty()) return false;
+    if(!safe_name(filename) || !journal_ext(filename)) return false;
+    std::lock_guard<std::recursive_mutex> lock(g_journal_mutex);
+
+    const size_t n = needle_lower.size();
+    size_t cap = 4096;
+    if(n + 1 > cap) cap = n + 1;  // 极长查询也要保证一次能匹配
+    std::vector<char> buf(cap);
+    bool found = false;
+    FILE *f = fopen((base_path() + "/" + filename).c_str(), "rb");
+    if(f) {
+        const size_t keep = n > 1 ? n - 1 : 0;
+        size_t carry = 0;
+        while(true) {
+            size_t want = cap - carry;
+            size_t got = fread(buf.data() + carry, 1, want, f);
+            size_t len = carry + got;
+            if(ascii_contains_len(buf.data(), len, needle_lower)) { found = true; break; }
+            if(got < want) break;  // EOF 或短读
+            // 保留末尾 n-1 字节,避免匹配被块边界切断
+            size_t c = keep < len ? keep : len;
+            if(c) memmove(buf.data(), buf.data() + len - c, c);
+            carry = c;
+        }
+        fclose(f);
+    }
+    return found;
+}
+
 bool JournalStorage::delete_entry(const std::string &filename) {
     if(!safe_name(filename) || !journal_ext(filename)) return false;
     std::lock_guard<std::recursive_mutex> lock(g_journal_mutex);
-    return remove((base_path() + "/" + filename).c_str()) == 0;
+    bool ok = remove((base_path() + "/" + filename).c_str()) == 0;
+    if(ok) m_contentRevision.fetch_add(1, std::memory_order_relaxed);
+    return ok;
 }
 
 JournalStats JournalStorage::stats() {

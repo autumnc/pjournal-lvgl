@@ -28,6 +28,8 @@ enum AppKey {
     KEY_WIN_V = 0xA6,  // Alt/GUI+V:打开剪贴板历史
     KEY_BACKLIGHT_UP = 0xA7,
     KEY_BACKLIGHT_DOWN = 0xA8,
+    KEY_CTRL_J = 0xA9,  // Ctrl+J:AI 聊天新建会话
+    KEY_CTRL_H = 0xAA,  // Ctrl+H:显示/隐藏 AI 会话列表
     // 修饰键"单击"(按下后没按别的键就抬起)。输入法用它触发字母选字。
     KEY_MOD_TAP_LCTRL = 0xB0,
     KEY_MOD_TAP_LGUI = 0xB1,

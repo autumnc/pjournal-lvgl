@@ -12,6 +12,7 @@
 #include "term_theme.h"
 #include "term_vt.h"
 #include "text_utils.h"
+#include "clip_history.h"
 
 #include <clocale>
 #include <cstdlib>
@@ -81,6 +82,21 @@ static int test_journal_storage() {
         if(e.preview != std::string(80, 'a')) return fail("long entry preview mismatch");
     }
     if(!checked) return fail("long entry missing from list");
+
+    // 全文搜索:ASCII 大小写不敏感,中文按字节匹配,匹配可跨 4KB 读块边界
+    uint32_t rev0 = g_journal.content_revision();
+    if(!g_journal.save_entry_raw("search.txt", "Alpha 中文Beta", false)) return fail("save search entry failed");
+    if(!g_journal.search_entry_content("search.txt", "alpha")) return fail("search lowercase miss");
+    if(!g_journal.search_entry_content("search.txt", "中文beta")) return fail("search utf8 miss");
+    if(g_journal.search_entry_content("search.txt", "gamma")) return fail("search false positive");
+    std::string straddle(4094, 'x');
+    straddle += "Needle";
+    if(!g_journal.save_entry_raw("straddle.txt", straddle, false)) return fail("save straddle entry failed");
+    if(!g_journal.search_entry_content("straddle.txt", "needle")) return fail("search across block boundary miss");
+    if(g_journal.content_revision() == rev0) return fail("content revision not bumped on save");
+    uint32_t rev1 = g_journal.content_revision();
+    if(!g_journal.delete_entry("search.txt")) return fail("delete search entry failed");
+    if(g_journal.content_revision() == rev1) return fail("content revision not bumped on delete");
     return 0;
 }
 
@@ -416,6 +432,60 @@ static int test_term_sixel() {
     return 0;
 }
 
+static int test_clip_history() {
+    // 新条目在 0 号
+    cliphist_record("a", false);
+    cliphist_record("b", true);
+    if(cliphist_count() != 2) return fail("clip history count mismatch");
+    std::string got;
+    bool lw = false;
+    if(!cliphist_get(0, got, &lw) || got != "b" || !lw) return fail("clip history head mismatch");
+    if(!cliphist_get(1, got) || got != "a") return fail("clip history second mismatch");
+
+    // 重复内容去重并移到最前,不新增条目
+    cliphist_record("a", false);
+    if(cliphist_count() != 2) return fail("clip history dedup grew count");
+    if(!cliphist_get(0, got) || got != "a") return fail("clip history dedup did not move to front");
+
+    // get 必须返回副本:改它不能影响内部存储(旧 API 返回的内部指针会跨线程悬垂)
+    if(!cliphist_get(0, got)) return fail("clip history get failed");
+    got += "tampered";
+    if(!cliphist_get(0, got) || got != "a") return fail("clip history get leaked internal buffer");
+
+    // 越界读取返回 false
+    if(cliphist_get(-1, got) || cliphist_get(cliphist_count(), got)) return fail("clip history out of range accepted");
+
+    // 删除后后续元素前移;越界删除是 no-op
+    cliphist_remove(0);
+    if(cliphist_count() != 1 || !cliphist_get(0, got) || got != "b") return fail("clip history remove mismatch");
+    cliphist_remove(99);
+    if(cliphist_count() != 1) return fail("clip history remove out of range changed count");
+
+    if(!cliphist_replace_raw(0, "new", 3)) return fail("clip history replace failed");
+    if(!cliphist_get(0, got) || got != "new") return fail("clip history replace mismatch");
+
+    // 超长内容截到上限,且不能把 UTF-8 字符劈成半个
+    std::string big(CLIPHIST_MAX_BYTES - 1, 'a');
+    big += "中";  // 3 字节,截断点正落在它中间
+    if(!cliphist_add_raw(big.data(), big.size(), false)) return fail("clip history add_raw failed");
+    if(!cliphist_get(0, got)) return fail("clip history get big failed");
+    if(got.size() > CLIPHIST_MAX_BYTES) return fail("clip history not capped");
+    if(!got.empty() && ((unsigned char)got.back() & 0xC0) == 0x80) return fail("clip history split utf8");
+    if(got != std::string(CLIPHIST_MAX_BYTES - 1, 'a')) return fail("clip history truncation mismatch");
+    return 0;
+}
+
+static int test_json_depth_guard() {
+    // 正常嵌套仍能解析
+    JsonValue ok = JsonValue::parse("[[[1]]]");
+    if(!ok.isArray() || ok.size() != 1) return fail("json nested parse broken");
+    // 超深嵌套必须被安全拒绝,而不是递归到爆栈
+    std::string deep(20000, '[');
+    JsonValue d = JsonValue::parse(deep);
+    (void)d;  // 不崩溃即通过
+    return 0;
+}
+
 int main() {
     if(hash::md5_hex("") != "d41d8cd98f00b204e9800998ecf8427e") return fail("md5 empty mismatch");
     if(hash::md5_hex("abc") != "900150983cd24fb0d6963f7d28e17f72") return fail("md5 abc mismatch");
@@ -436,5 +506,7 @@ int main() {
     if(int rc = test_term_settings()) return rc;
     if(int rc = test_term_keys()) return rc;
     if(int rc = test_term_sixel()) return rc;
+    if(int rc = test_clip_history()) return rc;
+    if(int rc = test_json_depth_guard()) return rc;
     return 0;
 }

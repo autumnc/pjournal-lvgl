@@ -218,15 +218,15 @@ void handle_list(int fd) {
     const int n = cliphist_count();
     std::string out = "[";
     for(int i = 0; i < n; ++i) {
-        const char *p = cliphist_text(i);
-        if(!p) continue;
-        const uint32_t len = cliphist_len(i);
+        std::string data;
+        bool linewise = false;
+        if(!cliphist_get(i, data, &linewise)) continue;  // 期间被删掉了
         if(out.size() > 1) out += ',';
         out += "{\"i\":" + std::to_string(i);
-        out += ",\"len\":" + std::to_string(len);
+        out += ",\"len\":" + std::to_string((uint32_t)data.size());
         out += ",\"linewise\":";
-        out += cliphist_linewise(i) ? "1" : "0";
-        out += ",\"preview\":\"" + json_preview(p, len) + "\"}";
+        out += linewise ? "1" : "0";
+        out += ",\"preview\":\"" + json_preview(data.data(), (uint32_t)data.size()) + "\"}";
     }
     out += "]";
     send_json(fd, out);
@@ -238,13 +238,12 @@ void handle_item_get(int fd, const Request &req) {
         send_error(fd, "bad index");
         return;
     }
-    const char *p = cliphist_text(i);
-    if(!p) {
+    std::string data;
+    if(!cliphist_get(i, data)) {
         send_response(fd, 404, "Not Found", "text/plain; charset=utf-8", "not found");
         return;
     }
-    send_response(fd, 200, "OK", "text/plain; charset=utf-8",
-                  std::string(p, cliphist_len(i)));
+    send_response(fd, 200, "OK", "text/plain; charset=utf-8", data);
 }
 
 void handle_item_post(int fd, const Request &req) {

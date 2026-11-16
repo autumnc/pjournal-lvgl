@@ -8,13 +8,20 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+extern char **environ;
 
 namespace {
 
 constexpr int kTotalTimeoutMs = 40000;   // 父进程自己的兜底,比 curl 的 -m 宽一点
 constexpr int kMaxBodyBytes = 4 * 1024 * 1024;
+// 响应没有上限的话,一个异常大的返回(或恶意服务端)就能把内存吃光。同步返回是
+// JSON,正常远小于此值。
+constexpr size_t kMaxResponseBytes = 8 * 1024 * 1024;
+constexpr size_t kMaxStderrBytes = 4096;
 
 int64_t now_ms() {
     using namespace std::chrono;
@@ -40,7 +47,7 @@ HttpResult http_request(const std::string &method, const std::string &url,
                         const std::vector<std::string> &headers,
                         const std::string &body) {
     HttpResult res;
-    if(static_cast<int>(body.size()) > kMaxBodyBytes) {
+    if(body.size() > (size_t)kMaxBodyBytes) {
         res.error = "请求体过大";
         return res;
     }
@@ -87,24 +94,32 @@ HttpResult http_request(const std::string &method, const std::string &url,
     for(std::string &a : args) argv.push_back(a.data());
     argv.push_back(nullptr);
 
-    pid_t pid = fork();
-    if(pid < 0) {
-        res.error = std::string("fork 失败: ") + strerror(errno);
+    // 用 posix_spawn 而不是 fork+exec:这是多线程程序,子进程在 exec 前再 malloc
+    // (execvp 和各参数数组都要)一旦撞上别的线程正持有 malloc/stdio 锁就是死等。
+    // posix_spawn 的重定向由内核/库在无锁状态下完成。
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, in_pipe[0], STDIN_FILENO);
+    posix_spawn_file_actions_adddup2(&fa, out_pipe[1], STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&fa, err_pipe[1], STDERR_FILENO);
+    // dup2 之后把子进程不该再持有的管脚都关掉:尤其是 in_pipe[1](否则父进程写完后
+    // curl 看不到 stdin EOF)、out_pipe[0]、err_pipe[0]。
+    const int child_fds[6] = {in_pipe[0], in_pipe[1], out_pipe[0], out_pipe[1], err_pipe[0], err_pipe[1]};
+    for(int fd : child_fds) {
+        if(fd != STDIN_FILENO && fd != STDOUT_FILENO && fd != STDERR_FILENO)
+            posix_spawn_file_actions_addclose(&fa, fd);
+    }
+
+    pid_t pid = -1;
+    const int spawn_rc = posix_spawnp(&pid, "curl", &fa, nullptr, argv.data(), environ);
+    posix_spawn_file_actions_destroy(&fa);
+    if(spawn_rc != 0) {
+        res.error = spawn_rc == ENOENT ? "找不到 curl 命令"
+                                       : std::string("启动 curl 失败: ") + strerror(spawn_rc);
         close_pair(in_pipe);
         close_pair(out_pipe);
         close_pair(err_pipe);
         return res;
-    }
-
-    if(pid == 0) {
-        dup2(in_pipe[0], STDIN_FILENO);
-        dup2(out_pipe[1], STDOUT_FILENO);
-        dup2(err_pipe[1], STDERR_FILENO);
-        close_pair(in_pipe);
-        close_pair(out_pipe);
-        close_pair(err_pipe);
-        execvp("curl", argv.data());
-        _exit(127);   // exec 失败;父进程按退出码 127 报「找不到 curl」
     }
 
     close(in_pipe[0]);
@@ -123,6 +138,7 @@ HttpResult http_request(const std::string &method, const std::string &url,
     }
     std::string out, errbuf;
     bool timed_out = false;
+    bool too_big = false;
     const int64_t deadline = now_ms() + kTotalTimeoutMs;
 
     while(in_open || out_open || err_open) {
@@ -173,8 +189,13 @@ HttpResult http_request(const std::string &method, const std::string &url,
         if(i_out >= 0 && (pf[i_out].revents & (POLLIN | POLLERR | POLLHUP))) {
             char buf[4096];
             ssize_t r = read(out_pipe[0], buf, sizeof(buf));
-            if(r > 0) out.append(buf, (size_t)r);
-            else {
+            if(r > 0) {
+                out.append(buf, (size_t)r);
+                if(out.size() > kMaxResponseBytes) {
+                    too_big = true;
+                    break;
+                }
+            } else {
                 close(out_pipe[0]);
                 out_pipe[0] = -1;
                 out_open = false;
@@ -183,8 +204,10 @@ HttpResult http_request(const std::string &method, const std::string &url,
         if(i_err >= 0 && (pf[i_err].revents & (POLLIN | POLLERR | POLLHUP))) {
             char buf[1024];
             ssize_t r = read(err_pipe[0], buf, sizeof(buf));
-            if(r > 0) errbuf.append(buf, (size_t)r);
-            else {
+            if(r > 0) {
+                // 报错文字只取前一小段拼到错误消息里,别无限攒。
+                if(errbuf.size() < kMaxStderrBytes) errbuf.append(buf, (size_t)r);
+            } else {
                 close(err_pipe[0]);
                 err_pipe[0] = -1;
                 err_open = false;
@@ -192,11 +215,11 @@ HttpResult http_request(const std::string &method, const std::string &url,
         }
     }
 
-    if(timed_out) {
+    if(timed_out || too_big) {
         kill(pid, SIGKILL);
         // 收尸,免得留僵尸。SIGKILL 之后 waitpid 立刻就回。
         while(waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
-        res.error = "请求超时";
+        res.error = too_big ? "响应过大" : "请求超时";
     } else {
         int status = 0;
         while(waitpid(pid, &status, 0) < 0 && errno == EINTR) {}

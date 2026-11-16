@@ -21,6 +21,7 @@
 #include <ctime>
 #include <dirent.h>
 #include <map>
+#include <mutex>
 #include <string>
 #include <sys/time.h>
 #include <system_error>
@@ -371,22 +372,21 @@ struct ZipEntry {
 };
 
 uint32_t g_crc_table[256];
-bool g_crc_ready = false;
+// 每个连接一条 detached 线程,下载目录时会并发进来;表必须初始化一次且只一次。
+std::once_flag g_crc_once;
 const size_t MAX_ZIP_FILES = 512;
 const uint64_t MAX_ZIP_TOTAL_SIZE = 64ULL * 1024 * 1024;
 
 void init_crc32() {
-    if(g_crc_ready) return;
     for(uint32_t i = 0; i < 256; i++) {
         uint32_t c = i;
         for(int j = 0; j < 8; j++) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
         g_crc_table[i] = c;
     }
-    g_crc_ready = true;
 }
 
 uint32_t compute_crc32(const uint8_t *data, size_t len, uint32_t crc) {
-    init_crc32();
+    std::call_once(g_crc_once, init_crc32);
     for(size_t i = 0; i < len; i++) crc = g_crc_table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
     return crc;
 }
@@ -444,7 +444,17 @@ uint64_t zip_out_size(const std::vector<ZipEntry> &entries) {
 void handle_index(int fd) {
     std::string page = HTML_PAGE;
     size_t pos;
-    std::string root_json = "\"" + json_escape(g_root) + "\"";
+    std::string escaped = json_escape(g_root);
+    // 这段 JSON 是塞进 <script> 里的。路径里出现 "</script>" 会把脚本提前截断,
+    // 所以额外把 '<' 转义成 <(JSON 与 JS 字符串里都合法)。
+    std::string root_json;
+    root_json.reserve(escaped.size() + 2);
+    root_json += '"';
+    for(char c : escaped) {
+        if(c == '<') root_json += "\\u003c";
+        else root_json += c;
+    }
+    root_json += '"';
     while((pos = page.find("__ROOT_JSON__")) != std::string::npos)
         page.replace(pos, 13, root_json);
     respond(fd, "200 OK", "text/html; charset=utf-8", page);
@@ -741,7 +751,8 @@ void handle_upload(int fd, Conn &conn, const Request &req) {
         respond_json_error(fd, "upload failed");
         return;
     }
-    remove(full_path.c_str());
+    // rename 是原子的,同目录下目标已存在时会直接替换。别先 remove 原文件:
+    // 那样 rename 一旦失败,原文件就白丢了。
     if(rename(tmp_path.c_str(), full_path.c_str()) != 0) {
         remove(tmp_path.c_str());
         respond_json_error(fd, "upload failed");

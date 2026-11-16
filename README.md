@@ -14,7 +14,17 @@ Implemented target changes:
 - Journal save location is configurable.
 - Clipboard history (20 entries, 64 KB each) with an `Alt+V` overlay; `w` in that menu
   serves a browser UI over HTTP for viewing/editing entries.
+- Past-journal browser with a floating calendar date filter (`t`) and search (`/`):
+  live filtering over date/title/first line, Enter runs an incremental full-text scan
+  with progress and any-key cancellation.
 - Left-Win tap in the editor opens a shortcut menu mirroring the keyboard shortcuts.
+- AI chat (问 ai): `Ctrl+W` in the editor opens a floating window with the current
+  selection or draft as context; `a` on the main screen opens it full-screen.
+  The bottom input sends to DeepSeek on Enter; answers render Markdown, and questions
+  vs answers use different colors; PageUp/PageDown scroll the conversation.
+  Multiple sessions are kept in memory: `Ctrl+J` starts a new one, `Ctrl+H` toggles
+  a left-side session list (`↑`/`↓` select, `Enter` open, `d` delete, `n` new,
+  `Tab` switches focus), and `Ctrl+L` clears the current session.
 - Static ARM build target is provided.
 
 Build for the target:

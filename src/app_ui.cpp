@@ -40,10 +40,12 @@
 #include <dirent.h>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <net/if.h>
 #include <set>
 #include <sys/stat.h>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -65,6 +67,7 @@ enum class Screen {
     Dict,
     FileMgr,
     Help,
+    AiChat,
 };
 
 struct Theme {
@@ -119,6 +122,7 @@ static const Action k_actions[] = {
     {'w', "同步WebDAV", LV_SYMBOL_UPLOAD, Screen::Sync},
     {'t', "写作计划", "\xEE\x9A\x9C", Screen::Gtd},             // U+E69C 勾选框
     {'o', "大纲写作", "\xF3\xB0\x88\x9A", Screen::Outline},      // U+F021A 便签
+    {'a', "问 ai", "\xF3\xB1\xAB\xB4", Screen::AiChat},    // U+F1AF4
     {'m', "浮墨笔记", "\xF3\xB1\xAB\xB1", Screen::Flomo},   // U+F1AF1
     {'c', "终端", "\xEF\x84\xA0", Screen::Terminal},        // U+F120
     {'s', "设置", LV_SYMBOL_SETTINGS, Screen::Settings},
@@ -140,7 +144,6 @@ static int g_main_sel = 0;
 // 主菜单图标放不下一屏时,第一个可见项的索引(横向滚动窗口)。g_main_sel 是
 // main_action_indices() 里的下标,不是 k_actions 的下标。
 static int g_main_top = 0;
-static int g_browser_sel = 0;
 static int g_history_sel = 0;
 static int g_history_scroll = 0;
 static int g_history_preview_scroll = 0;
@@ -232,6 +235,42 @@ static int g_settings_scroll = 0;
 static int g_wifi_sel = 0;
 static int g_wifi_saved_sel = 0;
 static std::vector<JournalEntry> g_entries;
+
+// 过往日记的筛选/搜索状态。列表先读进 g_entries,view 是当前可见项的下标
+// (按日期筛选和搜索词过滤之后),选中项、查看/编辑/删除都按 view 取。
+struct BrowserState {
+    int sel = 0;
+    int scroll = 0;
+    std::vector<int> view;
+    std::string filterDate;   // 空 = 不按日期筛选
+    bool calOpen = false;
+    int calYear = 1970;
+    int calMonth = 1;
+    int calDay = 1;
+    bool searchOpen = false;
+    std::string query;
+    bool rescanAfterReload = false;
+    // Enter 触发的全文结果:用条目数/首尾文件名/内容修订号校验是否仍有效
+    bool fullTextActive = false;
+    std::vector<int> fullTextIdx;
+    std::string fullTextQuery;
+    std::string fullTextDate;
+    size_t fullTextEntryCount = 0;
+    std::string fullTextFirstFile;
+    std::string fullTextLastFile;
+    uint32_t fullTextRevision = 0;
+    // 增量扫描:每个空闲节拍处理一小批,扫描期间界面和按键仍可用
+    bool scanActive = false;
+    int scanNext = 0;
+    int scanTotal = 0;
+    int scanDone = 0;
+    uint32_t scanNextTick = 0;
+    std::string scanQuery;
+    std::string scanQueryLower;
+    std::string scanDate;
+    uint32_t scanRevision = 0;
+};
+static BrowserState g_browser;
 // 过往日记列表只在进入该屏/删除后重读。以前每次按键渲染都全量读盘,翻列表会一顿一顿的。
 static bool g_browser_needs_reload = true;
 // 删除日记不可恢复(d 键很容易误碰),先弹框确认
@@ -247,6 +286,193 @@ static std::string g_prompt;
 static int g_quick_slot = -1;
 static std::string g_clipboard;
 static bool g_clipboard_linewise = false;
+
+// ── 过往日记:筛选/搜索 ──────────────────────────────────────────────
+static constexpr size_t kBrowserMaxSearchBytes = 128;
+static constexpr int kBrowserFullTextBatch = 16;
+
+static std::string ascii_lower_copy(const std::string &s) {
+    std::string out = s;
+    for(char &c : out)
+        if(c >= 'A' && c <= 'Z') c = (char)(c + ('a' - 'A'));
+    return out;
+}
+
+// ASCII 大小写不敏感的子串匹配;中文按字节精确匹配。
+static bool browser_text_contains(const std::string &hay, const std::string &needle_lower) {
+    const size_t n = needle_lower.size();
+    if(n == 0) return true;
+    if(hay.size() < n) return false;
+    for(size_t i = 0; i + n <= hay.size(); ++i) {
+        size_t j = 0;
+        while(j < n) {
+            char c = hay[i + j];
+            if(c >= 'A' && c <= 'Z') c = (char)(c + ('a' - 'A'));
+            if(c != needle_lower[j]) break;
+            ++j;
+        }
+        if(j == n) return true;
+    }
+    return false;
+}
+
+// 实时过滤只匹配日期/标题/首行预览(不读文件)
+static bool browser_entry_matches_query(const JournalEntry &e, const std::string &q_lower) {
+    return browser_text_contains(e.date, q_lower) ||
+           browser_text_contains(e.title, q_lower) ||
+           browser_text_contains(e.preview, q_lower);
+}
+
+// 删除最后一个 UTF-8 码点(避免退格截断多字节汉字)
+static void browser_pop_utf8(std::string &s) {
+    if(s.empty()) return;
+    size_t i = s.size() - 1;
+    while(i > 0 && ((unsigned char)s[i] & 0xC0) == 0x80) --i;
+    s.erase(i);
+}
+
+static void browser_invalidate_full_text() {
+    g_browser.fullTextActive = false;
+    g_browser.fullTextIdx.clear();
+    g_browser.fullTextQuery.clear();
+    g_browser.fullTextDate.clear();
+    g_browser.fullTextEntryCount = 0;
+    g_browser.fullTextFirstFile.clear();
+    g_browser.fullTextLastFile.clear();
+    g_browser.fullTextRevision = 0;
+}
+
+// 中止增量扫描。已完成的全文结果(fullTextActive)不动:调用方重读列表后
+// 仍可凭指纹复用;扫描期攒的半截下标在 rebuild_view 里会被指纹判废清掉。
+static void browser_cancel_scan() {
+    g_browser.scanActive = false;
+    g_browser.scanNext = 0;
+    g_browser.scanTotal = 0;
+    g_browser.scanDone = 0;
+    g_browser.scanNextTick = 0;
+    g_browser.scanQuery.clear();
+    g_browser.scanQueryLower.clear();
+    g_browser.scanDate.clear();
+    g_browser.scanRevision = 0;
+}
+
+static void browser_rebuild_view();
+static void browser_step_full_text_scan();
+
+// Enter 触发:开始逐篇分块搜索正文。扫描不一次跑完,而是由主循环的空闲节拍
+// 分批推进,期间任何按键都会中止扫描,避免长列表把界面堵死。
+static void browser_start_full_text_scan() {
+    browser_cancel_scan();
+    browser_invalidate_full_text();
+    if(g_browser.query.empty()) {
+        browser_rebuild_view();
+        return;
+    }
+    g_browser.scanQuery = g_browser.query;
+    g_browser.scanQueryLower = ascii_lower_copy(g_browser.query);
+    g_browser.scanDate = g_browser.filterDate;
+    // 记录扫描起点的修订号:扫描期间正文若有改动,结果直接作废
+    g_browser.scanRevision = g_journal.content_revision();
+    for(const auto &e : g_entries)
+        if(g_browser.scanDate.empty() || e.date == g_browser.scanDate) ++g_browser.scanTotal;
+    g_browser.scanNext = 0;
+    g_browser.scanDone = 0;
+    g_browser.scanNextTick = 0;
+    g_browser.sel = g_browser.scroll = 0;
+    g_browser.scanActive = true;
+    browser_step_full_text_scan();  // 先跑一批:短列表当场出结果
+}
+
+static void browser_step_full_text_scan() {
+    if(!g_browser.scanActive) return;
+    const auto &entries = g_entries;
+
+    uint32_t started = lv_tick_get();
+    int processed = 0;
+    while(g_browser.scanNext < (int)entries.size() && processed < kBrowserFullTextBatch) {
+        int i = g_browser.scanNext++;
+        const auto &e = entries[i];
+        if(!g_browser.scanDate.empty() && e.date != g_browser.scanDate) continue;
+        ++processed;
+        ++g_browser.scanDone;
+
+        bool matched = browser_entry_matches_query(e, g_browser.scanQueryLower);
+        if(!matched) matched = g_journal.search_entry_content(e.filename, g_browser.scanQueryLower);
+        if(matched) g_browser.fullTextIdx.push_back(i);
+        // 单个节拍别占太久:长文件按块读,一批 16 篇已经够快
+        if(processed > 1 && (uint32_t)(lv_tick_get() - started) > 25) break;
+    }
+    if(g_browser.scanNext < (int)entries.size()) return;
+
+    // 扫描完成:固定结果与指纹,条目列表未变时后续直接复用
+    g_browser.scanActive = false;
+    g_browser.fullTextActive = true;
+    g_browser.fullTextQuery = g_browser.scanQuery;
+    g_browser.fullTextDate = g_browser.scanDate;
+    g_browser.fullTextEntryCount = entries.size();
+    g_browser.fullTextRevision = g_browser.scanRevision;
+    if(!entries.empty()) {
+        g_browser.fullTextFirstFile = entries.front().filename;
+        g_browser.fullTextLastFile = entries.back().filename;
+    }
+    g_browser.scanQuery.clear();
+    g_browser.scanQueryLower.clear();
+    g_browser.scanDate.clear();
+    g_browser.sel = g_browser.scroll = 0;
+    browser_rebuild_view();
+}
+
+// 按日期筛选与搜索词重建可见列表;不重复读盘。
+static void browser_rebuild_view() {
+    g_browser.view.clear();
+    const auto &entries = g_entries;
+    std::string q = ascii_lower_copy(g_browser.query);
+    // 全文结果只在条目列表未变化时沿用,避免外部增删/改写后下标或正文错位
+    bool use_full = g_browser.fullTextActive &&
+                    g_browser.fullTextQuery == g_browser.query &&
+                    g_browser.fullTextDate == g_browser.filterDate &&
+                    g_browser.fullTextEntryCount == entries.size() &&
+                    g_browser.fullTextRevision == g_journal.content_revision() &&
+                    (entries.empty() ||
+                     (g_browser.fullTextFirstFile == entries.front().filename &&
+                      g_browser.fullTextLastFile == entries.back().filename));
+    // 结果已过期就退回首行/标题实时过滤,并释放可能很大的下标表
+    if(!use_full) {
+        g_browser.fullTextActive = false;
+        std::vector<int>().swap(g_browser.fullTextIdx);
+    }
+    for(int i = 0; i < (int)entries.size(); ++i) {
+        if(!g_browser.filterDate.empty() && entries[i].date != g_browser.filterDate) continue;
+        if(use_full) {
+            if(!std::binary_search(g_browser.fullTextIdx.begin(), g_browser.fullTextIdx.end(), i))
+                continue;
+        } else if(!q.empty() && !browser_entry_matches_query(entries[i], q)) {
+            continue;
+        }
+        g_browser.view.push_back(i);
+    }
+    if(g_browser.sel >= (int)g_browser.view.size()) g_browser.sel = (int)g_browser.view.size() - 1;
+    if(g_browser.sel < 0) g_browser.sel = 0;
+    if(g_browser.scroll > g_browser.sel) g_browser.scroll = g_browser.sel;
+}
+
+static const JournalEntry *browser_selected_entry() {
+    if(g_browser.sel < 0 || g_browser.sel >= (int)g_browser.view.size()) return nullptr;
+    int idx = g_browser.view[g_browser.sel];
+    if(idx < 0 || idx >= (int)g_entries.size()) return nullptr;
+    return &g_entries[idx];
+}
+
+static bool browser_has_entry_date(const std::string &date) {
+    for(const auto &e : g_entries)
+        if(e.date == date) return true;
+    return false;
+}
+
+static void browser_refresh_cache() {
+    g_entries = g_journal.list_entries();
+    browser_rebuild_view();
+}
 
 // 所有「复制」统一走这里:更新当前剪贴板,同时记账到剪贴板历史。
 // record=false 用于从历史里选一条粘贴(那次不算新的复制,不重排历史)。
@@ -285,6 +511,64 @@ static std::string g_polish_source;          // 送润色的原文(选区或整�
 static std::string g_polish_result;          // 润色结果
 static std::string g_polish_instr_text;      // 用户补充的优化指令
 static bool g_polish_is_sel = false;         // 是否润色选区
+
+// AI 聊天(Ctrl+W / 主界面 a):多会话 + 后台请求。会话常驻内存,关窗/切屏都不丢,
+// 但进程退出即清空(暂不落盘)。
+struct AiChatTurn {
+    std::string role;  // "user" / "assistant"
+    std::string content;
+};
+struct AiChatSession {
+    std::vector<AiChatTurn> turns;  // 发给 API 的历史(上限 20 轮)
+    std::vector<AiChatTurn> msgs;   // 显示用消息(含出错提示)
+    std::string title;              // 取自首条用户消息,空会话显示"新会话"
+};
+static std::vector<AiChatSession> g_ai_sessions;
+static int g_ai_cur = 0;                 // 当前查看/对话的会话下标
+static bool g_ai_show_sessions = false;  // 左侧会话列表是否展开(Ctrl+H)
+static bool g_ai_focus_list = false;     // 焦点是否在会话列表(Tab 切换)
+static int g_ai_sel = 0;                 // 会话列表里的光标
+static int g_ai_pending_idx = -1;        // 在途请求属于哪个会话,-1 表示没有
+
+// 当前会话;越界时夹回 0。空列表按需建一个。
+static AiChatSession &ai_cur() {
+    if(g_ai_sessions.empty()) g_ai_sessions.emplace_back();
+    if(g_ai_cur < 0 || g_ai_cur >= (int)g_ai_sessions.size()) g_ai_cur = 0;
+    return g_ai_sessions[g_ai_cur];
+}
+
+struct AiChatState {
+    bool open = false;
+    bool pending = false;       // 已发出请求,等后台线程回话
+    bool fullscreen = false;    // 主界面进入时为整屏,编辑器 Ctrl+W 为浮窗
+    bool ime_saved = false;
+    std::string context;        // 打开时抓的选区/正文,作为 system 上下文
+    std::string context_label;  // "选区" / "全文" / 空
+    lv_obj_t *panel = nullptr;
+    lv_obj_t *side = nullptr;     // 左侧会话列表(展开时才有)
+    lv_obj_t *view = nullptr;     // 可滚动的会话区
+    lv_obj_t *input = nullptr;
+    lv_obj_t *hint = nullptr;     // 浮窗底部提示行(不占编辑器状态栏)
+    // 会话区内容层与 Markdown 排版资源,重建时整体换掉
+    lv_obj_t *content = nullptr;
+    std::vector<lv_obj_t *> labels;
+    std::vector<lv_obj_t *> rules;
+    std::vector<lv_area_t> boxes;  // 反白底块(`code`/链接)
+    std::vector<lv_area_t> dots;   // 着重号
+    std::vector<lv_area_t> waves;  // 书名波浪线
+    // 会话区基准几何(不含左侧列表),Ctrl+H 折叠列表时据此重排
+    lv_obj_t *io_parent = nullptr;
+    int area_x = 8, area_y = 44, area_w = 888, view_h = 352;
+    int input_y = 404, input_h = 48;
+};
+static AiChatState g_ai_chat;
+// 后台线程只碰这两个原子量 + 结果结构,LVGL 对象一律留在主线程动。
+static std::atomic<bool> g_ai_req_busy{false};
+static std::atomic<bool> g_ai_req_ready{false};
+static std::mutex g_ai_req_mutex;
+static std::string g_ai_req_text;
+static std::string g_ai_req_error;
+
 static lv_obj_t *g_md_view = nullptr;     // Markdown 叠加层的视口
 static lv_obj_t *g_md_content = nullptr;  // 叠加层内容(负责滚动)
 static lv_obj_t *g_md_caret = nullptr;    // 叠加层自己画的光标
@@ -551,6 +835,10 @@ static void editor_vt_refresh();
 static void editor_vt_create(int x, int y, int w, int h);
 static bool editor_vertical();
 static void editor_sel_style_plain();
+static void ai_chat_open(bool fullscreen);
+static bool ai_chat_key(int key);
+static void ai_chat_status(const std::string &text);
+static void render_ai_chat();
 
 // 编辑模式四选一:正常 / 打字机 / 聚焦 / 打字机聚焦。聚焦那两种只是在打字机之上多盖一层
 // 暗化罩,所以拆成两个谓词,typing 相关的代码照旧只问 editor_typewriter()。
@@ -1950,6 +2238,21 @@ static void clear_root() {
     g_polish_preview = nullptr;
     g_polish_instr = nullptr;
     g_polish_instr_mode = false;
+    g_ai_chat.panel = nullptr;
+    g_ai_chat.side = nullptr;
+    g_ai_chat.view = nullptr;
+    g_ai_chat.input = nullptr;
+    g_ai_chat.hint = nullptr;
+    g_ai_chat.content = nullptr;
+    g_ai_chat.io_parent = nullptr;
+    g_ai_chat.labels.clear();
+    g_ai_chat.rules.clear();
+    g_ai_chat.boxes.clear();
+    g_ai_chat.dots.clear();
+    g_ai_chat.waves.clear();
+    g_ai_chat.open = false;
+    g_ai_chat.pending = false;
+    g_ai_chat.fullscreen = false;
     g_md_view = nullptr;
     g_md_content = nullptr;
     g_md_caret = nullptr;
@@ -2006,6 +2309,7 @@ static void draw_status_bar(const std::string &left = "", bool align_right = fal
 }
 
 static lv_obj_t *active_textarea() {
+    if(g_ai_chat.input) return g_ai_chat.input;
     if(g_polish_instr) return g_polish_instr;
     if(g_search_input) return g_search_input;
     if(g_gtd.input) return g_gtd.input;
@@ -2557,8 +2861,9 @@ static void render_main() {
     if(g_main_sel < 0) g_main_sel = 0;
 
     // 一屏放得下几个:按图标宽 + 间距算,两侧各留一条提示箭头的位置。
-    int icon_w = ui_px(84);
-    int gap = ui_px(16);
+    // 10 个入口在 1024 宽下要放得下,图标带宽从 84 收到 76、间距 16 收到 12。
+    int icon_w = ui_px(76);
+    int gap = ui_px(12);
     int chev_w = ui_px(28);
     int side = chev_w + ui_px(8);
     int per = (screen_w() - 2 * side) / (icon_w + gap);
@@ -2935,31 +3240,144 @@ static void open_search_panel() {
     set_status("Tab 切字段 · Ctrl+R 替换 · Ctrl+A 全部替换 · Esc 关闭");
 }
 
+static int cal_days_in_month(int year, int month) {
+    static const int d[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if(month < 1 || month > 12) return 30;
+    if(month == 2 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0)) return 29;
+    return d[month - 1];
+}
+
+static int cal_weekday(int year, int month, int day) {
+    tm t {};
+    t.tm_year = year - 1900;
+    t.tm_mon = month - 1;
+    t.tm_mday = day;
+    t.tm_hour = 12;
+    mktime(&t);
+    return t.tm_wday;  // 0 = 周日
+}
+
+// 过往日记的浮动月历:有日记的日期带 ✓,今天用细框标出。
+static void render_browser_calendar() {
+    int w = 620, h = 430;
+    int x = (screen_w() - w) / 2;
+    int y = (chrome_bottom() - h) / 2;
+    if(y < 8) y = 8;
+    lv_obj_t *dlg = box_raw(g_root, x, y, w, h, false);
+    lv_obj_set_style_bg_color(dlg, g_theme.bg, 0);
+    lv_obj_set_style_border_width(dlg, 2, 0);
+    lv_obj_t *title = label(dlg, std::to_string(g_browser.calYear) + "年" +
+                                    std::to_string(g_browser.calMonth) + "月",
+                            0, 10, w - 16, 32);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+
+    const char *wd[] = {"日", "一", "二", "三", "四", "五", "六"};
+    for(int i = 0; i < 7; ++i) label(dlg, wd[i], 16 + i * 84, 50, 76, 26);
+    const int days = cal_days_in_month(g_browser.calYear, g_browser.calMonth);
+    const int first = cal_weekday(g_browser.calYear, g_browser.calMonth, 1);
+    time_t now = time(nullptr);
+    tm today {};
+    localtime_r(&now, &today);
+    const bool this_month = today.tm_year + 1900 == g_browser.calYear &&
+                            today.tm_mon + 1 == g_browser.calMonth;
+    for(int d = 1; d <= days; ++d) {
+        int cell = first + d - 1;
+        int row = cell / 7, col = cell % 7;
+        int cx = 16 + col * 84;
+        int cy = 84 + row * 52;
+        bool on = d == g_browser.calDay;
+        bool is_today = this_month && d == today.tm_mday;
+        char date[32];
+        snprintf(date, sizeof(date), "%04d-%02d-%02d", g_browser.calYear, g_browser.calMonth, d);
+        bool has = browser_has_entry_date(date);
+        lv_obj_t *r = box(dlg, cx, cy, 76, 46, on);
+        if(on) {
+            // 选中的格子用实心反白,和列表选中行一致
+            lv_obj_set_style_pad_all(r, 0, 0);
+        }
+        lv_obj_t *l = label(r, std::to_string(d) + (has ? "✓" : ""), 0, 8, 76, 28);
+        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+        if(on) lv_obj_set_style_text_color(l, g_theme.bg, 0);
+        if(is_today && !on) {
+            // 今天:在格子外面套一层透明细框,不抢选中格的反白
+            lv_obj_t *frame = box(dlg, cx, cy, 76, 46, false);
+            lv_obj_set_style_bg_opa(frame, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_pad_all(frame, 0, 0);
+        }
+    }
+    label(dlg, "方向键选日期 Enter筛选 c清除 Esc关闭 h/l换月", 8, h - 42, w - 32, 28);
+    lv_obj_move_foreground(dlg);
+}
+
 static void render_browser() {
     clear_root();
     if(g_browser_needs_reload) {
-        g_entries = g_journal.list_entries();
+        browser_refresh_cache();
         g_browser_needs_reload = false;
+        // 从编辑器保存后回来,或外部改动过日记:过期的全文结果已降级成首行
+        // 过滤,这里自动重新增量扫描,恢复正文命中。
+        if(g_browser.rescanAfterReload) {
+            g_browser.rescanAfterReload = false;
+            if(!g_browser.query.empty() && !g_browser.fullTextActive)
+                browser_start_full_text_scan();
+        }
     }
-    if(g_browser_sel >= (int)g_entries.size()) g_browser_sel = (int)g_entries.size() - 1;
-    if(g_browser_sel < 0) g_browser_sel = 0;
-    if(g_browser_confirm_delete && g_entries.empty()) g_browser_confirm_delete = false;
+    if(g_browser_confirm_delete && g_browser.view.empty()) g_browser_confirm_delete = false;
+
     label(g_root, "过往日记", 8, 8, 1008, 32);
+    // 右上角:日期筛选(高亮)或快捷键提示
+    const bool filtered = !g_browser.filterDate.empty();
+    std::string hint = filtered ? g_browser.filterDate : "t日历  /搜索";
+    lv_obj_t *hl = label(g_root, hint, 8, 8, screen_w() - 24, 32);
+    lv_obj_set_style_text_align(hl, LV_TEXT_ALIGN_RIGHT, 0);
+    if(!filtered) lv_obj_set_style_text_color(hl, g_theme.muted, 0);
+
     int y = 52;
     int row_h = 52;
     int visible = visible_rows_from(y, row_h);
-    int start = std::max(0, g_browser_sel - visible + 1);
-    for(int i = 0; i < visible && start + i < (int)g_entries.size(); ++i) {
-        const auto &e = g_entries[start + i];
-        lv_obj_t *r = box(g_root, 8, y + i * row_h, 1008, row_h - 4, start + i == g_browser_sel);
+    int total = (int)g_browser.view.size();
+    if(g_browser.sel < g_browser.scroll) g_browser.scroll = g_browser.sel;
+    if(g_browser.sel >= g_browser.scroll + visible) g_browser.scroll = g_browser.sel - visible + 1;
+    if(g_browser.scroll < 0) g_browser.scroll = 0;
+    for(int i = 0; i < visible && g_browser.scroll + i < total; ++i) {
+        int vi = g_browser.scroll + i;
+        const auto &e = g_entries[g_browser.view[vi]];
+        lv_obj_t *r = box(g_root, 8, y + i * row_h, 1008, row_h - 4, vi == g_browser.sel);
         lv_obj_t *t = label(r, e.date + "  " + e.title + "  " + e.preview, 4, 8, 990, 32);
         lv_label_set_long_mode(t, LV_LABEL_LONG_CLIP);
-        if(start + i == g_browser_sel) lv_obj_set_style_text_color(t, g_theme.bg, 0);
+        if(vi == g_browser.sel) lv_obj_set_style_text_color(t, g_theme.bg, 0);
     }
-    draw_status_bar("过往日记  " + std::to_string(g_entries.size()) + "篇");
-    if(g_browser_confirm_delete && !g_entries.empty())
-        draw_confirm_overlay("删除「" + g_entries[g_browser_sel].date + " " + g_entries[g_browser_sel].title + "」?",
-                             "Enter删除");
+    if(total == 0) {
+        const char *empty = !g_browser.query.empty() ? "无匹配日记"
+                            : filtered ? "该日期无日记" : "暂无日记";
+        lv_obj_t *l = label_raw(g_root, empty, 0, screen_h() / 2 - 20, screen_w(), 40);
+        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(l, g_theme.muted, 0);
+    }
+
+    std::string st;
+    if(g_browser.scanActive) {
+        st = "全文搜索 " + std::to_string(g_browser.scanDone) + "/" +
+             std::to_string(g_browser.scanTotal) + "  Esc取消";
+    } else if(g_browser.searchOpen) {
+        st = "搜索: " + (g_browser.query.empty() ? "输入关键词" : g_browser.query) +
+             "  Enter全文  Esc取消";
+    } else if(!g_browser.query.empty()) {
+        st = (g_browser.fullTextActive ? "全文搜索: " : "搜索: ") + g_browser.query + "  Esc清除";
+    } else if(filtered) {
+        st = "日期: " + g_browser.filterDate + "  Esc清除";
+    } else {
+        st = "过往日记  " + std::to_string(total) + "篇  t日历  /搜索";
+    }
+    draw_status_bar(st);
+
+    if(g_browser.calOpen) render_browser_calendar();
+    if(g_browser_confirm_delete) {
+        const JournalEntry *sel = browser_selected_entry();
+        if(sel)
+            draw_confirm_overlay("删除「" + sel->date + " " + sel->title + "」?", "Enter删除");
+    }
+    if(g_browser.searchOpen) update_ime_bar();
 }
 
 static void render_viewer() {
@@ -4689,18 +5107,19 @@ static void render_sync() {
 static void render_help() {
     clear_root();
     static const char *help[] = {
-        "主界面: p提示写作 f自由写作 v查看 w同步WebDAV t写作计划 o大纲 s设置 Ctrl+Q退出",
+        "主界面: p提示写作 f自由写作 v查看 w同步WebDAV t写作计划 o大纲 a问ai s设置 Ctrl+Q退出",
         "通用: hjkl/方向键移动 Enter确认 Esc/q返回 Ctrl+I灵感",
         "编辑: Ctrl+S保存 Ctrl+Q退出 Ctrl+A全选 Ctrl+C复制 Ctrl+X剪切 Ctrl+V粘贴 Alt+V历史",
         "编辑: Ctrl+Z撤销 Ctrl+R重做 Ctrl+Y历史 Ctrl+/查找替换 Ctrl+?帮助 单按左Win快捷菜单",
         "查找: Enter下一处 Ctrl+Enter上一处 Tab切查找/替换 Ctrl+R替换 Ctrl+A全部替换 Esc关闭",
-        "编辑: Ctrl+P生成提示(仅日记模式) Ctrl+O润色(有选区只润色选区) Ctrl+F发送Flomo",
+        "编辑: Ctrl+P生成提示(仅日记模式) Ctrl+O润色(有选区只润色选区) Ctrl+W问AI Ctrl+F发送Flomo",
+        "问AI: Enter发送 Ctrl+J新会话 Ctrl+H会话列表(↑↓选 Enter进入 d删 n新建 Tab切焦点) Ctrl+L清空 Esc关闭",
         "润色: Shift+方向键/Ctrl+A选文本 Enter应用 R改指令重润色 Esc取消",
         "编辑: Ctrl+T折叠/展开光标所在的标题(Markdown渲染开启时)",
         "快捷编辑: F1-F10切换文件 Ctrl+n/p下/上一个 Esc保存并回设置",
         "文件编辑: Ctrl+E文件面板 a新建 d删除 r改名 Enter编辑",
         "输入法: Ctrl+Space开关 候选数字直选 空格首选 方向键/无变换/变换/标点翻页",
-        "浏览: Enter查看 e编辑 h历史 d删除 Ctrl+F发送Flomo",
+        "浏览: t日历筛选 /搜索(Enter全文) Enter查看 e编辑 h历史 d删除 Ctrl+F发送Flomo",
         "写作计划: 1-5/←→切换视图 a加任务 i子任务 Enter详情 空格切状态 d删除 r重命名",
         "写作计划: j/k上移下移 h/l提降层级 z/Z折叠 /筛选 c/t情境标签 s摘要 A归档 E导出 n新项目 ?帮助",
         "大纲: 项目列表a新建 Enter打开；项目内a同级 i子级 Enter状态 d删除 ,/.调整层级",
@@ -4708,8 +5127,7 @@ static void render_help() {
         "灵感: Ctrl+I进入 a添加 Enter编辑 k关键词 /检索 c复制 d删除 q返回",
         "词库: 设置→词库管理 a添加 d删除 /检索 Space多选 Tab切换词库",
         "设置: 主题/字号/字体/保存位置/WebDAV/输入法/WiFi/Markdown",
-        "Linux版: TTF/OTF优先从当前用户 ~/.fonts 加载。",
-        "UTF-8: LVGL文本和文件均为UTF-8。",
+        "Linux版: TTF/OTF优先从 ~/.fonts 加载;文本与文件均为 UTF-8。",
     };
     label(g_root, "快捷键帮助", 8, 8, 1008, 32);
     for(size_t i = 0; i < sizeof(help) / sizeof(help[0]); ++i) label(g_root, help[i], 16, 50 + i * 26, 992, 25);
@@ -4735,6 +5153,7 @@ static void render() {
     case Screen::Dict: render_dict(); break;
     case Screen::FileMgr: render_filemgr(); break;
     case Screen::Help: render_help(); break;
+    case Screen::AiChat: render_ai_chat(); break;
     }
     // 退出框不属于任何一屏的渲染函数,clear_root 会把它抹掉,所以在这里补画一次。
     if(g_quit_asking) draw_quit_confirm();
@@ -4751,6 +5170,15 @@ static void goto_screen(Screen s) {
     if(g_screen == Screen::Flomo && s != Screen::Flomo) flomo::leave();
     // 终端离开即关闭 shell 会话(用户选的),再进来是全新的一只。
     if(g_screen == Screen::Terminal && s != Screen::Terminal) terminal::leave();
+    // 离开全屏聊天页:收掉会话状态并恢复输入法,后台结果之后到达也没人收。
+    if(g_screen == Screen::AiChat && s != Screen::AiChat && g_ai_chat.open) {
+        g_ai_chat.open = false;
+        g_ai_chat.pending = false;
+        g_ai_chat.fullscreen = false;
+        g_ai_focus_list = false;
+        g_ai_pending_idx = -1;  // 后台结果之后到达也没人收
+        g_linux_ime.set_active(g_ai_chat.ime_saved);
+    }
     // 离开编辑器时把「大纲正文文件」的路径收回来(进入时保留,供编辑器读取)。
     bool back_from_outline_file = false;
     if(g_screen == Screen::Editor && s != Screen::Editor) {
@@ -4759,7 +5187,17 @@ static void goto_screen(Screen s) {
     }
     g_screen = s;
     if(s != Screen::Settings) g_setting_pick_active = false;
-    if(s == Screen::Browser) g_browser_confirm_delete = false;
+    if(s == Screen::Browser) {
+        g_browser_confirm_delete = false;
+        g_browser.calOpen = false;
+        g_browser.searchOpen = false;
+        g_browser.sel = g_browser.scroll = 0;
+        const bool had_full = g_browser.fullTextActive;
+        browser_cancel_scan();
+        g_browser_needs_reload = true;
+        // 重读列表后如果全文结果已过期,渲染时自动重新增量扫描
+        g_browser.rescanAfterReload = had_full && !g_browser.query.empty();
+    }
     if(s == Screen::Editor) {
         g_recovery_checked = false;
         g_recovery_meta.clear();
@@ -5106,7 +5544,8 @@ static void handle_main(int key) {
         const Action &a = k_actions[acts[g_main_sel]];
         if(a.key == 'p') { g_quick_slot = -1; g_file_edit_path.clear(); g_prompt = random_builtin_prompt(); g_edit_file.clear(); goto_screen(Screen::Editor); return; }
         if(a.key == 'f') { g_quick_slot = -1; g_file_edit_path.clear(); g_prompt.clear(); g_edit_file.clear(); goto_screen(Screen::Editor); return; }
-        if(a.key == 'v') { g_browser_sel = 0; g_browser_needs_reload = true; goto_screen(Screen::Browser); return; }
+        if(a.key == 'v') { g_browser_needs_reload = true; goto_screen(Screen::Browser); return; }
+        if(a.screen == Screen::AiChat) { ai_chat_open(true); return; }
         goto_screen(a.screen);
         return;
     }
@@ -5115,26 +5554,212 @@ static void handle_main(int key) {
 
 static void handle_browser(int key) {
     if(g_browser_confirm_delete) {
-        if((key == '\n' || key == '\r' || key == 'y' || key == 'Y') && !g_entries.empty()) {
-            g_journal.delete_entry(g_entries[g_browser_sel].filename);
+        const JournalEntry *sel = browser_selected_entry();
+        if((key == '\n' || key == '\r' || key == 'y' || key == 'Y') && sel) {
+            const bool was_full = g_browser.fullTextActive;
+            g_journal.delete_entry(sel->filename);
             g_browser_confirm_delete = false;
-            g_browser_needs_reload = true;
+            browser_refresh_cache();
+            g_browser_needs_reload = false;
+            // 原来在全文结果里删除:重新增量扫描,别退化成只看首行/标题
+            if(was_full && !g_browser.query.empty()) browser_start_full_text_scan();
+            if(g_browser.view.empty() && g_browser.query.empty() && g_browser.filterDate.empty()) {
+                goto_screen(Screen::Main);
+                return;
+            }
         } else if(key == 27 || key == 'q' || key == 'n' || key == 'N') {
             g_browser_confirm_delete = false;
         }
         render();
         return;
     }
-    if(key == 'q' || key == 27) { goto_screen(Screen::Main); return; }
-    if(key == KEY_DOWN || key == 'j') g_browser_sel++;
-    if(key == KEY_UP || key == 'k') g_browser_sel--;
-    if(g_browser_sel < 0) g_browser_sel = 0;
-    if(g_browser_sel >= (int)g_entries.size()) g_browser_sel = (int)g_entries.size() - 1;
-    if(g_entries.empty()) { goto_screen(Screen::Main); return; }
-    if(key == '\n' || key == '\r') { g_view_file = g_entries[g_browser_sel].filename; g_viewer_scroll = 0; goto_screen(Screen::Viewer); return; }
-    if(key == 'e' || key == 'E') { g_quick_slot = -1; g_file_edit_path.clear(); g_edit_file = g_entries[g_browser_sel].filename; g_prompt.clear(); goto_screen(Screen::Editor); return; }
-    if(key == 'h' || key == 'H') { open_history(g_entries[g_browser_sel].filename, Screen::Browser); return; }
-    if(key == 'd' || key == 'D') g_browser_confirm_delete = true;
+
+    // 全文扫描进行中:任何按键先中止扫描,再按常规按键处理;Esc 只中止扫描,
+    // 保留搜索词,再按一次才清除。
+    if(g_browser.scanActive) {
+        const bool esc = key == 27;
+        browser_cancel_scan();
+        browser_rebuild_view();
+        if(esc) {
+            render();
+            return;
+        }
+    }
+
+    if(g_browser.searchOpen) {
+        // 输入法优先消费按键,其余字符逐字追加并实时过滤
+        if(key == KEY_IME_TOGGLE) {
+            g_linux_ime.toggle();
+            update_ime_bar();
+            render();
+            return;
+        }
+        std::string ime_out;
+        if(g_linux_ime.handle_key(key, ime_out)) {
+            if(!ime_out.empty() &&
+               g_browser.query.size() + ime_out.size() <= kBrowserMaxSearchBytes) {
+                g_browser.query += ime_out;
+                g_browser.sel = g_browser.scroll = 0;
+                browser_invalidate_full_text();
+                browser_rebuild_view();
+            }
+            render();
+            return;
+        }
+        if(key == 27) {
+            g_browser.searchOpen = false;
+            g_linux_ime.cancel_composition();  // 只丢未上屏的拼音,不动输入法开关
+            g_browser.query.clear();
+            g_browser.sel = g_browser.scroll = 0;
+            browser_invalidate_full_text();
+            browser_rebuild_view();
+        } else if(key == '\n' || key == '\r') {
+            g_browser.searchOpen = false;
+            g_linux_ime.cancel_composition();
+            browser_start_full_text_scan();  // 输入期按首行实时过滤,Enter 再补搜全文
+        } else if(key == 8 || key == 127) {
+            browser_pop_utf8(g_browser.query);
+            g_browser.sel = g_browser.scroll = 0;
+            browser_invalidate_full_text();
+            browser_rebuild_view();
+        } else if(key >= 32 && key <= 126) {
+            if(g_browser.query.size() < kBrowserMaxSearchBytes) {
+                g_browser.query += (char)key;
+                g_browser.sel = g_browser.scroll = 0;
+                browser_invalidate_full_text();
+                browser_rebuild_view();
+            }
+        }
+        render();
+        return;
+    }
+
+    if(g_browser.calOpen) {
+        // 浮动日历独占按键:Enter 按日期筛选,退格/c 清除筛选,Esc 关闭面板
+        if(key == 27 || key == 'q') {
+            g_browser.calOpen = false;
+        } else if(key == '\n' || key == '\r') {
+            char date[16];
+            snprintf(date, sizeof(date), "%04d-%02d-%02d",
+                     g_browser.calYear, g_browser.calMonth, g_browser.calDay);
+            g_browser.filterDate = date;
+            g_browser.sel = g_browser.scroll = 0;
+            browser_invalidate_full_text();
+            browser_rebuild_view();
+            g_browser.calOpen = false;
+        } else if(key == 'c' || key == 'C' || key == 8 || key == 127) {
+            g_browser.filterDate.clear();
+            g_browser.sel = g_browser.scroll = 0;
+            browser_invalidate_full_text();
+            browser_rebuild_view();
+            g_browser.calOpen = false;
+        } else if(key == KEY_LEFT) {
+            if(g_browser.calDay > 1) --g_browser.calDay;
+        } else if(key == KEY_RIGHT) {
+            if(g_browser.calDay < cal_days_in_month(g_browser.calYear, g_browser.calMonth))
+                ++g_browser.calDay;
+        } else if(key == KEY_UP || key == 'k') {
+            g_browser.calDay -= 7;
+            if(g_browser.calDay < 1) g_browser.calDay = 1;
+        } else if(key == KEY_DOWN || key == 'j') {
+            g_browser.calDay += 7;
+            int days = cal_days_in_month(g_browser.calYear, g_browser.calMonth);
+            if(g_browser.calDay > days) g_browser.calDay = days;
+        } else if(key == 'h' || key == 'H' || key == KEY_PAGE_UP) {
+            if(--g_browser.calMonth < 1) { g_browser.calMonth = 12; --g_browser.calYear; }
+            int days = cal_days_in_month(g_browser.calYear, g_browser.calMonth);
+            if(g_browser.calDay > days) g_browser.calDay = days;
+        } else if(key == 'l' || key == 'L' || key == KEY_PAGE_DOWN) {
+            if(++g_browser.calMonth > 12) { g_browser.calMonth = 1; ++g_browser.calYear; }
+            int days = cal_days_in_month(g_browser.calYear, g_browser.calMonth);
+            if(g_browser.calDay > days) g_browser.calDay = days;
+        }
+        render();
+        return;
+    }
+
+    if(key == 'q' || key == 27) {
+        // 有搜索/日期筛选时 Esc 逐层清除,全部清空后再按才返回主界面
+        if(key == 27 && !g_browser.query.empty()) {
+            g_browser.query.clear();
+            g_browser.sel = g_browser.scroll = 0;
+            browser_invalidate_full_text();
+            browser_rebuild_view();
+            render();
+            return;
+        }
+        if(key == 27 && !g_browser.filterDate.empty()) {
+            g_browser.filterDate.clear();
+            g_browser.sel = g_browser.scroll = 0;
+            browser_invalidate_full_text();
+            browser_rebuild_view();
+            render();
+            return;
+        }
+        goto_screen(Screen::Main);
+        return;
+    }
+    if(key == '/') {
+        g_browser.searchOpen = true;
+        render();
+        return;
+    }
+    if(key == 't' || key == 'T') {
+        std::string base = g_browser.filterDate;
+        if(base.empty()) {
+            const JournalEntry *sel = browser_selected_entry();
+            if(sel) base = sel->date;
+        }
+        time_t now = time(nullptr);
+        tm local {};
+        localtime_r(&now, &local);
+        int y = local.tm_year + 1900, m = local.tm_mon + 1, d = local.tm_mday;
+        if(base.size() >= 10) {
+            int py = atoi(base.substr(0, 4).c_str());
+            int pm = atoi(base.substr(5, 2).c_str());
+            int pd = atoi(base.substr(8, 2).c_str());
+            if(py >= 1970 && pm >= 1 && pm <= 12) {
+                y = py;
+                m = pm;
+                int days = cal_days_in_month(y, m);
+                d = (pd >= 1 && pd <= days) ? pd : 1;
+            }
+        }
+        g_browser.calYear = y;
+        g_browser.calMonth = m;
+        g_browser.calDay = d;
+        g_browser.calOpen = true;
+        render();
+        return;
+    }
+
+    const int total = (int)g_browser.view.size();
+    if(key == KEY_DOWN || key == 'j') {
+        if(g_browser.sel < total - 1) ++g_browser.sel;
+    }
+    if(key == KEY_UP || key == 'k') {
+        if(g_browser.sel > 0) --g_browser.sel;
+    }
+    const JournalEntry *sel = browser_selected_entry();
+    if(sel && (key == '\n' || key == '\r')) {
+        g_view_file = sel->filename;
+        g_viewer_scroll = 0;
+        goto_screen(Screen::Viewer);
+        return;
+    }
+    if(sel && (key == 'e' || key == 'E')) {
+        g_quick_slot = -1;
+        g_file_edit_path.clear();
+        g_edit_file = sel->filename;
+        g_prompt.clear();
+        goto_screen(Screen::Editor);
+        return;
+    }
+    if(sel && (key == 'h' || key == 'H')) {
+        open_history(sel->filename, Screen::Browser);
+        return;
+    }
+    if(sel && (key == 'd' || key == 'D')) g_browser_confirm_delete = true;
     render();
 }
 
@@ -7451,16 +8076,19 @@ static void vt_push_wave(int x, int y, int h, std::vector<lv_area_t> &out) {
     }
 }
 
-// 一行的反白底块与着重号小方点,推进绘制回调要用的矩形表。
+// 一行的反白底块与着重号小方点,推进绘制回调要用的矩形表。矩形表由调用方给:
+// 编辑器/阅读视图用全局那套,AI 聊天用自己的,互不串装饰。
 static void md_push_deco(const std::string &disp, const std::vector<MdPiece> &pieces,
-                         int line_y, int line_h, int letter_h, int letter_space) {
+                         int line_y, int line_h, int letter_h, int letter_space,
+                         std::vector<lv_area_t> &boxes, std::vector<lv_area_t> &dots,
+                         std::vector<lv_area_t> &waves) {
     for(const MdPiece &q : pieces) {
         if(q.hi <= q.lo) continue;
         int ry = line_y + q.row * line_h;
         int extra = q.faux_bold ? 1 : 0;
         if(q.st.invert)
-            g_md_box_rects.push_back({q.x, ry, q.x + q.w + extra - 1, ry + letter_h - 1});
-        if(q.st.wavy) md_push_wave(q.x, ry + letter_h - 3, q.w + extra, g_md_wave_rects);
+            boxes.push_back({q.x, ry, q.x + q.w + extra - 1, ry + letter_h - 1});
+        if(q.st.wavy) md_push_wave(q.x, ry + letter_h - 3, q.w + extra, waves);
         if(q.st.emph) {
             // 和 ESP32 一样落在字脚下面:基线再往下一个 descent,正好压住 em 框下沿
             int dy = ry + letter_h + 1;
@@ -7472,7 +8100,7 @@ static void md_push_deco(const std::string &disp, const std::vector<MdPiece> &pi
                     int w1 = (int)lv_text_get_width(disp.c_str() + q.lo, (uint32_t)((int)n - q.lo), q.font,
                                                     letter_space);
                     int cx = q.x + w0 + (w1 - w0 - 3) / 2;
-                    g_md_dot_rects.push_back({cx, dy, cx + 2, dy + 1});
+                    dots.push_back({cx, dy, cx + 2, dy + 1});
                 }
                 k = (int)n;
             }
@@ -7732,7 +8360,8 @@ static void editor_md_refresh() {
         }
 
         // 反白底块与着重号小方点:按排版碎片算好,交给内容层的绘制回调
-        md_push_deco(disp, pieces, y, line_h, letter_h, letter_space);
+        md_push_deco(disp, pieces, y, line_h, letter_h, letter_space,
+                     g_md_box_rects, g_md_dot_rects, g_md_wave_rects);
 
         for(const MdPiece &q : pieces) {
             int pw = g_md_max_w - q.x;
@@ -7889,17 +8518,20 @@ static void md_readonly_create(int x, int y, int w, int h) {
     lv_obj_add_event_cb(g_ro_content, editor_md_draw_deco, LV_EVENT_DRAW_MAIN, nullptr);
 }
 
-static void md_render_readonly(const std::string &text, int content_w, int line_space,
-                               std::vector<int> *line_y_out) {
-    if(!g_ro_view || !g_ro_content || content_w <= 0) return;
+// 把一段 Markdown 追加排到 content 的 start_y 处,返回排版后的新 y。标签/分隔线池
+// 和装饰矩形表由调用方给:阅读视图复用全局池(每帧整体覆盖),AI 聊天每次重建
+// 用自己那份,免得和编辑器/阅读视图互相串装饰。
+static int md_render_block(lv_obj_t *content, std::vector<lv_obj_t *> &labels,
+                           std::vector<lv_obj_t *> &rules, int &lbi, int &rbi, int start_y,
+                           const std::string &text, int content_w, int line_space,
+                           lv_color_t body_color, bool first_line_indent,
+                           std::vector<lv_area_t> &boxes, std::vector<lv_area_t> &dots,
+                           std::vector<lv_area_t> &waves, std::vector<int> *line_y_out) {
+    if(!content || content_w <= 0) return start_y;
     const lv_font_t *font = g_editor_font ? g_editor_font : lv_font_default();
     const int letter_space = 0;
     const int letter_h = lv_font_get_line_height(font);
     const int line_h = letter_h + line_space;
-
-    g_md_box_rects.clear();
-    g_md_dot_rects.clear();
-    g_md_wave_rects.clear();
 
     MdDoc doc;
     md_split_caret(text, 0, doc);
@@ -7907,13 +8539,13 @@ static void md_render_readonly(const std::string &text, int content_w, int line_
     md_code_flags(doc.lines, in_code);
     if(line_y_out) line_y_out->assign(doc.lines.size(), 0);
 
-    int lbi = 0, rbi = 0, y = 0;
+    int y = start_y;
     for(size_t i = 0; i < doc.lines.size(); ++i) {
         if(line_y_out) (*line_y_out)[i] = y;
         MdRender d = md_build_line(doc.lines[i], in_code[i] != 0, -1);
 
         if(d.rule) {
-            lv_obj_t *o = md_rule_in(g_ro_rules, g_ro_content, rbi++);
+            lv_obj_t *o = md_rule_in(rules, content, rbi++);
             lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
             lv_obj_set_pos(o, 0, y + letter_h / 2 - 1);
             lv_obj_set_size(o, content_w, 2);
@@ -7923,7 +8555,7 @@ static void md_render_readonly(const std::string &text, int content_w, int line_
 
         std::string disp = d.text;
         int indent_bytes = 0;
-        if(g_settings.first_line_indent() && !d.heading && !d.muted &&
+        if(first_line_indent && !d.heading && !d.muted &&
            d.prefix_bytes == 0 && in_code[i] == 0 && !disp.empty()) {
             disp = "\xe3\x80\x80\xe3\x80\x80" + disp;
             indent_bytes = 6;
@@ -7941,9 +8573,9 @@ static void md_render_readonly(const std::string &text, int content_w, int line_
         for(const MdPiece &q : pieces)
             if(q.row + 1 > rows) rows = q.row + 1;
         int h = rows * line_h + md_para_extra(doc.lines, i, in_code, line_h);
-        lv_color_t color = d.heading ? md_heading_color() : (d.muted ? g_theme.muted : g_theme.fg);
+        lv_color_t color = d.heading ? md_heading_color() : (d.muted ? g_theme.muted : body_color);
 
-        md_push_deco(disp, pieces, y, line_h, letter_h, letter_space);
+        md_push_deco(disp, pieces, y, line_h, letter_h, letter_space, boxes, dots, waves);
 
         for(const MdPiece &q : pieces) {
             int pw = content_w - q.x;
@@ -7954,7 +8586,7 @@ static void md_render_readonly(const std::string &text, int content_w, int line_
             if(q.st.strike) decor |= LV_TEXT_DECOR_STRIKETHROUGH;
             int nlab = q.faux_bold ? 2 : 1;
             for(int d2 = 0; d2 < nlab; ++d2) {
-                lv_obj_t *o = md_label_in(g_ro_labels, g_ro_content, lbi++, q.font, letter_space, line_space);
+                lv_obj_t *o = md_label_in(labels, content, lbi++, q.font, letter_space, line_space);
                 lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
                 lv_obj_set_pos(o, q.x + d2, y + q.row * line_h);
                 lv_obj_set_size(o, pw, letter_h);
@@ -7965,9 +8597,24 @@ static void md_render_readonly(const std::string &text, int content_w, int line_
         }
         y += h;
     }
+    return y;
+}
+
+static void md_render_readonly(const std::string &text, int content_w, int line_space,
+                               std::vector<int> *line_y_out) {
+    if(!g_ro_view || !g_ro_content || content_w <= 0) return;
+    g_md_box_rects.clear();
+    g_md_dot_rects.clear();
+    g_md_wave_rects.clear();
+
+    int lbi = 0, rbi = 0;
+    int y = md_render_block(g_ro_content, g_ro_labels, g_ro_rules, lbi, rbi, 0, text, content_w,
+                            line_space, g_theme.fg, g_settings.first_line_indent(),
+                            g_md_box_rects, g_md_dot_rects, g_md_wave_rects, line_y_out);
 
     for(int k = lbi; k < (int)g_ro_labels.size(); ++k) lv_obj_add_flag(g_ro_labels[k], LV_OBJ_FLAG_HIDDEN);
     for(int k = rbi; k < (int)g_ro_rules.size(); ++k) lv_obj_add_flag(g_ro_rules[k], LV_OBJ_FLAG_HIDDEN);
+    int letter_h = lv_font_get_line_height(g_editor_font ? g_editor_font : lv_font_default());
     lv_obj_set_height(g_ro_content, y > 0 ? y : letter_h);
     // 滚动范围是按子对象坐标算的,先把这一层排完版,调用方再滚动
     lv_obj_update_layout(g_ro_view);
@@ -8927,6 +9574,621 @@ static bool polish_panel_key(int key) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// AI 聊天:编辑器里 Ctrl+W(快捷菜单「问 AI」)。浮窗底部输入框,Enter 发给
+// DeepSeek;请求跑在后台线程,主循环 tick 里回收结果,等待时界面不冻。
+// 打开时会抓当前选区(没有选区就整篇正文)作为上下文一起发过去。
+// ---------------------------------------------------------------------------
+
+static std::string ai_chat_trim_utf8(const std::string &s, size_t max_bytes) {
+    if(s.size() <= max_bytes) return s;
+    size_t n = max_bytes;
+    while(n > 0 && ((unsigned char)s[n] & 0xC0) == 0x80) --n;
+    return s.substr(0, n);
+}
+
+// 会话区的装饰(反白底块/着重号/书名波浪线)画在 content 自己的图层上,
+// 坐标是 content 局部坐标,绘制时再加层原点。
+static void ai_chat_draw_deco(lv_event_t *e) {
+    lv_layer_t *layer = lv_event_get_layer(e);
+    if(!layer) return;
+    lv_obj_t *o = lv_event_get_current_target_obj(e);
+    if(!o) return;
+    lv_area_t org;
+    lv_obj_get_coords(o, &org);
+    lv_draw_rect_dsc_t dsc;
+    lv_draw_rect_dsc_init(&dsc);
+    dsc.radius = 0;
+    dsc.border_width = 0;
+    dsc.bg_color = g_theme.fg;
+    dsc.bg_opa = LV_OPA_COVER;
+    for(const std::vector<lv_area_t> *tbl : {&g_ai_chat.boxes, &g_ai_chat.dots, &g_ai_chat.waves}) {
+        for(const lv_area_t &a : *tbl) {
+            lv_area_t r{a.x1 + org.x1, a.y1 + org.y1, a.x2 + org.x1, a.y2 + org.y1};
+            lv_draw_rect(layer, &dsc, &r);
+        }
+    }
+}
+
+// 会话区:外层可滚动,内层 content 放排版碎片。
+static void ai_chat_view_build(lv_obj_t *parent, int x, int y, int w, int h) {
+    g_ai_chat.view = lv_obj_create(parent);
+    lv_obj_set_pos(g_ai_chat.view, x, y);
+    lv_obj_set_size(g_ai_chat.view, w, h);
+    base_style(g_ai_chat.view);
+    lv_obj_set_style_radius(g_ai_chat.view, 0, 0);
+    lv_obj_set_style_border_width(g_ai_chat.view, 1, 0);
+    lv_obj_set_style_pad_all(g_ai_chat.view, 0, 0);
+    lv_obj_set_style_shadow_width(g_ai_chat.view, 0, 0);
+    lv_obj_set_scrollbar_mode(g_ai_chat.view, LV_SCROLLBAR_MODE_OFF);
+
+    const int pad = ui_px(8);
+    g_ai_chat.content = lv_obj_create(g_ai_chat.view);
+    lv_obj_set_pos(g_ai_chat.content, pad, pad);
+    lv_obj_set_size(g_ai_chat.content, w - 2 * pad, h - 2 * pad);
+    lv_obj_set_style_radius(g_ai_chat.content, 0, 0);
+    lv_obj_set_style_border_width(g_ai_chat.content, 0, 0);
+    lv_obj_set_style_pad_all(g_ai_chat.content, 0, 0);
+    lv_obj_set_style_shadow_width(g_ai_chat.content, 0, 0);
+    lv_obj_set_style_bg_opa(g_ai_chat.content, LV_OPA_TRANSP, 0);
+    // 同编辑器:内容层不自滚,否则伪粗体多出的 1px 会冒出假滚动条
+    lv_obj_remove_flag(g_ai_chat.content, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(g_ai_chat.content, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_add_event_cb(g_ai_chat.content, ai_chat_draw_deco, LV_EVENT_DRAW_MAIN, nullptr);
+}
+
+// 问句颜色从当前主题取:优先标题色;个别主题(高对比)标题色和正文同值,依次退回
+// 强调色、次要色,保证问与答在每种主题下都能分开。不写死色值,换主题自动跟着变。
+static lv_color_t ai_chat_question_color() {
+    if(!lv_color_eq(g_theme.heading, g_theme.fg)) return g_theme.heading;
+    if(!lv_color_eq(g_theme.accent, g_theme.fg)) return g_theme.accent;
+    return g_theme.muted;
+}
+
+// 重建整段会话:问题用主题的强调色,回答按 Markdown 排版(正文 fg,标题/引用
+// 沿用各自颜色)。会话不长,直接清空重排最省心。
+static void ai_chat_rebuild_msgs() {
+    if(!g_ai_chat.content) return;
+    lv_obj_clean(g_ai_chat.content);  // 标签池会跟着失效,先清池
+    g_ai_chat.labels.clear();
+    g_ai_chat.rules.clear();
+    g_ai_chat.boxes.clear();
+    g_ai_chat.dots.clear();
+    g_ai_chat.waves.clear();
+    const lv_font_t *font = g_editor_font ? g_editor_font : lv_font_default();
+    const int inner_w = lv_obj_get_width(g_ai_chat.content);
+    const int gap = ui_px(10);
+    int y = 0, lbi = 0, rbi = 0;
+    for(const AiChatTurn &m : ai_cur().msgs) {
+        const bool user = m.role == "user";
+        const bool error = m.role == "error";
+        lv_obj_t *rl = label_raw(g_ai_chat.content, user ? "你：" : (error ? "AI（出错）：" : "AI："),
+                                 0, y, inner_w);
+        lv_obj_set_style_text_font(rl, font, 0);
+        lv_obj_set_style_text_color(rl, user ? ai_chat_question_color() : g_theme.muted, 0);
+        lv_obj_update_layout(rl);
+        y += lv_obj_get_height(rl);
+        if(user) {
+            lv_obj_t *tl = label_raw(g_ai_chat.content, m.content, 0, y, inner_w);
+            lv_obj_set_style_text_font(tl, font, 0);
+            lv_obj_set_style_text_color(tl, ai_chat_question_color(), 0);
+            lv_obj_update_layout(tl);
+            y += lv_obj_get_height(tl);
+        } else {
+            y = md_render_block(g_ai_chat.content, g_ai_chat.labels, g_ai_chat.rules, lbi, rbi, y,
+                                m.content, inner_w, k_md_line_space,
+                                error ? g_theme.muted : g_theme.fg, false,
+                                g_ai_chat.boxes, g_ai_chat.dots, g_ai_chat.waves, nullptr);
+        }
+        y += gap;
+    }
+    int letter_h = lv_font_get_line_height(font);
+    lv_obj_set_height(g_ai_chat.content, y > 0 ? y : letter_h);
+    lv_obj_update_layout(g_ai_chat.view);
+}
+
+static void ai_chat_scroll_bottom() {
+    if(!g_ai_chat.view) return;
+    lv_obj_update_layout(g_ai_chat.view);
+    lv_obj_scroll_to_y(g_ai_chat.view, LV_COORD_MAX, LV_ANIM_OFF);
+}
+
+static void ai_chat_refresh_view() {
+    ai_chat_rebuild_msgs();
+    ai_chat_scroll_bottom();
+}
+
+// 会话标题取自首条用户消息的首行,只设一次。
+static void ai_session_set_title(AiChatSession &s, const std::string &text) {
+    if(!s.title.empty()) return;
+    size_t nl = text.find('\n');
+    std::string line = nl == std::string::npos ? text : text.substr(0, nl);
+    size_t b = line.find_first_not_of(" \t\r\n");
+    if(b == std::string::npos) return;
+    size_t e = line.find_last_not_of(" \t\r\n");
+    s.title = ai_chat_trim_utf8(line.substr(b, e - b + 1), 30);
+}
+
+// 左侧会话列表:标题 + 当前高亮。列表比视口高时可滚。
+static void ai_chat_side_build(int x, int y, int w, int h) {
+    lv_obj_t *parent = g_ai_chat.io_parent;
+    if(!parent) return;
+    if(!g_ai_chat.side) {
+        g_ai_chat.side = lv_obj_create(parent);
+        base_style(g_ai_chat.side);
+        lv_obj_set_style_radius(g_ai_chat.side, 0, 0);
+        lv_obj_set_style_border_width(g_ai_chat.side, 1, 0);
+        lv_obj_set_style_pad_all(g_ai_chat.side, 0, 0);
+        lv_obj_set_style_shadow_width(g_ai_chat.side, 0, 0);
+        lv_obj_set_scroll_dir(g_ai_chat.side, LV_DIR_VER);
+        lv_obj_set_scrollbar_mode(g_ai_chat.side, LV_SCROLLBAR_MODE_AUTO);
+    }
+    lv_obj_clear_flag(g_ai_chat.side, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_pos(g_ai_chat.side, x, y);
+    lv_obj_set_size(g_ai_chat.side, w, h);
+    lv_obj_clean(g_ai_chat.side);
+
+    const lv_font_t *font = g_editor_font ? g_editor_font : lv_font_default();
+    const int pad = ui_px(6);
+    const int iw = w - 2 * pad;
+    int yy = pad;
+    lv_obj_t *hd = label_raw(g_ai_chat.side, "会话", pad, yy, iw);
+    lv_obj_set_style_text_font(hd, font, 0);
+    lv_obj_set_style_text_color(hd, g_theme.muted, 0);
+    lv_obj_update_layout(hd);
+    yy += lv_obj_get_height(hd) + ui_px(4);
+
+    const int item_h = ui_line_h() + ui_px(6);
+    for(int i = 0; i < (int)g_ai_sessions.size(); ++i) {
+        const bool active = i == g_ai_cur;
+        const bool cursor = g_ai_focus_list && i == g_ai_sel;
+        std::string t = g_ai_sessions[i].title.empty() ? "新会话" : g_ai_sessions[i].title;
+        std::string line = (cursor ? "▸ " : (active ? "• " : "  ")) + t;
+        lv_obj_t *it = lv_label_create(g_ai_chat.side);
+        lv_label_set_long_mode(it, LV_LABEL_LONG_DOT);
+        lv_label_set_text(it, line.c_str());
+        lv_obj_set_pos(it, pad, yy);
+        lv_obj_set_size(it, iw, item_h);
+        lv_obj_set_style_text_font(it, font, 0);
+        lv_obj_set_style_text_color(it, cursor ? ai_chat_question_color() : (active ? g_theme.accent : g_theme.fg), 0);
+        lv_obj_remove_flag(it, LV_OBJ_FLAG_SCROLLABLE);
+        yy += item_h;
+    }
+    lv_obj_update_layout(g_ai_chat.side);
+}
+
+// 按 g_ai_show_sessions 重排:会话区与输入框要么占满,要么让出左侧四分之一。
+static void ai_chat_apply_layout() {
+    if(!g_ai_chat.view) return;
+    const int gap = ui_px(8);
+    const int ax = g_ai_chat.area_x, ay = g_ai_chat.area_y, aw = g_ai_chat.area_w;
+    int chat_x = ax, chat_w = aw;
+    if(g_ai_show_sessions) {
+        const int side_w = aw / 4;
+        chat_x = ax + side_w + gap;
+        chat_w = aw - side_w - gap;
+        ai_chat_side_build(ax, ay, side_w, g_ai_chat.view_h);
+    } else if(g_ai_chat.side) {
+        lv_obj_add_flag(g_ai_chat.side, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_set_pos(g_ai_chat.view, chat_x, ay);
+    lv_obj_set_size(g_ai_chat.view, chat_w, g_ai_chat.view_h);
+    const int pad = ui_px(8);
+    if(g_ai_chat.content) lv_obj_set_size(g_ai_chat.content, chat_w - 2 * pad, g_ai_chat.view_h - 2 * pad);
+    if(g_ai_chat.input) {
+        lv_obj_set_pos(g_ai_chat.input, chat_x, g_ai_chat.input_y);
+        lv_obj_set_size(g_ai_chat.input, chat_w, g_ai_chat.input_h);
+    }
+    ai_chat_refresh_view();
+}
+
+// 焦点在列表还是输入框(仅列表展开时有意义)。输入框的 FOCUSED 态决定光标显隐。
+static void ai_chat_set_focus(bool list) {
+    g_ai_focus_list = list && g_ai_show_sessions;
+    if(!g_ai_chat.input) return;
+    if(g_ai_focus_list) {
+        lv_obj_clear_state(g_ai_chat.input, LV_STATE_FOCUSED);
+    } else {
+        lv_obj_add_state(g_ai_chat.input, LV_STATE_FOCUSED);
+        lv_group_focus_obj(g_ai_chat.input);
+    }
+}
+
+// 新建空会话并切过去,焦点回到输入框。
+static void ai_chat_new_session() {
+    g_ai_sessions.emplace_back();
+    g_ai_cur = (int)g_ai_sessions.size() - 1;
+    g_ai_sel = g_ai_cur;
+    ai_chat_set_focus(false);
+    ai_chat_apply_layout();
+}
+
+// 删除第 i 个会话;只剩一个时清空它,始终保留一个空会话。
+static void ai_session_delete(int i) {
+    if(i < 0 || i >= (int)g_ai_sessions.size()) return;
+    if(g_ai_sessions.size() == 1) {
+        g_ai_sessions[0] = AiChatSession{};
+        if(g_ai_pending_idx == 0) {
+            g_ai_chat.pending = false;
+            g_ai_pending_idx = -1;
+        }
+        g_ai_cur = 0;
+        g_ai_sel = 0;
+    } else {
+        g_ai_sessions.erase(g_ai_sessions.begin() + i);
+        if(g_ai_pending_idx == i) {
+            g_ai_chat.pending = false;
+            g_ai_pending_idx = -1;
+        } else if(g_ai_pending_idx > i) {
+            --g_ai_pending_idx;
+        }
+        if(g_ai_cur > i) --g_ai_cur;
+        if(g_ai_sel > i) --g_ai_sel;
+        const int n = (int)g_ai_sessions.size();
+        if(g_ai_cur >= n) g_ai_cur = n - 1;
+        if(g_ai_sel >= n) g_ai_sel = n - 1;
+    }
+    ai_chat_apply_layout();
+    ai_chat_status("已删除会话");
+}
+
+static std::string ai_chat_body() {
+    std::string sys = "你是一个友好的中文 AI 助手，正在协助用户写日记。回答简洁、实用，直接给内容，不必客套。";
+    if(!g_ai_chat.context.empty())
+        sys += "\n\n用户当前正在编辑的日记内容（供参考）：\n" + g_ai_chat.context;
+    std::string body = "{\"model\":\"deepseek-chat\",\"messages\":[";
+    body += "{\"role\":\"system\",\"content\":\"" + json_escape(sys) + "\"}";
+    for(const auto &t : ai_cur().turns)
+        body += ",{\"role\":\"" + t.role + "\",\"content\":\"" + json_escape(t.content) + "\"}";
+    body += "],\"max_tokens\":1024,\"temperature\":0.7}";
+    return body;
+}
+
+static void ai_chat_worker(std::string body) {
+    std::string out, err;
+    bool ok = deepseek_chat(body, out, err);
+    {
+        std::lock_guard<std::mutex> lock(g_ai_req_mutex);
+        g_ai_req_text = ok ? out : std::string();
+        g_ai_req_error = ok ? std::string() : err;
+    }
+    g_ai_req_ready.store(true, std::memory_order_release);
+    g_ai_req_busy.store(false, std::memory_order_release);
+}
+
+static std::string ai_chat_hint() {
+    return g_ai_chat.fullscreen ? "Enter 发送 · Ctrl+J 新会话 · Ctrl+H 列表 · Ctrl+L 清空 · Esc 返回"
+                                : "Enter 发送 · Ctrl+J 新会话 · Ctrl+H 列表 · Ctrl+L 清空 · Esc 关闭";
+}
+
+// 浮窗有自己的一行提示,状态信息写到那里,别去占用编辑器底部的状态栏;
+// 全屏聊天页没有额外提示行,仍走状态栏。
+static void ai_chat_status(const std::string &text) {
+    if(g_ai_chat.fullscreen) { set_status(text); return; }
+    if(g_ai_chat.hint) lv_label_set_text(g_ai_chat.hint, text.c_str());
+}
+
+static void ai_chat_close() {
+    const bool fullscreen = g_ai_chat.fullscreen;
+    if(g_ai_chat.panel) lv_obj_delete(g_ai_chat.panel);  // 子控件(view/side/input)随之释放
+    g_ai_chat.panel = nullptr;
+    g_ai_chat.side = nullptr;
+    g_ai_chat.view = nullptr;
+    g_ai_chat.input = nullptr;
+    g_ai_chat.hint = nullptr;
+    g_ai_chat.content = nullptr;
+    g_ai_chat.io_parent = nullptr;
+    g_ai_chat.open = false;
+    g_ai_chat.pending = false;
+    g_ai_chat.fullscreen = false;
+    g_ai_focus_list = false;
+    g_ai_pending_idx = -1;
+    g_linux_ime.set_active(g_ai_chat.ime_saved);
+    if(fullscreen) {
+        goto_screen(Screen::Main);
+        // 别让聊天页变成 Help 的返回目标
+        g_prev_screen = Screen::Main;
+        return;
+    }
+    if(g_editor) lv_group_focus_obj(g_editor);
+    update_ime_bar();
+    set_status(editor_status_text());
+}
+
+static void ai_chat_open(bool fullscreen) {
+    if(g_ai_chat.open) return;
+    if(!fullscreen && !g_editor) return;
+    g_linux_ime.cancel_composition();
+    // 会话常驻内存:重新打开沿用上次的会话列表,不会清空(Ctrl+J 才是新会话)。
+    if(g_ai_sessions.empty()) g_ai_sessions.emplace_back();
+    if(g_ai_cur < 0 || g_ai_cur >= (int)g_ai_sessions.size()) g_ai_cur = 0;
+    g_ai_sel = g_ai_cur;
+    g_ai_focus_list = false;  // 打开时焦点在输入框
+    g_ai_chat.context.clear();
+    g_ai_chat.context_label.clear();
+    if(!fullscreen) {
+        std::string sel = editor_selected_text();
+        const char *t = lv_textarea_get_text(g_editor);
+        std::string draft = t ? t : "";
+        if(!sel.empty()) {
+            g_ai_chat.context = ai_chat_trim_utf8(sel, 16000);
+            g_ai_chat.context_label = "选区";
+        } else if(draft.find_first_not_of(" \t\r\n") != std::string::npos) {
+            g_ai_chat.context = ai_chat_trim_utf8(draft, 16000);
+            g_ai_chat.context_label = "全文";
+        }
+    }
+    g_ai_chat.ime_saved = g_linux_ime.active();
+    g_linux_ime.set_active(true);
+    if(fullscreen) {
+        g_ai_chat.pending = false;
+        goto_screen(Screen::AiChat);  // 控件由 render_ai_chat 建
+        return;
+    }
+    g_ai_chat.open = true;
+    g_ai_chat.pending = false;
+
+    g_ai_chat.panel = box(g_root, 60, 30, 904, 496, false);
+    lv_obj_set_style_bg_color(g_ai_chat.panel, g_theme.bg, 0);
+    lv_obj_set_style_border_width(g_ai_chat.panel, 2, 0);
+    label(g_ai_chat.panel, "问 ai", 8, 8, 300, 32);
+    if(!g_ai_chat.context_label.empty()) {
+        lv_obj_t *ctx = label(g_ai_chat.panel, "上下文: " + g_ai_chat.context_label, 440, 8, 450, 32);
+        lv_obj_set_style_text_align(ctx, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_set_style_text_color(ctx, g_theme.muted, 0);
+    }
+
+    // 会话区是自绘 Markdown 排版层,输入只看底部输入框。
+    ai_chat_view_build(g_ai_chat.panel, 8, 44, 888, 352);
+    g_ai_chat.io_parent = g_ai_chat.panel;
+    g_ai_chat.area_x = 8;
+    g_ai_chat.area_y = 44;
+    g_ai_chat.area_w = 888;
+    g_ai_chat.view_h = 352;
+    g_ai_chat.input_y = 404;
+    g_ai_chat.input_h = 48;
+
+    g_ai_chat.input = lv_textarea_create(g_ai_chat.panel);
+    lv_obj_set_pos(g_ai_chat.input, 8, 404);
+    lv_obj_set_size(g_ai_chat.input, 888, 48);
+    base_style(g_ai_chat.input);
+    lv_obj_set_style_border_width(g_ai_chat.input, 1, 0);
+    lv_textarea_set_one_line(g_ai_chat.input, true);
+    lv_textarea_set_placeholder_text(g_ai_chat.input, "输入问题，Enter 发送");
+    lv_obj_add_state(g_ai_chat.input, LV_STATE_FOCUSED);
+    lv_group_focus_obj(g_ai_chat.input);
+    g_ai_chat.hint = label(g_ai_chat.panel, ai_chat_hint(), 8, 458, 888, 28);
+    lv_obj_set_style_text_color(g_ai_chat.hint, g_theme.muted, 0);
+    ai_chat_apply_layout();
+    lv_obj_move_foreground(g_ai_chat.panel);
+
+    update_ime_bar();
+}
+
+// 全屏聊天页(主界面入口):控件重建时从 msgs 重排整段会话,换主题/重绘不丢。
+static void render_ai_chat() {
+    // clear_root 会清掉 open/pending,重绘时把在途请求状态带过去,别把回答弄丢
+    const bool keep_pending = g_ai_chat.pending;
+    const int keep_idx = g_ai_pending_idx;
+    clear_root();
+    g_ai_chat.open = true;
+    g_ai_chat.fullscreen = true;
+    g_ai_chat.panel = nullptr;
+    g_ai_chat.pending = keep_pending;
+    g_ai_pending_idx = keep_idx;
+    const int w = screen_w() - 16;
+    label(g_root, "问 ai", 8, 8, 300, 32);
+    if(!g_ai_chat.context_label.empty()) {
+        lv_obj_t *ctx = label(g_root, "上下文: " + g_ai_chat.context_label, screen_w() - 8 - 450, 8, 450, 32);
+        lv_obj_set_style_text_align(ctx, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_set_style_text_color(ctx, g_theme.muted, 0);
+    }
+    const int input_h = 48;
+    const int gap = ui_px(8);
+    const int view_y = 44;
+    int view_h = chrome_bottom() - view_y - input_h - gap;
+    if(view_h < ui_line_h() * 3) view_h = ui_line_h() * 3;
+
+    ai_chat_view_build(g_root, 8, view_y, w, view_h);
+    g_ai_chat.io_parent = g_root;
+    g_ai_chat.area_x = 8;
+    g_ai_chat.area_y = view_y;
+    g_ai_chat.area_w = w;
+    g_ai_chat.view_h = view_h;
+    g_ai_chat.input_y = view_y + view_h + gap;
+    g_ai_chat.input_h = input_h;
+
+    g_ai_chat.input = lv_textarea_create(g_root);
+    lv_obj_set_pos(g_ai_chat.input, 8, view_y + view_h + gap);
+    lv_obj_set_size(g_ai_chat.input, w, input_h);
+    base_style(g_ai_chat.input);
+    lv_obj_set_style_border_width(g_ai_chat.input, 1, 0);
+    lv_textarea_set_one_line(g_ai_chat.input, true);
+    lv_textarea_set_placeholder_text(g_ai_chat.input, "输入问题，Enter 发送");
+    lv_obj_add_state(g_ai_chat.input, LV_STATE_FOCUSED);
+    lv_group_focus_obj(g_ai_chat.input);
+
+    ai_chat_apply_layout();
+    ai_chat_set_focus(g_ai_focus_list);  // 重绘后按原焦点恢复光标
+    draw_status_bar(ai_chat_hint());
+    update_ime_bar();
+}
+
+static void ai_chat_send() {
+    if(!g_ai_chat.input) return;
+    if(g_ai_req_busy.load() || g_ai_chat.pending) {
+        ai_chat_status("AI 思考中…");
+        return;
+    }
+    std::string text = lv_textarea_get_text(g_ai_chat.input);
+    size_t b = text.find_first_not_of(" \t\r\n");
+    if(b == std::string::npos) return;
+    size_t e = text.find_last_not_of(" \t\r\n");
+    text = text.substr(b, e - b + 1);
+    lv_textarea_set_text(g_ai_chat.input, "");
+    AiChatSession &s = ai_cur();
+    s.turns.push_back({"user", text});
+    while(s.turns.size() > 20) s.turns.erase(s.turns.begin());
+    s.msgs.push_back({"user", text});
+    ai_session_set_title(s, text);
+    ai_chat_apply_layout();  // 会话标题可能刚生成,左侧列表要刷新
+    g_ai_chat.pending = true;
+    g_ai_pending_idx = g_ai_cur;
+    g_ai_req_ready.store(false, std::memory_order_relaxed);
+    g_ai_req_busy.store(true, std::memory_order_relaxed);
+    ai_chat_status("AI 思考中…");
+    std::thread(ai_chat_worker, ai_chat_body()).detach();
+}
+
+// 主线程节拍:后台线程置位后把结果贴回对应会话;聊天已关或会话已被清空就丢掉。
+static void ai_chat_poll() {
+    if(!g_ai_req_ready.load(std::memory_order_acquire)) return;
+    g_ai_req_ready.store(false, std::memory_order_relaxed);
+    const bool was_pending = g_ai_chat.pending;
+    const int idx = g_ai_pending_idx;
+    g_ai_pending_idx = -1;
+    g_ai_chat.pending = false;
+    if(!g_ai_chat.open || !was_pending) return;
+    std::string text, err;
+    {
+        std::lock_guard<std::mutex> lock(g_ai_req_mutex);
+        text = g_ai_req_text;
+        err = g_ai_req_error;
+    }
+    AiChatSession *s = (idx >= 0 && idx < (int)g_ai_sessions.size()) ? &g_ai_sessions[idx] : nullptr;
+    if(s) {
+        if(err.empty() && !text.empty()) {
+            s->turns.push_back({"assistant", text});
+            s->msgs.push_back({"assistant", text});
+        } else {
+            s->msgs.push_back({"error", err.empty() ? "无响应" : err});
+        }
+    }
+    // 仍停在发出请求的那个会话才重排;切到别的会话别把回答贴过来。
+    if(idx == g_ai_cur) ai_chat_apply_layout();
+    ai_chat_status(ai_chat_hint());
+}
+
+// 返回 true 表示浮窗已消费该键。
+static bool ai_chat_key(int key) {
+    if(!g_ai_chat.open) return false;
+    if(key == KEY_IME_TOGGLE) {
+        g_linux_ime.toggle();
+        update_ime_bar();
+        return true;
+    }
+    if(key == KEY_CTRL_J) {  // Ctrl+J 新会话
+        ai_chat_new_session();
+        ai_chat_status(ai_chat_hint());
+        return true;
+    }
+    if(key == KEY_CTRL_H) {  // Ctrl+H 显示/隐藏会话列表
+        g_ai_show_sessions = !g_ai_show_sessions;
+        if(g_ai_show_sessions) {
+            g_ai_sel = g_ai_cur;
+            ai_chat_set_focus(true);
+            ai_chat_status("会话列表:↑/↓ 选择 · Enter 进入 · d 删除 · n 新建 · Tab 切回");
+        } else {
+            ai_chat_set_focus(false);
+            ai_chat_status(ai_chat_hint());
+        }
+        ai_chat_apply_layout();
+        return true;
+    }
+    if(key == 0x0C) {  // Ctrl+L 清空当前会话
+        AiChatSession &s = ai_cur();
+        s.turns.clear();
+        s.msgs.clear();
+        s.title.clear();
+        // 在途回答作废:留着 pending 会让清空后突然冒出一条没有问题的回复
+        if(g_ai_pending_idx == g_ai_cur) {
+            g_ai_chat.pending = false;
+            g_ai_pending_idx = -1;
+        }
+        ai_chat_apply_layout();
+        ai_chat_status("已清空当前会话");
+        return true;
+    }
+    if(key == 27) {  // Esc 关闭聊天
+        ai_chat_close();
+        return true;
+    }
+
+    // 焦点在左侧会话列表
+    if(g_ai_show_sessions && g_ai_focus_list) {
+        const int n = (int)g_ai_sessions.size();
+        if(key == KEY_UP || key == KEY_DOWN) {
+            if(n > 0) {
+                g_ai_sel = (g_ai_sel + (key == KEY_UP ? -1 : 1) + n) % n;
+                ai_chat_apply_layout();
+            }
+            return true;
+        }
+        if(key == '\t') {  // 焦点回到输入框
+            ai_chat_set_focus(false);
+            ai_chat_apply_layout();
+            ai_chat_status(ai_chat_hint());
+            return true;
+        }
+        if(key == '\n' || key == '\r') {  // 进入选中的会话,焦点落到输入框
+            if(g_ai_sel >= 0 && g_ai_sel < n) g_ai_cur = g_ai_sel;
+            ai_chat_set_focus(false);
+            ai_chat_apply_layout();
+            ai_chat_status(ai_chat_hint());
+            return true;
+        }
+        if(key == 'd' || key == 'D') { ai_session_delete(g_ai_sel); return true; }
+        if(key == 'n' || key == 'N') {
+            ai_chat_new_session();
+            ai_chat_status(ai_chat_hint());
+            return true;
+        }
+        return true;  // 列表焦点吃掉其它键,别落进输入框
+    }
+
+    // 焦点在输入框
+    if(key == '\t') {  // 列表展开时切到列表,否则忽略
+        if(g_ai_show_sessions) {
+            g_ai_sel = g_ai_cur;
+            ai_chat_set_focus(true);
+            ai_chat_apply_layout();
+            ai_chat_status("会话列表:↑/↓ 选择 · Enter 进入 · d 删除 · n 新建 · Tab 切回");
+        }
+        return true;
+    }
+    std::string ime_out;
+    if(g_linux_ime.handle_key(key, ime_out)) {
+        if(!ime_out.empty() && g_ai_chat.input) lv_textarea_add_text(g_ai_chat.input, ime_out.c_str());
+        update_ime_bar();
+        return true;
+    }
+    if(key == '\n' || key == '\r') {
+        ai_chat_send();
+        return true;
+    }
+    // 对话区翻页:上翻内容往下挪,所以 PageUp 给正位移、PageDown 给负位移。
+    if(key == KEY_PAGE_UP || key == KEY_PAGE_DOWN || key == KEY_UP || key == KEY_DOWN) {
+        if(g_ai_chat.view) {
+            bool up = key == KEY_PAGE_UP || key == KEY_UP;
+            int step = (key == KEY_PAGE_UP || key == KEY_PAGE_DOWN)
+                           ? lv_obj_get_height(g_ai_chat.view) - ui_line_h()
+                           : ui_line_h() * 2;
+            lv_obj_scroll_by_bounded(g_ai_chat.view, 0, up ? step : -step, LV_ANIM_OFF);
+        }
+        return true;
+    }
+    if(!g_ai_chat.input) return true;
+    if(key == KEY_LEFT) lv_textarea_cursor_left(g_ai_chat.input);
+    else if(key == KEY_RIGHT) lv_textarea_cursor_right(g_ai_chat.input);
+    else if(key == KEY_HOME) lv_textarea_set_cursor_pos(g_ai_chat.input, 0);
+    else if(key == KEY_END) lv_textarea_set_cursor_pos(g_ai_chat.input, LV_TEXTAREA_CURSOR_LAST);
+    else if(key == 8 || key == 127) lv_textarea_delete_char(g_ai_chat.input);
+    else if(key >= 32 && key < 127) lv_textarea_add_char(g_ai_chat.input, (uint32_t)key);
+    update_ime_bar();
+    return true;
+}
+
+
 // 列内左右挪一格(dcol > 0 是往左一列),行内保持同一格位。
 static void vt_move_col(int dcol) {
     if(g_vt_data.cols.empty()) return;
@@ -9101,6 +10363,7 @@ static void handle_editor_keys(int key) {
         return;
     }
     if(g_polish_panel) { polish_panel_key(key); return; }
+    if(g_ai_chat.open) { ai_chat_key(key); return; }
     if(g_search_panel) {
         if(key == KEY_IME_TOGGLE) {
             g_linux_ime.toggle();
@@ -9237,6 +10500,7 @@ static void handle_editor_keys(int key) {
         return;
     }
     if(key == 0x0F) { polish_begin(); return; }
+    if(key == 0x17) { ai_chat_open(false); return; }   // Ctrl+W 问 AI
     if(key == 0x01 && g_editor) { g_ed_sel_anchor = 0; lv_textarea_set_cursor_pos(g_editor, LV_TEXTAREA_CURSOR_LAST); return; }
     if(key == 0x03 && g_editor) {
         if(g_ed_sel_anchor >= 0) {
@@ -9378,9 +10642,10 @@ static lv_obj_t *menu_panel(lv_obj_t *layer, int w, int h) {
 
 // 首行预览(最多 max_bytes 字节,不劈开 UTF-8 字符)。截断时补省略号。
 static std::string clip_preview(int idx, size_t max_bytes) {
-    const char *p = cliphist_text(idx);
-    if(!p) return "（空）";
-    const uint32_t len = cliphist_len(idx);
+    std::string data;
+    if(!cliphist_get(idx, data)) return "（空）";
+    const char *p = data.data();
+    const uint32_t len = (uint32_t)data.size();
     std::string out;
     uint32_t k = 0;
     bool cut = false;
@@ -9667,8 +10932,9 @@ static void clip_menu_handle(int key) {
     }
     if(key == '\n' || key == '\r') {
         if(count == 0) return;
-        std::string text(cliphist_text(g_clip_menu.sel), cliphist_len(g_clip_menu.sel));
-        const bool linewise = cliphist_linewise(g_clip_menu.sel);
+        std::string text;
+        bool linewise = false;
+        if(!cliphist_get(g_clip_menu.sel, text, &linewise)) return;
         // 用历史条目不算一次新的复制:只更新当前剪贴板,不重排历史。
         clipboard_set(text, linewise, false);
         clip_menu_close();
@@ -9690,6 +10956,7 @@ enum class ShortcutAction {
     History,
     Prompt,
     Polish,
+    AiChat,
     FileManager,
     Help,
     Exit,
@@ -9701,7 +10968,7 @@ struct ShortcutItem {
     const char *shortcut;
 };
 
-static ShortcutItem g_sc_items[12];
+static ShortcutItem g_sc_items[14];
 static int g_sc_count = 0;
 static int g_sc_sel = 0;
 static bool g_sc_active = false;
@@ -9722,7 +10989,7 @@ static bool editor_is_empty() {
 // 且候选正可用时,这一下轻点归输入法。
 static bool shortcut_menu_allowed() {
     if(g_editor_exit_asking) return false;
-    if(g_search_panel || g_polish_panel || g_file_panel_state.active) return false;
+    if(g_search_panel || g_polish_panel || g_ai_chat.open || g_file_panel_state.active) return false;
     if(g_settings.letterSelKey() == "lwin" && g_linux_ime.active() &&
        g_linux_ime.letter_sel_tap_available())
         return false;
@@ -9751,6 +11018,7 @@ static void sc_build() {
         sc_add(ShortcutAction::Prompt, "AI 提示词", "Ctrl+P");
     if(editor_has_selection()) sc_add(ShortcutAction::Polish, "AI 润色(选区)", "Ctrl+O");
     else if(!editor_is_empty()) sc_add(ShortcutAction::Polish, "AI 润色", "Ctrl+O");
+    sc_add(ShortcutAction::AiChat, "问 ai", "Ctrl+W");
     if(!g_file_edit_path.empty()) sc_add(ShortcutAction::FileManager, "文件管理器", "Ctrl+E");
     sc_add(ShortcutAction::Help, "帮助", "Ctrl+?");
     sc_add(ShortcutAction::Exit, "退出", "Ctrl+Q");
@@ -9867,6 +11135,7 @@ static void handle_key(int key) {
         case ShortcutAction::History: handle_key(0x19); break;
         case ShortcutAction::Prompt: handle_key(0x10); break;
         case ShortcutAction::Polish: handle_key(0x0F); break;
+        case ShortcutAction::AiChat: handle_key(0x17); break;
         case ShortcutAction::FileManager: handle_key(0x05); break;
         case ShortcutAction::Help: handle_key(KEY_HELP); break;
         case ShortcutAction::Exit: handle_key(0x11); break;
@@ -9921,6 +11190,7 @@ static void handle_key(int key) {
         open_quick_editor(key - KEY_FILE_BASE);
         return;
     }
+    if(g_screen == Screen::AiChat) { ai_chat_key(key); return; }
     if(key == KEY_HELP && g_screen != Screen::Editor) { g_screen = g_screen == Screen::Help ? g_prev_screen : Screen::Help; render(); return; }
     if(g_screen == Screen::Help) { if(key == KEY_HELP || key == 'q' || key == 27) goto_screen(g_prev_screen); return; }
     if(key == KEY_CTRL_I) { goto_screen(Screen::Inspiration); return; }
@@ -9951,6 +11221,7 @@ static void handle_key(int key) {
     case Screen::Flomo: break;   // 已在前面整键转给 flomo::handle_key
     case Screen::Terminal: break;  // 同上,已转给 terminal::handle_key
     case Screen::Help: break;
+    case Screen::AiChat: break;  // 已在前面整键转给 ai_chat_key
     }
     if(g_bl_osd_until) draw_backlight_osd();
 }
@@ -10013,6 +11284,22 @@ void app_ui_tick() {
     if(g_clip_menu.active || g_sc_active) return;
     if(g_screen == Screen::Flomo) { flomo::tick(); return; }
     if(g_screen == Screen::Terminal) { terminal::tick(); return; }
+    // AI 聊天:后台请求跑完的结果回到主线程再贴进浮窗(浮窗已关就丢弃)。
+    ai_chat_poll();
+    // 全文搜索逐批推进:每 ~30ms 处理一小批,进度写进状态栏;跑完再重绘结果。
+    if(g_screen == Screen::Browser && g_browser.scanActive) {
+        uint32_t tick = lv_tick_get();
+        if(g_browser.scanNextTick == 0 || (int32_t)(tick - g_browser.scanNextTick) >= 0) {
+            g_browser.scanNextTick = tick + 30;
+            browser_step_full_text_scan();
+            if(g_browser.scanActive) {
+                set_status("全文搜索 " + std::to_string(g_browser.scanDone) + "/" +
+                           std::to_string(g_browser.scanTotal) + "  Esc取消");
+            } else {
+                render();
+            }
+        }
+    }
     static uint32_t next_main_status_ms = 0;
     if(g_bl_osd_until && (int32_t)(lv_tick_get() - g_bl_osd_until) >= 0) backlight_osd_hide();
     if(g_screen == Screen::Main && g_status) {

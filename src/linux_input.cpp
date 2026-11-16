@@ -47,6 +47,8 @@ static constexpr int APP_KEY_HELP = 0xA3;
 static constexpr int APP_KEY_REDO = 0xA4;
 static constexpr int APP_KEY_IM_SWITCH = 0xA5;
 static constexpr int APP_KEY_WIN_V = 0xA6;  // Alt/GUI+V:打开剪贴板历史
+static constexpr int APP_KEY_CTRL_J = 0xA9;  // Ctrl+J:AI 聊天新建会话
+static constexpr int APP_KEY_CTRL_H = 0xAA;  // Ctrl+H:显示/隐藏 AI 会话列表
 // 修饰键单击(与 include/key_codes.h 的 KEY_MOD_TAP_* 一致):输入法拿它当字母选字键
 static constexpr int APP_KEY_MOD_TAP_LCTRL = 0xB0;
 static constexpr int APP_KEY_MOD_TAP_LGUI = 0xB1;
@@ -107,6 +109,9 @@ static std::atomic<bool> g_modifier_tap_live{false};
 
 static bool console_byte_swallowed(uint8_t ch) {
     if(g_ctrl_held.load() && ch == '\r') return true;
+    // Ctrl+H/Ctrl+J 的 tty 字节是 0x08/0x0A,会撞退格/回车;真正的组合键由
+    // console_modifier_thread 补发专用码(见下),这里的重复字节丢掉。
+    if(g_ctrl_held.load() && (ch == 0x08 || ch == 0x0A)) return true;
     // Alt/GUI+V:tty 可能只翻译出裸 'v',真正的事件由 console_modifier_thread 补发
     if((g_alt_held.load() || g_gui_held.load()) && (ch == 'v' || ch == 'V')) return true;
     if(!g_modifier_tap_live.load() || !g_shift_held.load()) return false;
@@ -151,6 +156,8 @@ static int map_key(int code, const InputState &st) {
         if(code == KEY_SPACE) return APP_KEY_IME_TOGGLE;
         if(code == KEY_ENTER) return APP_KEY_CTRL_ENTER;
         if(code == KEY_I) return APP_KEY_CTRL_I;
+        if(code == KEY_J) return APP_KEY_CTRL_J;  // 撞 Enter 的 0x0A,给专用码
+        if(code == KEY_H) return APP_KEY_CTRL_H;  // 撞 Backspace 的 0x08,给专用码
         if(code == KEY_SLASH) return APP_KEY_SEARCH;
         if(code == KEY_MINUS) return APP_KEY_FULLWIDTH_TOGGLE;
         if(code == KEY_F) return st.shift ? APP_KEY_TRAD_TOGGLE : 0x06;
@@ -494,6 +501,11 @@ static void console_modifier_thread(std::string device) {
         if(ev.value == 1 && ev.code == KEY_V && (g_alt_held.load() || g_gui_held.load())) {
             dispatch_key(APP_KEY_WIN_V);
             continue;
+        }
+        // Ctrl+J/Ctrl+H:tty 那头是 0x0A/0x08(会撞回车/退格),这里补发专用码。
+        if(ev.value == 1 && g_ctrl_held.load() && !g_shift_held.load()) {
+            if(ev.code == KEY_J) { dispatch_key(APP_KEY_CTRL_J); continue; }
+            if(ev.code == KEY_H) { dispatch_key(APP_KEY_CTRL_H); continue; }
         }
         if(g_ctrl_held && g_shift_held) {
             if(ev.code == KEY_F) dispatch_key(APP_KEY_TRAD_TOGGLE);

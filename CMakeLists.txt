@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(pjournal_lvgl VERSION 1.3.2 LANGUAGES C CXX)
+project(pjournal_lvgl VERSION 1.3.3 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -199,6 +199,7 @@ include(CTest)
 if(BUILD_TESTING)
     add_executable(pjournal-tests
         tests/test_utils.cpp
+        src/clip_history.cpp
         src/hash_utils.cpp
         src/journal_storage.cpp
         src/outline_model.cpp
