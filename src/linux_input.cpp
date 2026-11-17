@@ -49,6 +49,7 @@ static constexpr int APP_KEY_IM_SWITCH = 0xA5;
 static constexpr int APP_KEY_WIN_V = 0xA6;  // Alt/GUI+V:打开剪贴板历史
 static constexpr int APP_KEY_CTRL_J = 0xA9;  // Ctrl+J:AI 聊天新建会话
 static constexpr int APP_KEY_CTRL_H = 0xAA;  // Ctrl+H:显示/隐藏 AI 会话列表
+static constexpr int APP_KEY_ALT_W = 0xAB;   // Alt/GUI+W:模板日记取天气
 // 修饰键单击(与 include/key_codes.h 的 KEY_MOD_TAP_* 一致):输入法拿它当字母选字键
 static constexpr int APP_KEY_MOD_TAP_LCTRL = 0xB0;
 static constexpr int APP_KEY_MOD_TAP_LGUI = 0xB1;
@@ -114,6 +115,8 @@ static bool console_byte_swallowed(uint8_t ch) {
     if(g_ctrl_held.load() && (ch == 0x08 || ch == 0x0A)) return true;
     // Alt/GUI+V:tty 可能只翻译出裸 'v',真正的事件由 console_modifier_thread 补发
     if((g_alt_held.load() || g_gui_held.load()) && (ch == 'v' || ch == 'V')) return true;
+    // Alt/GUI+W 同理(tty 里是 ESC 'w' 或裸 'w')
+    if((g_alt_held.load() || g_gui_held.load()) && (ch == 'w' || ch == 'W')) return true;
     if(!g_modifier_tap_live.load() || !g_shift_held.load()) return false;
     if(ch == ' ') return true;
     return g_ctrl_held.load() && (ch == 0x06 || ch == 0x1A || ch == 0x1F);
@@ -152,6 +155,7 @@ static int letter_of(int code) {
 
 static int map_key(int code, const InputState &st) {
     if((st.alt || st.gui) && code == KEY_V) return APP_KEY_WIN_V;
+    if((st.alt || st.gui) && code == KEY_W) return APP_KEY_ALT_W;
     if(st.ctrl) {
         if(code == KEY_SPACE) return APP_KEY_IME_TOGGLE;
         if(code == KEY_ENTER) return APP_KEY_CTRL_ENTER;
@@ -309,6 +313,9 @@ static void console_input_thread() {
         // Alt+V 在 tty 里是 ESC 'v';修饰键线程已经补发 KEY_WIN_V,这里别再当成裸 Esc。
         if(seq.size() == 1 && seq[0] == 'v' && (g_alt_held.load() || g_gui_held.load()))
             continue;
+        // Alt+W 同理(ESC 'w')
+        if(seq.size() == 1 && seq[0] == 'w' && (g_alt_held.load() || g_gui_held.load()))
+            continue;
         int key = parse_csi_key(seq);
         dispatch_key(key ? key : 27);
     }
@@ -396,6 +403,7 @@ static void input_thread(std::string device) {
         // Alt/GUI+V 按住不放时内核会持续发 value==2 的重复事件;那会让刚弹出来的
         // 剪贴板菜单被反复开/关。这里只放行第一次按下。
         if(ev.value == 2 && (st.alt || st.gui) && ev.code == KEY_V) continue;
+        if(ev.value == 2 && (st.alt || st.gui) && ev.code == KEY_W) continue;
         int key = map_key(ev.code, st);
         dispatch_key(key);
     }
@@ -500,6 +508,11 @@ static void console_modifier_thread(std::string device) {
         // 事件(value==2)会把刚弹出的菜单立刻再关掉。
         if(ev.value == 1 && ev.code == KEY_V && (g_alt_held.load() || g_gui_held.load())) {
             dispatch_key(APP_KEY_WIN_V);
+            continue;
+        }
+        // Alt/GUI+W:模板日记取天气(tty 那头只翻译出裸 'w')
+        if(ev.value == 1 && ev.code == KEY_W && (g_alt_held.load() || g_gui_held.load())) {
+            dispatch_key(APP_KEY_ALT_W);
             continue;
         }
         // Ctrl+J/Ctrl+H:tty 那头是 0x0A/0x08(会撞回车/退格),这里补发专用码。

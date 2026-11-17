@@ -30,6 +30,7 @@ enum AppKey {
     KEY_BACKLIGHT_DOWN = 0xA8,
     KEY_CTRL_J = 0xA9,  // Ctrl+J:AI 聊天新建会话
     KEY_CTRL_H = 0xAA,  // Ctrl+H:显示/隐藏 AI 会话列表
+    KEY_ALT_W = 0xAB,   // Alt/GUI+W:模板日记里获取天气
     // 修饰键"单击"(按下后没按别的键就抬起)。输入法用它触发字母选字。
     KEY_MOD_TAP_LCTRL = 0xB0,
     KEY_MOD_TAP_LGUI = 0xB1,

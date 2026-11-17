@@ -8,6 +8,7 @@
 #include "font_manager.h"
 #include "hash_utils.h"
 #include "journal_storage.h"
+#include "journal_template.h"
 #include "key_codes.h"
 #include "linux_ime.h"
 #include "markdown.h"
@@ -19,6 +20,7 @@
 #include "text_utils.h"
 #include "vertical_layout.h"
 #include "webdav_sync.h"
+#include "weather_client.h"
 #include "wifi_manager.h"
 
 #include "IME.h"
@@ -118,12 +120,13 @@ struct Action {
 static const Action k_actions[] = {
     {'p', "提示写作", "\xF3\xB0\x8C\xB5", Screen::Editor},      // U+F0335 灯泡
     {'f', "自由写作", LV_SYMBOL_KEYBOARD, Screen::Editor},
+    {'m', "模板日记", "\xF3\xB0\xA0\xAE", Screen::Editor},      // U+F082E 笔记本
     {'v', "查看过往日记", "\xEF\x80\xAD", Screen::Browser},      // U+F02D 书
     {'w', "同步WebDAV", LV_SYMBOL_UPLOAD, Screen::Sync},
     {'t', "写作计划", "\xEE\x9A\x9C", Screen::Gtd},             // U+E69C 勾选框
     {'o', "大纲写作", "\xF3\xB0\x88\x9A", Screen::Outline},      // U+F021A 便签
     {'a', "问 ai", "\xF3\xB1\xAB\xB4", Screen::AiChat},    // U+F1AF4
-    {'m', "浮墨笔记", "\xF3\xB1\xAB\xB1", Screen::Flomo},   // U+F1AF1
+    {'n', "浮墨笔记", "\xF3\xB1\xAB\xB1", Screen::Flomo},   // U+F1AF1
     {'c', "终端", "\xEF\x84\xA0", Screen::Terminal},        // U+F120
     {'s', "设置", LV_SYMBOL_SETTINGS, Screen::Settings},
 };
@@ -286,6 +289,28 @@ static std::string g_prompt;
 static int g_quick_slot = -1;
 static std::string g_clipboard;
 static bool g_clipboard_linewise = false;
+
+// 模板日记会话:进入后正文来自 ~/Templates,Alt+W 取天气填 {{weather}}。
+static bool g_template_journal = false;
+static std::string g_template_content;
+static uint32_t g_template_gen = 0;
+static bool g_template_auto_weather_pending = false;
+
+// 天气后台请求:单飞行任务 + 代际号,结果回主线程再应用。
+static std::atomic<bool> g_weather_busy{false};
+static std::atomic<bool> g_weather_ready{false};
+static std::mutex g_weather_mutex;
+static WeatherResult g_weather_result;
+static uint32_t g_weather_gen = 0;
+static bool g_weather_auto = false;
+
+// 离开模板日记会话:清上下文并把代际号推进,让还在飞的天气结果作废。
+static void clear_template_session() {
+    g_template_journal = false;
+    g_template_content.clear();
+    g_template_auto_weather_pending = false;
+    ++g_template_gen;
+}
 
 // ── 过往日记:筛选/搜索 ──────────────────────────────────────────────
 static constexpr size_t kBrowserMaxSearchBytes = 128;
@@ -785,18 +810,31 @@ static const char *terminal_menu_icon() {
     return LV_SYMBOL_KEYBOARD;
 }
 
+// 模板日记图标 U+F082E(笔记本);旧字体缺字形时退回便签/文件图标。
+static const char *template_menu_icon() {
+    const lv_font_t *font = g_icon_font ? g_icon_font : LV_FONT_DEFAULT;
+    lv_font_glyph_dsc_t dsc {};
+    if(lv_font_get_glyph_dsc(font, &dsc, 0xF082E, 0)) return "\xF3\xB0\xA0\xAE";
+    if(lv_font_get_glyph_dsc(font, &dsc, 0xF249, 0)) return "\xef\x89\x89";
+    return LV_SYMBOL_FILE;
+}
+
 static const char *action_menu_icon(const Action &a) {
     if(a.screen == Screen::Flomo) return flomo_menu_icon();
     if(a.screen == Screen::Terminal) return terminal_menu_icon();
+    if(a.screen == Screen::Editor && a.key == 'm') return template_menu_icon();
     return a.symbol;
 }
 
-// 主菜单当前该显示的 k_actions 下标。「查看过往日记」在没有日记时跳过。
+// 主菜单当前该显示的 k_actions 下标。「查看过往日记」在没有日记时跳过,
+// 模板日记在模板选择「无」时跳过。
 static std::vector<int> main_action_indices(bool has_entries) {
     std::vector<int> idx;
+    const bool template_enabled = journal_template_enabled();
     const int n = (int)(sizeof(k_actions) / sizeof(k_actions[0]));
     for(int i = 0; i < n; ++i) {
         if(k_actions[i].key == 'v' && !has_entries) continue;
+        if(k_actions[i].key == 'm' && !template_enabled) continue;
         idx.push_back(i);
     }
     return idx;
@@ -835,6 +873,8 @@ static void editor_vt_refresh();
 static void editor_vt_create(int x, int y, int w, int h);
 static bool editor_vertical();
 static void editor_sel_style_plain();
+static void start_weather_fetch(bool auto_mode);
+static void weather_poll();
 static void ai_chat_open(bool fullscreen);
 static bool ai_chat_key(int key);
 static void ai_chat_status(const std::string &text);
@@ -2410,6 +2450,7 @@ static std::string editor_status_text() {
         mode = "文件 " + (slash == std::string::npos ? g_file_edit_path : g_file_edit_path.substr(slash + 1));
     }
     else if(!g_ol.editPath.empty()) mode = "大纲文件 " + g_ol.project;
+    else if(g_template_journal && g_edit_file.empty()) mode = "模板日记";
     else if(g_edit_file.empty()) mode = g_prompt.empty() ? "自由写作" : "提示写作";
     else mode = "编辑 " + g_edit_file;
     return mode;
@@ -3038,7 +3079,19 @@ static void render_editor() {
         // 打开已有日记时把「提示词」一并带回,否则保存时头部会被改写成「自由写作」
         g_prompt = journal_prompt(full);
     }
+    bool template_initialized = false;
+    if(initial.empty() && g_template_journal && g_edit_file.empty() && g_quick_slot < 0 &&
+       g_file_edit_path.empty() && g_ol.editPath.empty() && !g_template_content.empty()) {
+        initial = g_template_content;
+        template_initialized = true;
+    }
     if(!initial.empty()) lv_textarea_set_text(g_editor, initial.c_str());
+    if(template_initialized) {
+        // 模板第一行通常是标题位,光标直接落在行末方便接着写
+        size_t nl = initial.find('\n');
+        std::string first_line = initial.substr(0, nl == std::string::npos ? initial.size() : nl);
+        lv_textarea_set_cursor_pos(g_editor, utf8_char_count(first_line));
+    }
     lv_obj_add_state(g_editor, LV_STATE_FOCUSED);
     lv_group_focus_obj(g_editor);
     if(editor_vertical()) {
@@ -3062,6 +3115,11 @@ static void render_editor() {
     editor_mark_clean();
     if(g_editor_exit_asking) draw_editor_exit_confirm();
     editor_follow_cursor();
+    if(g_template_auto_weather_pending) {
+        g_template_auto_weather_pending = false;
+        // 恢复草稿顶掉了模板的话,正文里没有数据段,不必发请求
+        if(template_initialized) start_weather_fetch(true);
+    }
 }
 
 static int byte_to_char_pos(const std::string &s, size_t byte_pos) {
@@ -4521,6 +4579,13 @@ static std::vector<std::pair<std::string, std::string>> setting_options(const st
         return v;
     }
     if(k == "editor_orientation") return {{"horizontal", "横排"}, {"vertical", "竖排"}};
+    if(k == "journal_template") {
+        // 「无」关闭模板日记;其余是 ~/Templates 下的 Markdown 文件
+        std::vector<std::pair<std::string, std::string>> o = {{"__none__", "无"}};
+        for(const std::string &f : journal_template_list())
+            o.push_back({f, journal_template_display_name(f)});
+        return o;
+    }
     if(k == "editor_mode")
         return {{"normal", "正常"},
                 {"typewriter", "打字机"},
@@ -4595,6 +4660,15 @@ static std::string setting_current_value(const std::string &k) {
     if(k == "ime_doc_context") return g_settings.imeDocContext() ? "1" : "0";
     if(k == "ime_candidate_highlight") return g_settings.imeCandidateHighlight() ? "1" : "0";
     if(k == "editor_orientation") return editor_vertical() ? "vertical" : "horizontal";
+    if(k == "journal_template") {
+        // 空值/失效值都按「加载行为」显示列表里第一个模板
+        std::string sel = journal_template_selected();
+        auto list = journal_template_list();
+        if(sel == "__none__") return sel;
+        if(!sel.empty() && std::find(list.begin(), list.end(), sel) != list.end()) return sel;
+        return list.empty() ? "__none__" : list.front();
+    }
+    if(k == "weather_city") return g_settings.get("weather_city", "");
     if(k == "editor_mode") return g_settings.editor_mode();
     if(k == "vertical_ref_line_style") return g_settings.vertical_reference_line_style();
     if(k == "md_render") return g_settings.markdown_render() ? "1" : "0";
@@ -4686,6 +4760,8 @@ static std::vector<SetItem> settings_items() {
         {"font_italic_file", "斜体字体",
          g_settings.font_italic_file().empty() ? "(伪斜体)" : g_settings.font_italic_file()},
         {"journal_dir", "保存位置", g_settings.journal_dir()},
+        {"journal_template", "模板日记",
+         setting_option_label("journal_template", setting_current_value("journal_template"))},
         {"webdav_url", "WebDAV URL", g_settings.get("webdav_url", "")},
         {"webdav_user", "WebDAV 用户", g_settings.get("webdav_user", "")},
         {"webdav_pass", "WebDAV 密码", g_settings.get("webdav_pass", "").empty() ? "" : "******"},
@@ -4715,6 +4791,12 @@ static std::vector<SetItem> settings_items() {
         {"personal_hob", "个人爱好", g_settings.get("personal_hob", "").empty() ? "(未设置)" : "(已设置)"},
         {"editor_orientation", "文字方向", editor_vertical() ? "竖排" : "横排"},
     };
+    // 模板日记关闭时天气地区没有意义,整项隐藏
+    if(journal_template_enabled()) {
+        auto tpl = std::find_if(v.begin(), v.end(),
+                                [](const SetItem &it) { return it.key == "journal_template"; });
+        v.insert(tpl + 1, {"weather_city", "天气地区", g_settings.get("weather_city", "")});
+    }
     // 机器上没有 rkwifi 控制口(开发机)就不显示电源开关,免得留一个按了没反应的项
     if(!g_wifi.power_control_available())
         for(auto it = v.begin(); it != v.end(); ++it)
@@ -5107,12 +5189,13 @@ static void render_sync() {
 static void render_help() {
     clear_root();
     static const char *help[] = {
-        "主界面: p提示写作 f自由写作 v查看 w同步WebDAV t写作计划 o大纲 a问ai s设置 Ctrl+Q退出",
+        "主界面: p提示写作 f自由写作 m模板日记 n浮墨笔记 v查看 w同步WebDAV t写作计划 o大纲 a问ai s设置 Ctrl+Q退出",
         "通用: hjkl/方向键移动 Enter确认 Esc/q返回 Ctrl+I灵感",
         "编辑: Ctrl+S保存 Ctrl+Q退出 Ctrl+A全选 Ctrl+C复制 Ctrl+X剪切 Ctrl+V粘贴 Alt+V历史",
         "编辑: Ctrl+Z撤销 Ctrl+R重做 Ctrl+Y历史 Ctrl+/查找替换 Ctrl+?帮助 单按左Win快捷菜单",
         "查找: Enter下一处 Ctrl+Enter上一处 Tab切查找/替换 Ctrl+R替换 Ctrl+A全部替换 Esc关闭",
         "编辑: Ctrl+P生成提示(仅日记模式) Ctrl+O润色(有选区只润色选区) Ctrl+W问AI Ctrl+F发送Flomo",
+        "模板日记: Alt+W获取天气填入{{weather}}；联网时会自动获取",
         "问AI: Enter发送 Ctrl+J新会话 Ctrl+H会话列表(↑↓选 Enter进入 d删 n新建 Tab切焦点) Ctrl+L清空 Esc关闭",
         "润色: Shift+方向键/Ctrl+A选文本 Enter应用 R改指令重润色 Esc取消",
         "编辑: Ctrl+T折叠/展开光标所在的标题(Markdown渲染开启时)",
@@ -5126,7 +5209,7 @@ static void render_help() {
         "WiFi: Tab扫描/已保存 r刷新 Enter连接/选择 d删保存 x断开 c重连",
         "灵感: Ctrl+I进入 a添加 Enter编辑 k关键词 /检索 c复制 d删除 q返回",
         "词库: 设置→词库管理 a添加 d删除 /检索 Space多选 Tab切换词库",
-        "设置: 主题/字号/字体/保存位置/WebDAV/输入法/WiFi/Markdown",
+        "设置: 主题/字号/字体/保存位置/模板日记/天气地区/WebDAV/输入法/WiFi/Markdown",
         "Linux版: TTF/OTF优先从 ~/.fonts 加载;文本与文件均为 UTF-8。",
     };
     label(g_root, "快捷键帮助", 8, 8, 1008, 32);
@@ -5374,6 +5457,7 @@ static void open_quick_editor(int slot) {
     if(slot < 0) slot = 0;
     if(slot > 9) slot = 9;
     if(g_screen == Screen::Editor && g_quick_slot >= 0) save_editor_text();
+    clear_template_session();
     g_quick_slot = slot;
     g_file_edit_path.clear();
     g_prompt.clear();
@@ -5383,6 +5467,7 @@ static void open_quick_editor(int slot) {
 
 static void open_file_editor(const std::string &name) {
     if(g_screen == Screen::Editor && !g_file_edit_path.empty()) save_editor_text();
+    clear_template_session();
     file_edit_ensure_default();
     std::string clean = file_edit_clean_name(name.empty() ? file_edit_last_name() : name);
     g_file_edit_path = file_edit_path_for(clean);
@@ -5542,8 +5627,32 @@ static void handle_main(int key) {
     }
     if(key == '\n' || key == '\r') {
         const Action &a = k_actions[acts[g_main_sel]];
-        if(a.key == 'p') { g_quick_slot = -1; g_file_edit_path.clear(); g_prompt = random_builtin_prompt(); g_edit_file.clear(); goto_screen(Screen::Editor); return; }
-        if(a.key == 'f') { g_quick_slot = -1; g_file_edit_path.clear(); g_prompt.clear(); g_edit_file.clear(); goto_screen(Screen::Editor); return; }
+        if(a.key == 'p') { clear_template_session(); g_quick_slot = -1; g_file_edit_path.clear(); g_prompt = random_builtin_prompt(); g_edit_file.clear(); goto_screen(Screen::Editor); return; }
+        if(a.key == 'f') { clear_template_session(); g_quick_slot = -1; g_file_edit_path.clear(); g_prompt.clear(); g_edit_file.clear(); goto_screen(Screen::Editor); return; }
+        if(a.key == 'm') {
+            std::string content, error;
+            if(!journal_template_load_selected(content, error)) {
+                // render() 会重建状态栏,提示得在它之后再写
+                render();
+                set_status(error);
+                return;
+            }
+            clear_template_session();
+            g_template_journal = true;
+            g_template_content = std::move(content);
+            g_edit_file.clear();
+            g_prompt.clear();
+            g_quick_slot = -1;
+            g_file_edit_path.clear();
+            g_ol.editPath.clear();
+            ++g_template_gen;
+            // 只有模板里真的留了数据段才值得发网络请求
+            g_template_auto_weather_pending =
+                g_template_content.find("{{weather}}") != std::string::npos ||
+                g_template_content.find("{{ weather }}") != std::string::npos;
+            goto_screen(Screen::Editor);
+            return;
+        }
         if(a.key == 'v') { g_browser_needs_reload = true; goto_screen(Screen::Browser); return; }
         if(a.screen == Screen::AiChat) { ai_chat_open(true); return; }
         goto_screen(a.screen);
@@ -5748,6 +5857,7 @@ static void handle_browser(int key) {
         return;
     }
     if(sel && (key == 'e' || key == 'E')) {
+        clear_template_session();
         g_quick_slot = -1;
         g_file_edit_path.clear();
         g_edit_file = sel->filename;
@@ -5909,6 +6019,7 @@ static void handle_settings(int key) {
         if(k == "dict") { goto_screen(Screen::Dict); return; }
         if(k == "file_mgr") { goto_screen(Screen::FileMgr); return; }
         if(k == "journal_dir") { open_setting_text("journal_dir", "保存位置"); return; }
+        if(k == "weather_city") { open_setting_text("weather_city", "天气地区"); return; }
         if(k == "webdav_url") { open_setting_text("webdav_url", "WebDAV URL"); return; }
         if(k == "webdav_user") { open_setting_text("webdav_user", "WebDAV 用户"); return; }
         if(k == "webdav_pass") { open_setting_text("webdav_pass", "WebDAV 密码"); return; }
@@ -6923,6 +7034,7 @@ static void outline_edit_contents(int idx) {
         outline_save();
     }
     g_ol.editPath = outline_ensure_content_file(file);
+    clear_template_session();
     g_prompt.clear();
     g_quick_slot = -1;
     g_file_edit_path.clear();
@@ -10301,6 +10413,125 @@ static void editor_follow_cursor() {
     focus_dim_update(true, ca, vp);
 }
 
+// ── 模板日记:天气后台获取与 {{weather}} 填充 ───────────────────────────
+
+// 正文里的 {{weather}} / {{ weather }} 全部替换成 summary。返回 false 表示没有占位符。
+static bool fill_weather_placeholders(const std::string &summary) {
+    if(!g_editor) return false;
+    static const char *kPatterns[] = {"{{weather}}", "{{ weather }}"};
+    std::string text = lv_textarea_get_text(g_editor);
+    bool found = false;
+    for(const char *p : kPatterns)
+        if(text.find(p) != std::string::npos) { found = true; break; }
+    if(!found) return false;
+
+    struct Occ { size_t pos; size_t len; };
+    std::vector<Occ> occs;
+    for(const char *p : kPatterns) {
+        size_t plen = strlen(p);
+        size_t pos = 0;
+        while((pos = text.find(p, pos)) != std::string::npos) {
+            occs.push_back({pos, plen});
+            pos += plen;
+        }
+    }
+    std::sort(occs.begin(), occs.end(),
+              [](const Occ &a, const Occ &b) { return a.pos < b.pos; });
+
+    // 光标按「原位置 + 占位符替换造成的字节差」重映射;落在占位符内部的落到替换文本末尾。
+    const int caret = editor_caret_byte();
+    long new_caret = caret;
+    {
+        long adj = 0;
+        bool mapped = false;
+        for(const Occ &o : occs) {
+            long delta = (long)summary.size() - (long)o.len;
+            if(o.pos + o.len <= (size_t)caret) adj += delta;
+            else if(o.pos < (size_t)caret) {
+                new_caret = (long)o.pos + adj + (long)summary.size();
+                mapped = true;
+                break;
+            } else {
+                new_caret = (long)caret + adj;
+                mapped = true;
+                break;
+            }
+        }
+        if(!mapped) new_caret = (long)caret + adj;
+    }
+
+    editor_record_undo();
+    std::string out = text;
+    for(auto it = occs.rbegin(); it != occs.rend(); ++it)
+        out.replace(it->pos, it->len, summary);
+    lv_textarea_set_text(g_editor, out.c_str());
+    lv_textarea_set_cursor_pos(g_editor, byte_to_char_pos(out, (size_t)new_caret));
+    return true;
+}
+
+static void apply_weather_result(const WeatherResult &result, bool auto_mode) {
+    if(!g_editor) return;
+    if(!result.success) {
+        if(!auto_mode) set_status(result.error.empty() ? "天气获取失败" : result.error);
+        return;
+    }
+    bool filled = fill_weather_placeholders(result.summary);
+    if(!filled) {
+        if(auto_mode) return;  // 自动获取只在有占位符时动正文
+        editor_record_undo();
+        lv_textarea_add_text(g_editor, result.summary.c_str());
+    }
+    if(g_vt_view) editor_vt_refresh();
+    else if(g_md_view) editor_md_refresh();
+    update_ime_bar();
+    set_status(filled ? "已填入天气" : "已插入天气");
+}
+
+// 主线程调用:手动(Alt+W)或进入模板日记时自动取一次。单飞行,结果由 weather_poll 应用。
+static void start_weather_fetch(bool auto_mode) {
+    if(!g_template_journal) return;
+    std::string city = trim_copy(g_settings.get("weather_city"));
+    if(city.empty()) {
+        if(!auto_mode) set_status("请先在设置中设置天气地区");
+        return;
+    }
+    if(auto_mode && !(g_wifi.powered() && g_wifi.status().connected)) return;
+    if(g_weather_busy.exchange(true)) {
+        if(!auto_mode) set_status("天气获取中，请稍候");
+        return;
+    }
+    g_weather_gen = g_template_gen;
+    g_weather_auto = auto_mode;
+    g_weather_ready = false;
+    {
+        std::lock_guard<std::mutex> lk(g_weather_mutex);
+        g_weather_result = WeatherResult();
+    }
+    std::thread([city]() {
+        WeatherResult result = weather_fetch_current(city);
+        {
+            std::lock_guard<std::mutex> lk(g_weather_mutex);
+            g_weather_result = result;
+        }
+        g_weather_busy = false;
+        g_weather_ready = true;
+    }).detach();
+}
+
+// 主线程轮询:只有还停在原来的模板会话里才应用,否则丢弃。
+static void weather_poll() {
+    if(!g_weather_ready.load()) return;
+    WeatherResult result;
+    {
+        std::lock_guard<std::mutex> lk(g_weather_mutex);
+        result = g_weather_result;
+        g_weather_result = WeatherResult();
+    }
+    g_weather_ready = false;
+    if(g_screen != Screen::Editor || !g_template_journal || g_weather_gen != g_template_gen) return;
+    apply_weather_result(result, g_weather_auto);
+}
+
 static void handle_editor_keys(int key);
 
 static void handle_editor(int key) {
@@ -10364,6 +10595,11 @@ static void handle_editor_keys(int key) {
     }
     if(g_polish_panel) { polish_panel_key(key); return; }
     if(g_ai_chat.open) { ai_chat_key(key); return; }
+    if(key == KEY_ALT_W) {
+        // 天气只属于模板日记;普通编辑会话里这个组合键没有含义,直接吞掉。
+        if(g_template_journal) start_weather_fetch(false);
+        return;
+    }
     if(g_search_panel) {
         if(key == KEY_IME_TOGGLE) {
             g_linux_ime.toggle();
@@ -10957,6 +11193,7 @@ enum class ShortcutAction {
     Prompt,
     Polish,
     AiChat,
+    Weather,
     FileManager,
     Help,
     Exit,
@@ -10968,7 +11205,7 @@ struct ShortcutItem {
     const char *shortcut;
 };
 
-static ShortcutItem g_sc_items[14];
+static ShortcutItem g_sc_items[15];
 static int g_sc_count = 0;
 static int g_sc_sel = 0;
 static bool g_sc_active = false;
@@ -11019,6 +11256,7 @@ static void sc_build() {
     if(editor_has_selection()) sc_add(ShortcutAction::Polish, "AI 润色(选区)", "Ctrl+O");
     else if(!editor_is_empty()) sc_add(ShortcutAction::Polish, "AI 润色", "Ctrl+O");
     sc_add(ShortcutAction::AiChat, "问 ai", "Ctrl+W");
+    if(g_template_journal) sc_add(ShortcutAction::Weather, "获取天气", "Alt+W");
     if(!g_file_edit_path.empty()) sc_add(ShortcutAction::FileManager, "文件管理器", "Ctrl+E");
     sc_add(ShortcutAction::Help, "帮助", "Ctrl+?");
     sc_add(ShortcutAction::Exit, "退出", "Ctrl+Q");
@@ -11136,6 +11374,7 @@ static void handle_key(int key) {
         case ShortcutAction::Prompt: handle_key(0x10); break;
         case ShortcutAction::Polish: handle_key(0x0F); break;
         case ShortcutAction::AiChat: handle_key(0x17); break;
+        case ShortcutAction::Weather: start_weather_fetch(false); break;
         case ShortcutAction::FileManager: handle_key(0x05); break;
         case ShortcutAction::Help: handle_key(KEY_HELP); break;
         case ShortcutAction::Exit: handle_key(0x11); break;
@@ -11200,7 +11439,7 @@ static void handle_key(int key) {
     case Screen::Browser: handle_browser(key); break;
     case Screen::Viewer:
         if(key == 'q' || key == 27) goto_screen(Screen::Browser);
-        else if(key == 'e' || key == 'E') { g_quick_slot = -1; g_file_edit_path.clear(); g_edit_file = g_view_file; g_prompt.clear(); goto_screen(Screen::Editor); }
+        else if(key == 'e' || key == 'E') { clear_template_session(); g_quick_slot = -1; g_file_edit_path.clear(); g_edit_file = g_view_file; g_prompt.clear(); goto_screen(Screen::Editor); }
         else if(key == 'h' || key == 'H') { open_history(g_view_file, Screen::Viewer); }
         else if(key == KEY_DOWN || key == 'j') viewer_scroll_by(1);
         else if(key == KEY_UP || key == 'k') viewer_scroll_by(-1);
@@ -11245,6 +11484,7 @@ extern "C" void app_ui_insert_utf8(const char *text) {
 void app_ui_create() {
     srand((unsigned)time(nullptr));
     apply_theme_values();
+    journal_template_ensure_defaults();
     g_root = lv_screen_active();
     lv_obj_remove_style_all(g_root);
     g_linux_ime.begin();
@@ -11286,6 +11526,8 @@ void app_ui_tick() {
     if(g_screen == Screen::Terminal) { terminal::tick(); return; }
     // AI 聊天:后台请求跑完的结果回到主线程再贴进浮窗(浮窗已关就丢弃)。
     ai_chat_poll();
+    // 模板日记的天气请求同理。
+    weather_poll();
     // 全文搜索逐批推进:每 ~30ms 处理一小批,进度写进状态栏;跑完再重绘结果。
     if(g_screen == Screen::Browser && g_browser.scanActive) {
         uint32_t tick = lv_tick_get();

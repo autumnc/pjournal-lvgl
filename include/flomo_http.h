@@ -21,6 +21,7 @@ struct HttpResult {
 //
 // method 是 "GET"/"POST"/"PUT"/"DELETE";headers 每条一个 "Name: value";
 // body 为空则不给 curl 传 --data-binary,stdin 立刻 EOF。
+// timeout_ms > 0 时覆盖默认的 40s 总超时(天气这类轻量请求用)。
 HttpResult http_request(const std::string &method, const std::string &url,
                         const std::vector<std::string> &headers,
-                        const std::string &body);
+                        const std::string &body, int timeout_ms = 0);

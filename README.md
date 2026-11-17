@@ -12,6 +12,11 @@ Implemented target changes:
 - Markdown themes are configurable: dark is default, light is available.
 - Font size is user-adjustable rather than fixed bitmap slots.
 - Journal save location is configurable.
+- Template journal (`m` on the main screen): applies a Markdown file from `~/Templates`,
+  expanding `{{date}}` / `{{weekday}}` on entry. When the selected template asks for
+  `{{weather}}`, the current weather is fetched in the background on entry (if online)
+  and can be refreshed with `Alt+W`. Templates are selected in Settings; the six
+  built-in ones are seeded on first start.
 - Clipboard history (20 entries, 64 KB each) with an `Alt+V` overlay; `w` in that menu
   serves a browser UI over HTTP for viewing/editing entries.
 - Past-journal browser with a floating calendar date filter (`t`) and search (`/`):

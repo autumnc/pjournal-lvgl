@@ -3,6 +3,7 @@
 #include "flomo_model.h"
 #include "hash_utils.h"
 #include "journal_storage.h"
+#include "journal_template.h"
 #include "outline_model.h"
 #include "process_utils.h"
 #include "settings.h"
@@ -17,6 +18,7 @@
 #include <clocale>
 #include <cstdlib>
 #include <cstdio>
+#include <ctime>
 #include <iostream>
 #include <string>
 #include <sys/stat.h>
@@ -486,6 +488,44 @@ static int test_json_depth_guard() {
     return 0;
 }
 
+static int test_journal_template() {
+    // {{date}} / {{weekday}} 展开,含带空格的写法
+    tm t {};
+    t.tm_year = 2026 - 1900;
+    t.tm_mon = 10;  // 11 月
+    t.tm_mday = 17;
+    t.tm_hour = 12;
+    t.tm_isdst = -1;
+    time_t now = mktime(&t);
+    std::string out = journal_template_expand(
+        "# {{date}} {{ weekday }}\n{{ date }} {{weekday}}", now);
+    if(out != "# 2026-11-17 星期二\n2026-11-17 星期二") return fail("template expand mismatch: " + out);
+    if(journal_template_expand("没有占位符", now) != "没有占位符") return fail("template expand touched plain text");
+
+    if(journal_template_display_name("晨间日记.md") != "晨间日记") return fail("template display name .md");
+    if(journal_template_display_name("foo.markdown") != "foo") return fail("template display name .markdown");
+    if(journal_template_display_name("plain") != "plain") return fail("template display name plain");
+
+    // 目录不存在时播种内置模板;目录已存在则不再补写
+    char templ[] = "/tmp/pjournal-tpl-XXXXXX";
+    char *home = mkdtemp(templ);
+    if(!home) return fail("template mkdtemp failed");
+    std::string root = home;
+    setenv("HOME", root.c_str(), 1);
+    std::string dir = root + "/Templates";
+    if(exists(dir)) return fail("template dir unexpectedly exists");
+    journal_template_ensure_defaults();
+    auto list = journal_template_list();
+    if(list.size() != 6) return fail("template seed count mismatch: " + std::to_string(list.size()));
+    std::string content;
+    if(!journal_template_load(list.front(), content)) return fail("seeded template not loadable");
+    if(content.empty()) return fail("seeded template empty");
+    if(unlink((dir + "/" + list.front()).c_str()) != 0) return fail("template unlink failed");
+    journal_template_ensure_defaults();
+    if(journal_template_list().size() != 5) return fail("template reseeded an existing dir");
+    return 0;
+}
+
 int main() {
     if(hash::md5_hex("") != "d41d8cd98f00b204e9800998ecf8427e") return fail("md5 empty mismatch");
     if(hash::md5_hex("abc") != "900150983cd24fb0d6963f7d28e17f72") return fail("md5 abc mismatch");
@@ -507,6 +547,7 @@ int main() {
     if(int rc = test_term_keys()) return rc;
     if(int rc = test_term_sixel()) return rc;
     if(int rc = test_clip_history()) return rc;
+    if(int rc = test_journal_template()) return rc;
     if(int rc = test_json_depth_guard()) return rc;
     return 0;
 }

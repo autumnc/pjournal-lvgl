@@ -1,6 +1,7 @@
 #include "flomo_http.h"
 
 #include <cerrno>
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -45,12 +46,14 @@ std::string trimmed(const std::string &s) {
 
 HttpResult http_request(const std::string &method, const std::string &url,
                         const std::vector<std::string> &headers,
-                        const std::string &body) {
+                        const std::string &body, int timeout_ms) {
     HttpResult res;
     if(body.size() > (size_t)kMaxBodyBytes) {
         res.error = "请求体过大";
         return res;
     }
+    const int curl_timeout_s = timeout_ms > 0 ? (timeout_ms + 999) / 1000 : 30;
+    const int total_timeout_ms = timeout_ms > 0 ? timeout_ms + 2000 : kTotalTimeoutMs;
 
     int in_pipe[2] = {-1, -1};    // 父写 → 子 stdin(curl 的请求体)
     int out_pipe[2] = {-1, -1};   // 子 stdout → 父读(响应正文 + 状态码)
@@ -69,8 +72,8 @@ HttpResult http_request(const std::string &method, const std::string &url,
 
     std::vector<std::string> args = {
         "curl", "-s", "-S",
-        "-m", "30",
-        "--connect-timeout", "10",
+        "-m", std::to_string(curl_timeout_s),
+        "--connect-timeout", std::to_string(std::min(10, curl_timeout_s)),
         "-X", method,
         // 正文之后紧接一个换行再跟状态码,父进程用最后一个换行切开。不用 -D 存头文件是
         // 因为那样要落一个临时文件,反过来更容易出错。
@@ -139,7 +142,7 @@ HttpResult http_request(const std::string &method, const std::string &url,
     std::string out, errbuf;
     bool timed_out = false;
     bool too_big = false;
-    const int64_t deadline = now_ms() + kTotalTimeoutMs;
+    const int64_t deadline = now_ms() + total_timeout_ms;
 
     while(in_open || out_open || err_open) {
         pollfd pf[3];

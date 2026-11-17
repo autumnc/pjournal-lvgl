@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(pjournal_lvgl VERSION 1.3.3 LANGUAGES C CXX)
+project(pjournal_lvgl VERSION 1.3.4 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -59,6 +59,13 @@ set(PJOURNAL_EMBED_OBJS)
 pjournal_embed_binary(${CMAKE_CURRENT_SOURCE_DIR}/port/esp32_main/ime/ime_table_pinyin.bin ime_table_pinyin_bin)
 pjournal_embed_binary(${CMAKE_CURRENT_SOURCE_DIR}/port/esp32_main/ime/liangfen.bin liangfen_bin)
 pjournal_embed_binary(${CMAKE_CURRENT_SOURCE_DIR}/port/esp32_main/ime/english_words.txt english_words_txt)
+# 内置默认模板:首次启动 ~/Templates 不存在时播种(journal_template.cpp 引用)
+pjournal_embed_binary(${CMAKE_CURRENT_SOURCE_DIR}/Templates/子弹笔记日记.md pj_tpl0)
+pjournal_embed_binary(${CMAKE_CURRENT_SOURCE_DIR}/Templates/晨间日记.md pj_tpl1)
+pjournal_embed_binary(${CMAKE_CURRENT_SOURCE_DIR}/Templates/极简日记模板.md pj_tpl2)
+pjournal_embed_binary(${CMAKE_CURRENT_SOURCE_DIR}/Templates/项目学习日记.md pj_tpl3)
+pjournal_embed_binary(${CMAKE_CURRENT_SOURCE_DIR}/Templates/马伯庸日记模板.md pj_tpl4)
+pjournal_embed_binary(${CMAKE_CURRENT_SOURCE_DIR}/Templates/马伯庸日记模板-紧凑.md pj_tpl5)
 
 add_compile_definitions(LV_CONF_INCLUDE_SIMPLE)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
@@ -129,6 +136,8 @@ add_executable(pjournal-lvgl
     src/settings.cpp
     src/backlight.cpp
     src/journal_storage.cpp
+    src/journal_template.cpp
+    src/weather_client.cpp
     src/markdown.cpp
     src/vertical_layout.cpp
     src/outline_model.cpp
@@ -202,6 +211,8 @@ if(BUILD_TESTING)
         src/clip_history.cpp
         src/hash_utils.cpp
         src/journal_storage.cpp
+        src/journal_template.cpp
+        src/weather_client.cpp
         src/outline_model.cpp
         src/process_utils.cpp
         src/safe_file.cpp
@@ -218,6 +229,7 @@ if(BUILD_TESTING)
         src/term_keys.cpp
         port/esp32_main/json_utils.cpp
         port/esp32_main/json_parser.cpp
+        ${PJOURNAL_EMBED_OBJS}
     )
     target_include_directories(pjournal-tests PRIVATE include port/esp32_main)
     target_compile_options(pjournal-tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
