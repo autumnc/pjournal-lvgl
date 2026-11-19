@@ -31,6 +31,8 @@ enum AppKey {
     KEY_CTRL_J = 0xA9,  // Ctrl+J:AI 聊天新建会话
     KEY_CTRL_H = 0xAA,  // Ctrl+H:显示/隐藏 AI 会话列表
     KEY_ALT_W = 0xAB,   // Alt/GUI+W:模板日记里获取天气
+    KEY_MD_TOGGLE = 0xAC,  // Ctrl+M:开关 Markdown 实时渲染(撞 Enter 的 0x0D)
+    KEY_TOC = 0xAD,        // Alt+O:大纲目录(TOC)
     // 修饰键"单击"(按下后没按别的键就抬起)。输入法用它触发字母选字。
     KEY_MOD_TAP_LCTRL = 0xB0,
     KEY_MOD_TAP_LGUI = 0xB1,

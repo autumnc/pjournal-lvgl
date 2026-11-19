@@ -618,6 +618,17 @@ static int g_md_caret_line_x = 0;      // 光标行的行首(屏幕 x)
 static int g_md_caret_line_top = -1;   // 光标行的行顶(屏幕 y)
 static int g_md_caret_line_pitch = 0;  // 行距 = 行高 + line_space
 
+// 大纲目录浮层(Alt+O)。打开时快照标题行号/级别;浮层打开期间正文不可编辑。
+struct TocState {
+    bool active = false;
+    std::vector<int> lines;   // 标题所在逻辑行
+    std::vector<int> levels;  // 对应标题级别(1..6)
+    int sel = 0;
+    int scroll = 0;
+    lv_obj_t *layer = nullptr;
+};
+static TocState g_toc;
+
 static std::string meta_value(const std::string &meta, const char *key) {
     std::string prefix = std::string(key) + "=";
     size_t pos = meta.find(prefix);
@@ -873,6 +884,10 @@ static void editor_vt_refresh();
 static void editor_vt_create(int x, int y, int w, int h);
 static bool editor_vertical();
 static void editor_sel_style_plain();
+// 运行时即时开关 Markdown 渲染(不重建 textarea)与大纲目录浮层(Alt+O)
+static void editor_md_toggle_live();
+static void editor_toc_open();
+static void editor_toc_handle(int key);
 static void start_weather_fetch(bool auto_mode);
 static void weather_poll();
 static void ai_chat_open(bool fullscreen);
@@ -5198,7 +5213,7 @@ static void render_help() {
         "模板日记: Alt+W获取天气填入{{weather}}；联网时会自动获取",
         "问AI: Enter发送 Ctrl+J新会话 Ctrl+H会话列表(↑↓选 Enter进入 d删 n新建 Tab切焦点) Ctrl+L清空 Esc关闭",
         "润色: Shift+方向键/Ctrl+A选文本 Enter应用 R改指令重润色 Esc取消",
-        "编辑: Ctrl+T折叠/展开光标所在的标题(Markdown渲染开启时)",
+        "编辑: Ctrl+T折叠/展开标题(Markdown渲染开启时) Ctrl+M开关渲染 Alt+O大纲目录",
         "快捷编辑: F1-F10切换文件 Ctrl+n/p下/上一个 Esc保存并回设置",
         "文件编辑: Ctrl+E文件面板 a新建 d删除 r改名 Enter编辑",
         "输入法: Ctrl+Space开关 候选数字直选 空格首选 方向键/无变换/变换/标点翻页",
@@ -8586,6 +8601,52 @@ static void editor_md_refresh() {
     }
 }
 
+// 运行时拆除 Markdown 叠加层:只删叠加层/聚焦暗罩,textarea 本身原样保留,
+// 于是未保存的正文、选区、撤销栈都不受影响。
+static void editor_md_destroy_overlay() {
+    if(g_md_view) lv_obj_delete(g_md_view);
+    g_md_view = nullptr;
+    g_md_content = nullptr;
+    g_md_caret = nullptr;
+    g_md_labels.clear();
+    g_md_rules.clear();
+    g_md_sel_rects.clear();
+    g_md_box_rects.clear();
+    g_md_dot_rects.clear();
+    g_md_wave_rects.clear();
+    g_md_focus_band_on = false;
+    g_md_caret_line_top = -1;
+    g_md_caret_line_pitch = 0;
+    for(lv_obj_t *&o : g_focus_dim)
+        if(o) { lv_obj_delete(o); o = nullptr; }
+}
+
+// Ctrl+M:即时开关 Markdown 实时渲染。写回设置(与设置面板同一项同步),再就地
+// 增删叠加层——真正的 textarea 从头到尾不动,不会像整屏 render() 那样把正文读回文件。
+static void editor_md_toggle_live() {
+    if(!g_editor) return;
+    if(editor_vertical()) { set_status("竖排模式始终按 Markdown 渲染"); return; }
+    const bool on = !g_settings.markdown_render();
+    g_settings.set("md_render", on ? "1" : "0");
+    if(on) {
+        if(!g_md_view) {
+            lv_obj_update_layout(g_editor);
+            editor_md_create(lv_obj_get_x(g_editor), lv_obj_get_y(g_editor),
+                             lv_obj_get_width(g_editor), lv_obj_get_height(g_editor),
+                             lv_obj_get_content_width(g_editor));
+            // 叠在 textarea 正上方,但在输入法候选条/状态栏之下(整屏 render 时的创建顺序)。
+            lv_obj_move_to_index(g_md_view, (int)lv_obj_get_index(g_editor) + 1);
+        }
+        editor_md_refresh();
+    } else {
+        editor_md_destroy_overlay();
+        editor_sel_style_plain();
+        editor_follow_cursor();
+    }
+    set_status(on ? "Markdown渲染: 开" : "Markdown渲染: 关");
+    update_ime_bar();
+}
+
 // ---------------------------------------------------------------------------
 // 只读 Markdown 渲染(阅读视图 / 历史预览)
 //
@@ -10575,6 +10636,9 @@ static std::string editor_list_continue() {
 }
 
 static void handle_editor_keys(int key) {
+    // 大纲目录浮层是模态子状态:所有按键(含 Ctrl+E 等面板快捷键)都交给它,
+    // 免得目录快照指向的正文被别的面板替换掉。
+    if(g_toc.active) { editor_toc_handle(key); return; }
     if(handle_file_panel_key(key)) return;
     if(g_editor_exit_asking) {
         if(key == '\n' || key == '\r') {
@@ -10640,6 +10704,10 @@ static void handle_editor_keys(int key) {
         else if(key >= 32 && key < 127) lv_textarea_add_char(fld, (uint32_t)key);
         return;
     }
+    // Alt+O → 打开大纲目录;Ctrl+M → 即时开关 Markdown 渲染。放在输入法之前,
+    // 这两个专用键码不会被输入法当普通按键处理。
+    if(key == KEY_TOC) { editor_toc_open(); return; }
+    if(key == KEY_MD_TOGGLE) { editor_md_toggle_live(); return; }
     if(key == KEY_IME_TOGGLE) {
         g_linux_ime.toggle();
         update_ime_bar();
@@ -11189,6 +11257,8 @@ enum class ShortcutAction {
     Inspiration,
     Flomo,
     Search,
+    Outline,
+    MarkdownToggle,
     History,
     Prompt,
     Polish,
@@ -11205,9 +11275,10 @@ struct ShortcutItem {
     const char *shortcut;
 };
 
-static ShortcutItem g_sc_items[15];
+static ShortcutItem g_sc_items[16];
 static int g_sc_count = 0;
 static int g_sc_sel = 0;
+static int g_sc_scroll = 0;  // 列表首项下标(放不下时滚动)
 static bool g_sc_active = false;
 static lv_obj_t *g_sc_layer = nullptr;
 
@@ -11226,6 +11297,7 @@ static bool editor_is_empty() {
 // 且候选正可用时,这一下轻点归输入法。
 static bool shortcut_menu_allowed() {
     if(g_editor_exit_asking) return false;
+    if(g_toc.active) return false;
     if(g_search_panel || g_polish_panel || g_ai_chat.open || g_file_panel_state.active) return false;
     if(g_settings.letterSelKey() == "lwin" && g_linux_ime.active() &&
        g_linux_ime.letter_sel_tap_available())
@@ -11248,6 +11320,9 @@ static void sc_build() {
     sc_add(ShortcutAction::Inspiration, "灵感", "Ctrl+I");
     sc_add(ShortcutAction::Flomo, "发送到 Flomo", "Ctrl+F");
     sc_add(ShortcutAction::Search, "查找/替换", "Ctrl+/");
+    sc_add(ShortcutAction::Outline, "大纲目录", "Alt+O");
+    sc_add(ShortcutAction::MarkdownToggle,
+           g_settings.markdown_render() ? "Markdown渲染 开" : "Markdown渲染 关", "Ctrl+M");
     // 快捷编辑/文件编辑里 Ctrl+Y 有自己的含义,版本历史只在日记会话里列。
     if(g_settings.version_history() && g_quick_slot < 0 && g_file_edit_path.empty())
         sc_add(ShortcutAction::History, "版本历史", "Ctrl+Y");
@@ -11279,12 +11354,20 @@ static void draw_shortcut_menu() {
     const int margin = ui_px(24);
     int panel_w = screen_w() - margin * 2;
     if(panel_w > ui_px(640)) panel_w = ui_px(640);
-    int panel_h = pad * 2 + row_h * (g_sc_count + 2);
+    // 条件项全开时一屏放不下,固定标题/提示行,中间列表滚动。
     const int max_h = screen_h() - margin * 2;
-    if(panel_h > max_h) panel_h = max_h;
+    const int fixed_h = pad * 2 + row_h * 2;
+    int max_rows = (max_h - fixed_h) / row_h;
+    if(max_rows < 1) max_rows = 1;
+    const int visible = g_sc_count < max_rows ? g_sc_count : max_rows;
+    const int panel_h = fixed_h + visible * row_h;
 
     if(g_sc_sel < 0) g_sc_sel = 0;
     if(g_sc_sel >= g_sc_count) g_sc_sel = g_sc_count - 1;
+    if(g_sc_sel < g_sc_scroll) g_sc_scroll = g_sc_sel;
+    if(g_sc_sel >= g_sc_scroll + visible) g_sc_scroll = g_sc_sel - visible + 1;
+    if(g_sc_scroll > g_sc_count - visible) g_sc_scroll = g_sc_count - visible;
+    if(g_sc_scroll < 0) g_sc_scroll = 0;
 
     lv_obj_t *panel = menu_panel(layer, panel_w, panel_h);
     const int inner_x = pad;
@@ -11299,14 +11382,43 @@ static void draw_shortcut_menu() {
 
     menu_text(panel, "快捷菜单", inner_x, pad, inner_w, row_h);
     const int list_y = pad + row_h;
-    for(int i = 0; i < g_sc_count; ++i) {
-        const int top = list_y + i * row_h;
-        if(top + row_h > panel_h - pad - row_h) break;
+    for(int row = 0; row < visible; ++row) {
+        const int i = g_sc_scroll + row;
+        if(i >= g_sc_count) break;
+        const int top = list_y + row * row_h;
         const bool sel = i == g_sc_sel;
         if(sel) menu_highlight(panel, ui_px(4), top, panel_w - ui_px(8), row_h);
         menu_text(panel, g_sc_items[i].shortcut, inner_x, top, sc_w + ui_px(8), row_h, sel);
         menu_text(panel, g_sc_items[i].label, label_x, top,
                   panel_w - label_x - pad, row_h, sel);
+    }
+    // 列表放不下时右侧画滚动条,提示还有被裁掉的项。
+    if(g_sc_count > visible) {
+        const int track_x = panel_w - ui_px(8);
+        const int track_y = list_y + ui_px(2);
+        const int track_h = visible * row_h - ui_px(4);
+        if(track_h > 0) {
+            lv_obj_t *track = lv_obj_create(panel);
+            lv_obj_remove_style_all(track);
+            lv_obj_set_pos(track, track_x, track_y);
+            lv_obj_set_size(track, ui_px(3), track_h);
+            lv_obj_set_style_bg_color(track, g_theme.muted, 0);
+            lv_obj_set_style_bg_opa(track, LV_OPA_COVER, 0);
+            lv_obj_remove_flag(track, LV_OBJ_FLAG_SCROLLABLE);
+            int thumb_h = track_h * visible / g_sc_count;
+            if(thumb_h < ui_px(8)) thumb_h = ui_px(8);
+            if(thumb_h > track_h) thumb_h = track_h;
+            int thumb_y = track_y;
+            if(track_h > thumb_h)
+                thumb_y += (track_h - thumb_h) * g_sc_scroll / (g_sc_count - visible);
+            lv_obj_t *thumb = lv_obj_create(panel);
+            lv_obj_remove_style_all(thumb);
+            lv_obj_set_pos(thumb, track_x, thumb_y);
+            lv_obj_set_size(thumb, ui_px(3), thumb_h);
+            lv_obj_set_style_bg_color(thumb, g_theme.fg, 0);
+            lv_obj_set_style_bg_opa(thumb, LV_OPA_COVER, 0);
+            lv_obj_remove_flag(thumb, LV_OBJ_FLAG_SCROLLABLE);
+        }
     }
     menu_text(panel, "↑↓ 选择  Enter 执行  Esc 关闭",
               inner_x, panel_h - pad - row_h, inner_w, row_h, false, true);
@@ -11324,6 +11436,7 @@ static void shortcut_menu_open() {
     g_linux_ime.cancel_composition();
     sc_build();
     g_sc_sel = 0;
+    g_sc_scroll = 0;
     g_sc_active = true;
     g_sc_layer = nullptr;
     draw_shortcut_menu();
@@ -11355,6 +11468,236 @@ static ShortcutAction shortcut_menu_handle(int key) {
     return ShortcutAction::None;
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// 大纲目录浮层 (Alt+O)
+//
+// 与 ESP32 版同一套交互:打开时快照标题行号/级别,↑↓/PgUp/PgDn/Home/End 选择,
+// Enter 跳到该标题,Esc/Alt+O 关闭。与 "Markdown渲染" 开关无关 —— 关掉实时渲染
+// 也能按标题跳转,目录里始终显示渲染后的标题(级别图标 + 隐藏内联标记)。
+// ─────────────────────────────────────────────────────────────────────────
+
+
+static int toc_row_h() { return ui_line_h() + ui_px(4); }
+
+// 一屏能放下的列表行数(标题行、提示行各占一行,固定不滚)。
+static int toc_max_rows() {
+    const int pad = ui_px(10);
+    const int margin = ui_px(24);
+    const int row_h = toc_row_h();
+    int rows = (screen_h() - margin * 2 - pad * 2 - row_h * 2) / row_h;
+    if(rows < 1) rows = 1;
+    return rows;
+}
+
+// 与编辑器叠加层/竖排同一套代码围栏状态机,只挑出标题行,不建整篇 MdLineInfo。
+static void toc_collect(const std::string &text, std::vector<int> &lines, std::vector<int> &levels) {
+    MdDoc ml;
+    md_split_caret(text, 0, ml);
+    bool inCode = false;
+    for(size_t i = 0; i < ml.lines.size(); ++i) {
+        const std::string &ln = ml.lines[i];
+        size_t lead = 0;
+        while(lead < ln.size() && ln[lead] == ' ') ++lead;
+        bool fence = ln.compare(lead, 3, "```") == 0 || ln.compare(lead, 3, "~~~") == 0;
+        if(fence) { inCode = !inCode; continue; }
+        if(inCode) continue;
+        int h = md_heading_level_of(ln);
+        if(h > 0) { lines.push_back((int)i); levels.push_back(h); }
+    }
+}
+
+static const lv_font_t *toc_heading_font() {
+    if(g_editor_bold_font) return g_editor_bold_font;
+    if(g_editor_font) return g_editor_font;
+    return g_ui_font ? g_ui_font : LV_FONT_DEFAULT;
+}
+
+static void editor_toc_close() {
+    if(!g_toc.active) return;
+    g_toc.active = false;
+    overlay_drop(g_toc.layer);
+    g_toc.sel = 0;
+    g_toc.scroll = 0;
+    std::vector<int>().swap(g_toc.lines);  // clear 只改 size,容量会常驻内部内存
+    std::vector<int>().swap(g_toc.levels);
+    if(g_editor) update_ime_bar();
+}
+
+static void editor_toc_draw() {
+    overlay_drop(g_toc.layer);
+    g_toc.layer = overlay_layer_begin();
+    lv_obj_t *layer = g_toc.layer;
+    const int total = (int)g_toc.lines.size();
+    const int row_h = toc_row_h();
+    const int pad = ui_px(10);
+    const int margin = ui_px(24);
+    int panel_w = screen_w() - margin * 2;
+    if(panel_w > ui_px(720)) panel_w = ui_px(720);
+    const int max_rows = toc_max_rows();
+    const int visible = total > 0 ? (total < max_rows ? total : max_rows) : 1;
+    const int panel_h = pad * 2 + row_h * (visible + 2);
+
+    if(g_toc.sel < 0) g_toc.sel = 0;
+    if(total > 0 && g_toc.sel >= total) g_toc.sel = total - 1;
+    if(g_toc.sel < g_toc.scroll) g_toc.scroll = g_toc.sel;
+    if(g_toc.sel >= g_toc.scroll + visible) g_toc.scroll = g_toc.sel - visible + 1;
+    if(total > visible && g_toc.scroll > total - visible) g_toc.scroll = total - visible;
+    if(g_toc.scroll < 0) g_toc.scroll = 0;
+
+    lv_obj_t *panel = menu_panel(layer, panel_w, panel_h);
+    const int inner_x = pad;
+    const int inner_w = panel_w - pad * 2;
+
+    menu_text(panel, "大纲目录", inner_x, pad, inner_w, row_h);
+    if(total > 0) {
+        std::string info = std::to_string(g_toc.sel + 1) + "/" + std::to_string(total);
+        const int iw = menu_text_width(info);
+        menu_text(panel, info, panel_w - pad - iw, pad, iw, row_h);
+    }
+    const int list_y = pad + row_h;
+
+    if(total == 0) {
+        menu_text(panel, "当前文件没有可跳转的标题", inner_x, list_y, inner_w, row_h, false, true);
+    } else {
+        const char *ctxt = g_editor ? lv_textarea_get_text(g_editor) : "";
+        MdDoc ml;
+        md_split_caret(ctxt ? ctxt : "", 0, ml);
+        const int indent = ui_px(22);  // 每级标题缩进
+        const lv_font_t *hfont = toc_heading_font();
+        for(int row = 0; row < visible; ++row) {
+            const int idx = g_toc.scroll + row;
+            if(idx >= total) break;
+            const int li = g_toc.lines[idx];
+            if(li < 0 || li >= (int)ml.lines.size()) continue;
+            const int row_top = list_y + row * row_h;
+            const bool sel = idx == g_toc.sel;
+            if(sel) menu_highlight(panel, ui_px(4), row_top, panel_w - ui_px(8), row_h);
+            int level = g_toc.levels[idx];
+            if(level < 1) level = 1;
+            if(level > 6) level = 6;
+            // 目录里始终用渲染后的标题(级别图标 + 去掉内联标记),与实时渲染开关无关。
+            MdRender d = md_build_line(ml.lines[li], false, -1);
+            const int x = inner_x + ui_px(4) + (level - 1) * indent;
+            int w = panel_w - pad - x;
+            if(w < ui_px(16)) w = ui_px(16);
+            lv_obj_t *lbl = label_raw(panel, d.text, x, row_top, w, row_h);
+            lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
+            lv_obj_set_style_text_font(lbl, hfont, 0);
+            lv_obj_set_style_text_color(lbl, sel ? g_theme.bg : md_heading_color(), 0);
+            lv_obj_remove_flag(lbl, LV_OBJ_FLAG_SCROLLABLE);
+        }
+        // 列表放不下时右侧画滚动条,提示还有被裁掉的项。
+        if(total > visible) {
+            const int track_x = panel_w - ui_px(8);
+            const int track_y = list_y + ui_px(2);
+            const int track_h = visible * row_h - ui_px(4);
+            if(track_h > 0) {
+                lv_obj_t *track = lv_obj_create(panel);
+                lv_obj_remove_style_all(track);
+                lv_obj_set_pos(track, track_x, track_y);
+                lv_obj_set_size(track, ui_px(3), track_h);
+                lv_obj_set_style_bg_color(track, g_theme.muted, 0);
+                lv_obj_set_style_bg_opa(track, LV_OPA_COVER, 0);
+                lv_obj_remove_flag(track, LV_OBJ_FLAG_SCROLLABLE);
+                int thumb_h = track_h * visible / total;
+                if(thumb_h < ui_px(8)) thumb_h = ui_px(8);
+                if(thumb_h > track_h) thumb_h = track_h;
+                int thumb_y = track_y;
+                if(track_h > thumb_h)
+                    thumb_y += (track_h - thumb_h) * g_toc.scroll / (total - visible);
+                lv_obj_t *thumb = lv_obj_create(panel);
+                lv_obj_remove_style_all(thumb);
+                lv_obj_set_pos(thumb, track_x, thumb_y);
+                lv_obj_set_size(thumb, ui_px(3), thumb_h);
+                lv_obj_set_style_bg_color(thumb, g_theme.fg, 0);
+                lv_obj_set_style_bg_opa(thumb, LV_OPA_COVER, 0);
+                lv_obj_remove_flag(thumb, LV_OBJ_FLAG_SCROLLABLE);
+            }
+        }
+    }
+
+    menu_text(panel, "↑↓ 选择  Enter 跳转  Esc 关闭",
+              inner_x, panel_h - pad - row_h, inner_w, row_h, false, true);
+}
+
+static void editor_toc_jump() {
+    if(!g_editor) return;
+    if(g_toc.sel < 0 || g_toc.sel >= (int)g_toc.lines.size()) { editor_toc_close(); return; }
+    const int li = g_toc.lines[g_toc.sel];
+    const char *ctxt = lv_textarea_get_text(g_editor);
+    std::string text = ctxt ? ctxt : "";
+    MdDoc ml;
+    md_split_caret(text, 0, ml);
+    if(li < 0 || li >= (int)ml.lines.size()) { editor_toc_close(); return; }
+    // 光标落在标题标记(含其后的空格)之后,渲染时正好从图标/正文开始。
+    MdRender d = md_build_line(ml.lines[li], false, -1);
+    uint32_t byte = ml.start[li] + (uint32_t)d.body_off;
+    if(byte > (uint32_t)text.size()) byte = (uint32_t)text.size();
+    editor_toc_close();
+    // 离开选区,否则跳转后旧锚点会留下一大段选区。
+    g_ed_sel_anchor = -1;
+    if(editor_vertical()) vt_set_caret_byte((int)byte);
+    else lv_textarea_set_cursor_pos(g_editor, utf8_char_count(text.substr(0, byte)));
+    if(g_vt_view) editor_vt_refresh();
+    else if(g_md_view) editor_md_refresh();
+    else editor_follow_cursor();
+    update_ime_bar();
+}
+
+static void editor_toc_open() {
+    if(!g_editor || g_toc.active) return;
+    g_linux_ime.cancel_composition();  // 只丢未上屏的组合,保留输入法开关状态
+    const char *ctxt = lv_textarea_get_text(g_editor);
+    std::string text = ctxt ? ctxt : "";
+    std::vector<int>().swap(g_toc.lines);
+    std::vector<int>().swap(g_toc.levels);
+    toc_collect(text, g_toc.lines, g_toc.levels);
+    // 默认选中光标之前(含)的最后一个标题,从当前阅读位置继续。
+    MdDoc ml;
+    md_split_caret(text, (uint32_t)editor_caret_byte(), ml);
+    g_toc.sel = 0;
+    for(int i = 0; i < (int)g_toc.lines.size(); ++i) {
+        if(g_toc.lines[i] <= ml.caret_line) g_toc.sel = i;
+        else break;
+    }
+    g_toc.scroll = 0;
+    const int vis = toc_max_rows();
+    if(g_toc.sel >= vis) g_toc.scroll = g_toc.sel - vis + 1;
+    g_toc.active = true;
+    g_toc.layer = nullptr;
+    editor_toc_draw();
+}
+
+static void editor_toc_handle(int key) {
+    const int total = (int)g_toc.lines.size();
+    const int vis = toc_max_rows();
+    if(key == KEY_TOC || key == 27 || key == 'q' || key == 'Q' || key == KEY_MOD_TAP_LGUI) {
+        editor_toc_close();
+        return;
+    }
+    if(key == KEY_UP || key == 'k') {
+        if(g_toc.sel > 0) --g_toc.sel;
+    } else if(key == KEY_DOWN || key == 'j') {
+        if(g_toc.sel + 1 < total) ++g_toc.sel;
+    } else if(key == KEY_PAGE_UP) {
+        g_toc.sel -= vis;
+        if(g_toc.sel < 0) g_toc.sel = 0;
+    } else if(key == KEY_PAGE_DOWN) {
+        if(total > 0) {
+            g_toc.sel += vis;
+            if(g_toc.sel >= total) g_toc.sel = total - 1;
+        }
+    } else if(key == KEY_HOME) {
+        g_toc.sel = 0;
+    } else if(key == KEY_END) {
+        g_toc.sel = total > 0 ? total - 1 : 0;
+    } else if((key == '\n' || key == '\r') && total > 0) {
+        editor_toc_jump();
+        return;
+    }
+    editor_toc_draw();
+}
+
 static void handle_key(int key) {
     // 退出确认框是模态的:吃掉所有按键。Ctrl+Q 在三种工作模式下都灵,也放在最前面,
     // 免得被下面的输入法/文件槽位快捷键抢走。
@@ -11370,6 +11713,8 @@ static void handle_key(int key) {
         case ShortcutAction::Inspiration: handle_key(KEY_CTRL_I); break;
         case ShortcutAction::Flomo: handle_key(0x06); break;
         case ShortcutAction::Search: handle_key(KEY_SEARCH); break;
+        case ShortcutAction::Outline: handle_key(KEY_TOC); break;
+        case ShortcutAction::MarkdownToggle: handle_key(KEY_MD_TOGGLE); break;
         case ShortcutAction::History: handle_key(0x19); break;
         case ShortcutAction::Prompt: handle_key(0x10); break;
         case ShortcutAction::Polish: handle_key(0x0F); break;
@@ -11383,6 +11728,9 @@ static void handle_key(int key) {
         return;
     }
     if(key == 0x11) { quit_begin(); return; }
+    // 大纲目录是模态浮层:开着时所有按键归它,别让全局快捷键(剪贴板/灵感/输入法)
+    // 在浮层下面改状态。Ctrl+Q 已在上一步放行。
+    if(g_screen == Screen::Editor && g_toc.active) { handle_editor(key); return; }
     // 剪贴板历史是全局的,必须在把按键转给浮墨/终端之前拦截。
     if(key == KEY_WIN_V) { clip_menu_open(); return; }
     // 单按左 Win → 编辑器快捷菜单。右 Win 不认,免得设备报文误解析成修饰键单击。

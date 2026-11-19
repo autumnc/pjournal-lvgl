@@ -50,6 +50,8 @@ static constexpr int APP_KEY_WIN_V = 0xA6;  // Alt/GUI+V:打开剪贴板历史
 static constexpr int APP_KEY_CTRL_J = 0xA9;  // Ctrl+J:AI 聊天新建会话
 static constexpr int APP_KEY_CTRL_H = 0xAA;  // Ctrl+H:显示/隐藏 AI 会话列表
 static constexpr int APP_KEY_ALT_W = 0xAB;   // Alt/GUI+W:模板日记取天气
+static constexpr int APP_KEY_MD_TOGGLE = 0xAC;  // Ctrl+M:Markdown 实时渲染开关
+static constexpr int APP_KEY_TOC = 0xAD;        // Alt+O:大纲目录(TOC)
 // 修饰键单击(与 include/key_codes.h 的 KEY_MOD_TAP_* 一致):输入法拿它当字母选字键
 static constexpr int APP_KEY_MOD_TAP_LCTRL = 0xB0;
 static constexpr int APP_KEY_MOD_TAP_LGUI = 0xB1;
@@ -156,12 +158,14 @@ static int letter_of(int code) {
 static int map_key(int code, const InputState &st) {
     if((st.alt || st.gui) && code == KEY_V) return APP_KEY_WIN_V;
     if((st.alt || st.gui) && code == KEY_W) return APP_KEY_ALT_W;
+    if((st.alt || st.gui) && code == KEY_O) return APP_KEY_TOC;
     if(st.ctrl) {
         if(code == KEY_SPACE) return APP_KEY_IME_TOGGLE;
         if(code == KEY_ENTER) return APP_KEY_CTRL_ENTER;
         if(code == KEY_I) return APP_KEY_CTRL_I;
         if(code == KEY_J) return APP_KEY_CTRL_J;  // 撞 Enter 的 0x0A,给专用码
         if(code == KEY_H) return APP_KEY_CTRL_H;  // 撞 Backspace 的 0x08,给专用码
+        if(code == KEY_M) return APP_KEY_MD_TOGGLE;  // 撞 Enter 的 0x0D,给专用码
         if(code == KEY_SLASH) return APP_KEY_SEARCH;
         if(code == KEY_MINUS) return APP_KEY_FULLWIDTH_TOGGLE;
         if(code == KEY_F) return st.shift ? APP_KEY_TRAD_TOGGLE : 0x06;
@@ -316,6 +320,9 @@ static void console_input_thread() {
         // Alt+W 同理(ESC 'w')
         if(seq.size() == 1 && seq[0] == 'w' && (g_alt_held.load() || g_gui_held.load()))
             continue;
+        // Alt+O 同理(ESC 'o');真正的 KEY_TOC 由修饰键线程补发
+        if(seq.size() == 1 && seq[0] == 'o' && (g_alt_held.load() || g_gui_held.load()))
+            continue;
         int key = parse_csi_key(seq);
         dispatch_key(key ? key : 27);
     }
@@ -404,6 +411,10 @@ static void input_thread(std::string device) {
         // 剪贴板菜单被反复开/关。这里只放行第一次按下。
         if(ev.value == 2 && (st.alt || st.gui) && ev.code == KEY_V) continue;
         if(ev.value == 2 && (st.alt || st.gui) && ev.code == KEY_W) continue;
+        // Alt+O 打开大纲目录:同上,按住不放的重复事件会反复开关
+        if(ev.value == 2 && (st.alt || st.gui) && ev.code == KEY_O) continue;
+        // Ctrl+M 开关渲染:按住不放会连续翻转
+        if(ev.value == 2 && st.ctrl && ev.code == KEY_M) continue;
         int key = map_key(ev.code, st);
         dispatch_key(key);
     }
@@ -515,10 +526,16 @@ static void console_modifier_thread(std::string device) {
             dispatch_key(APP_KEY_ALT_W);
             continue;
         }
-        // Ctrl+J/Ctrl+H:tty 那头是 0x0A/0x08(会撞回车/退格),这里补发专用码。
+        // Alt/GUI+O:大纲目录(tty 那头是 ESC 'o')
+        if(ev.value == 1 && ev.code == KEY_O && (g_alt_held.load() || g_gui_held.load())) {
+            dispatch_key(APP_KEY_TOC);
+            continue;
+        }
+        // Ctrl+J/Ctrl+H/Ctrl+M:tty 那头是 0x0A/0x08/0x0D(撞回车/退格),这里补发专用码。
         if(ev.value == 1 && g_ctrl_held.load() && !g_shift_held.load()) {
             if(ev.code == KEY_J) { dispatch_key(APP_KEY_CTRL_J); continue; }
             if(ev.code == KEY_H) { dispatch_key(APP_KEY_CTRL_H); continue; }
+            if(ev.code == KEY_M) { dispatch_key(APP_KEY_MD_TOGGLE); continue; }
         }
         if(g_ctrl_held && g_shift_held) {
             if(ev.code == KEY_F) dispatch_key(APP_KEY_TRAD_TOGGLE);
